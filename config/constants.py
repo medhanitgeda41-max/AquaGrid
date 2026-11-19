@@ -21,9 +21,10 @@ PRESSURE_MAX_PSI: float = 100.0
 PRESSURE_NOMINAL_MIN_PSI: float = 45.0
 PRESSURE_NOMINAL_MAX_PSI: float = 65.0
 
-# Tariff Windows
+# Tariff Windows & Default Operational Time
 PEAK_TARIFF_START_HOUR: int = 14  # 2:00 PM
 PEAK_TARIFF_END_HOUR: int = 18    # 6:00 PM
+DEFAULT_SCADA_HOUR: int = 14      # Live operational scenario baseline hour (2:00 PM)
 
 # Architectural Loop Guardrails
 MAX_AGENT_STEPS: int = 5

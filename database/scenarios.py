@@ -41,12 +41,12 @@ def inject_scenario_1(db_path: str | None = None) -> dict:
             """
         )
 
-        # 2. Flatline sensor P-17 (variance = 0 across recent hours 12, 13, 14)
+        # 2. Flatline sensor P-17 (variance = 0 across recent hours 10, 11, 12, 13, 14)
         conn.execute(
             """
             UPDATE telemetry
             SET value = 48.120, status = 'FLATLINE'
-            WHERE sensor_id = 'P-17' AND hour IN (12, 13, 14);
+            WHERE sensor_id = 'P-17' AND hour IN (10, 11, 12, 13, 14);
             """
         )
 
@@ -114,7 +114,16 @@ def inject_scenario_2(db_path: str | None = None) -> dict:
             """
         )
 
-        # 2. Coastal algal bloom alert at Intake 2
+        # 2. Update demand forecast for the 6h peak horizon (hours 14-19)
+        # Starting from 48% (240 ML), an afternoon demand of 351 MLD vs 15 MLD throttle
+        # draws 14.0 ML/hr, driving the reservoir down to 156.0 ML (31.2% < 35% safety floor).
+        for h in range(14, 20):
+            conn.execute(
+                "UPDATE demand_forecast SET demand_mld = 351.0 WHERE hour = ?;",
+                (h,),
+            )
+
+        # 3. Coastal algal bloom alert at Intake 2
         conn.execute(
             """
             INSERT INTO quality_alerts (severity, location, raw_text, sanitized_text, is_injection)
