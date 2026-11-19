@@ -6,7 +6,7 @@ the pure Python regex injection filter before presenting data to the agent.
 """
 from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
-from database.connection import get_db_connection
+from database.connection import get_db_connection, transaction_scope
 from guards.injection_filter import sanitize_text, QUARANTINED_ALERT_PLACEHOLDER
 from guards.safety_floors import evaluate_quality_and_bloom_derating
 
@@ -15,6 +15,7 @@ def read_tariff_and_quality_feeds(
     horizon_hours: int = 6,
     current_hour: int = DEFAULT_SCADA_HOUR,
     db_path: Optional[str] = None,
+    log_audit: bool = False,
 ) -> dict:
     """
     Read time-of-use tariffs, demand forecasts, and water quality alerts.
@@ -181,7 +182,7 @@ def read_tariff_and_quality_feeds(
             bloom_severity=highest_bloom_severity,
         )
 
-        return {
+        result = {
             "current_hour": current_hour,
             "horizon_hours": horizon_hours,
             "is_current_peak_tariff": is_current_peak,
@@ -204,3 +205,40 @@ def read_tariff_and_quality_feeds(
         }
     finally:
         conn.close()
+
+    if log_audit:
+        inj_alerts = [a for a in sanitized_alerts if a.get("injection_detected")]
+        with transaction_scope(db_path) as audit_conn:
+            audit_conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (
+                    "TOOL_CALL",
+                    "read_tariff_and_quality_feeds",
+                    (
+                        f"Ingested {len(tariff_schedule)}h tariff/demand horizon from hour {current_hour}, "
+                        f"bloom={highest_bloom_severity} (max {derating_eval['max_safe_output_mld']} MLD), "
+                        f"alerts={len(sanitized_alerts)} ({len(inj_alerts)} quarantined)."
+                    ),
+                    "CODE_GUARD",
+                    "ALLOWED",
+                ),
+            )
+            for ia in inj_alerts:
+                audit_conn.execute(
+                    """
+                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (
+                        "INJECTION_BLOCKED",
+                        f"ALERT-{ia['alert_id']}",
+                        f"Alert #{ia['alert_id']} from {ia.get('source')} ({ia.get('severity')}) fully quarantined before LLM ingestion.",
+                        "CODE_GUARD",
+                        "BLOCKED",
+                    ),
+                )
+
+    return result

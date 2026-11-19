@@ -1,7 +1,7 @@
 """AquaGrid Streamlit SCADA Control Room — Phase 4 Entry Point.
 
 Launch from project root:
-    streamlit run app/app.py
+    python -m streamlit run app/app.py
 """
 import os
 import sys

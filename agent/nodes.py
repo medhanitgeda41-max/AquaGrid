@@ -13,6 +13,7 @@ from agent.llm_factory import llm_client
 from tools.read_telemetry import read_network_telemetry
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.write_gateway import stage_gated_valve_or_setpoint_action
+from database.connection import transaction_scope
 from guards.schedule_validator import validate_production_schedule
 from config.constants import MAX_REPLANS, MAX_AGENT_STEPS
 
@@ -21,11 +22,11 @@ def node_ingest(state: AgentState) -> dict:
     """Ingest live network state using the two read-only tools."""
     current_hour = state.get("current_hour", 14)
 
-    # Tool 1: Read Telemetry (cross-checked in pure Python)
-    telemetry_data = read_network_telemetry(current_hour=current_hour)
+    # Tool 1: Read Telemetry (cross-checked in pure Python + logged to audit_log)
+    telemetry_data = read_network_telemetry(current_hour=current_hour, log_audit=True)
 
-    # Tool 2: Read Feeds (sanitized by regex filter in pure Python)
-    feeds_data = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=current_hour)
+    # Tool 2: Read Feeds (sanitized by regex filter in pure Python + logged to audit_log)
+    feeds_data = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=current_hour, log_audit=True)
 
     return {
         "verified_telemetry": telemetry_data.get("verified_telemetry", []),
@@ -88,6 +89,31 @@ def node_reason(state: AgentState) -> dict:
         turbidity_ntu=float(wq.get("intake_turbidity_ntu", 1.2)),
         chlorine_ppm=float(wq.get("intake_chlorine_ppm", 1.8)),
     )
+
+    # Record LLM provider & reasoning pass in immutable audit_log
+    scenario_label = f"SCENARIO_{state.get('scenario_id')}" if state.get("scenario_id") else "NETWORK"
+    prop_summary = (
+        f"{action_prop.get('action_type')} {action_prop.get('target_id')}={action_prop.get('proposed_value')}"
+        if action_prop
+        else "NONE"
+    )
+    with transaction_scope() as audit_conn:
+        audit_conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "LLM_REASONING",
+                scenario_label,
+                (
+                    f"Provider: {provider_used} | replan={state.get('replan_count', 0)} | "
+                    f"proposal={prop_summary} | schedule_check={schedule_validation.get('status')}"
+                ),
+                "LLM_AGENT",
+                "ALLOWED",
+            ),
+        )
 
     return {
         "last_user_prompt": user_prompt,

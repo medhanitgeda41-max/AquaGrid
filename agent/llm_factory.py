@@ -57,7 +57,8 @@ def generate_offline_mock_response(system_prompt: str, user_prompt: str) -> dict
                 "Intake sensor T-INTAKE-2 is drifting (4.85 NTU vs reference 1.25 NTU) and has been isolated."
             ),
             "maintenance_advisory": (
-                "PRIORITY 1: Dispatch emergency repair crew to Sector 4 near Junction J-14 to investigate surface pooling. "
+                "PRIORITY 1: Dispatch emergency repair crew to Sector 4 near Junction J-14 to investigate surface pooling; "
+                "after operator approval, close V-12 to isolate the ruptured main. "
                 "PRIORITY 2: Dispatch instrumentation technician to recalibrate or replace pressure transmitter P-17 "
                 "and clean optical lens on Intake 02 turbidity analyzer."
             ),
@@ -130,7 +131,10 @@ def generate_offline_mock_response(system_prompt: str, user_prompt: str) -> dict
                 "EMERGENCY ISOLATION REQUEST: Major pipe breach confirmed in Sector 4. Hydraulic model recommends "
                 "immediate closure of isolation valve V-12. Physical action staged in gateway awaiting operator signoff."
             ),
-            "maintenance_advisory": "Notify local utility dispatch that Sector 4 will experience reduced service pressure during V-12 isolation.",
+            "maintenance_advisory": (
+                "After operator approval, close V-12 to isolate the Sector 4 rupture near J-14, and notify local utility "
+                "dispatch that Sector 4 will experience reduced service pressure during repair."
+            ),
             "proposed_schedule": "Keep Desalination Plant ONLINE at 100.0 MLD.",
             "action_proposal": {
                 "action_type": "CLOSE_VALVE",
@@ -169,7 +173,11 @@ class LLMClient:
     """Multi-provider LLM client implementing the fallback chain."""
 
     def __init__(self, mode: Optional[str] = None):
-        self.mode = mode or settings.LLM_MODE
+        self._explicit_mode = mode
+
+    @property
+    def mode(self) -> str:
+        return self._explicit_mode or settings.LLM_MODE
 
     def _get_provider_chain(self) -> list[dict]:
         """Define prioritized provider list based on LLM_MODE."""

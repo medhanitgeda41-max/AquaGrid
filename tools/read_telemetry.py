@@ -6,7 +6,7 @@ and returns verified telemetry to the agent.
 """
 from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
-from database.connection import get_db_connection
+from database.connection import get_db_connection, transaction_scope
 from guards.sensor_checks import (
     check_flatline,
     check_drift,
@@ -19,6 +19,7 @@ def read_network_telemetry(
     sector_id: Optional[str] = None,
     current_hour: int = DEFAULT_SCADA_HOUR,
     db_path: Optional[str] = None,
+    log_audit: bool = False,
 ) -> dict:
     """
     Read verified water distribution network telemetry.
@@ -184,7 +185,7 @@ def read_network_telemetry(
                         ),
                     })
 
-        return {
+        result = {
             "sector_filter": sector_id or "ALL",
             "evaluation_hour": latest_hour,
             "total_sensors_evaluated": len(sensors),
@@ -196,3 +197,39 @@ def read_network_telemetry(
         }
     finally:
         conn.close()
+
+    if log_audit:
+        with transaction_scope(db_path) as audit_conn:
+            audit_conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (
+                    "TOOL_CALL",
+                    "read_network_telemetry",
+                    (
+                        f"Evaluated {result['total_sensors_evaluated']} sensors at hour {latest_hour}: "
+                        f"{result['verified_sensor_count']} verified, {result['quarantined_sensor_count']} quarantined, "
+                        f"{len(leak_alerts)} confirmed leak(s)."
+                    ),
+                    "CODE_GUARD",
+                    "ALLOWED",
+                ),
+            )
+            for q in quarantined_sensors:
+                audit_conn.execute(
+                    """
+                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (
+                        "SENSOR_QUARANTINED",
+                        q["sensor_id"],
+                        f"Sensor {q['sensor_id']} ({q['junction_id']}, {q['sector']}) quarantined: {'; '.join(q['reasons'])}",
+                        "CODE_GUARD",
+                        "BLOCKED",
+                    ),
+                )
+
+    return result
