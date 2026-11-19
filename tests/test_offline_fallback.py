@@ -184,6 +184,17 @@ def test_scenario_3_valve_staged_awaiting_human(mock_query, fresh_db):
         f"Target must be V-12. Got: {gw.get('target_id')}"
     )
 
+    # Confirm Scenario 3 creates strictly ONE PENDING CLOSE_VALVE V-12 row (no duplicates)
+    from database.connection import get_db_connection
+    conn = get_db_connection()
+    try:
+        pending = conn.execute(
+            "SELECT id FROM pending_actions WHERE target_id = 'V-12' AND action_type = 'CLOSE_VALVE' AND status = 'PENDING';"
+        ).fetchall()
+        assert len(pending) == 1, f"Expected exactly 1 PENDING CLOSE_VALVE V-12 action, got {len(pending)}"
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Scenario 4: Prompt Injection Blocked

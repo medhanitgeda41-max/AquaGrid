@@ -63,6 +63,39 @@ def stage_gated_valve_or_setpoint_action(
     conn = get_db_connection(db_path)
     sim_min_projected_percent: Optional[float] = None
     try:
+        # 1b. Duplicate PENDING guard: reject if a PENDING action already exists for same target_id & action_type
+        existing_pending = conn.execute(
+            """
+            SELECT id
+            FROM pending_actions
+            WHERE target_id = ? AND action_type = ? AND status = 'PENDING'
+            ORDER BY id ASC
+            LIMIT 1;
+            """,
+            (target_id, action_type),
+        ).fetchone()
+        if existing_pending:
+            existing_id = int(existing_pending["id"])
+            reason = (
+                f"Duplicate proposal rejected: PENDING action #{existing_id} already exists for "
+                f"{action_type} on {target_id}. Resolve the existing pending action first."
+            )
+            with transaction_scope(db_path) as audit_conn:
+                audit_conn.execute(
+                    """
+                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    ("DUPLICATE_PENDING_REJECTED", target_id, reason, "CODE_GUARD", "BLOCKED"),
+                )
+            return {
+                "status": "REJECTED_DUPLICATE_PENDING",
+                "existing_action_id": existing_id,
+                "action_type": action_type,
+                "target_id": target_id,
+                "reason": reason,
+            }
+
         current_value = 0.0
         # Fetch current actuator state
         if action_type in ("CLOSE_VALVE", "OPEN_VALVE"):

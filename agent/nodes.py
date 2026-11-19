@@ -133,7 +133,7 @@ def node_stage_action(state: AgentState) -> dict:
         "gateway_response": result,
     })
 
-    if result.get("status") == "STAGED_PENDING_APPROVAL":
+    if result.get("status") in ("STAGED_PENDING_APPROVAL", "REJECTED_DUPLICATE_PENDING"):
         return {
             "gateway_response": result,
             "proposal_history": history,

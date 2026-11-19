@@ -241,3 +241,54 @@ def test_direct_write_bypass_is_refused_and_valve_unchanged():
     assert res["valve_status_before"] == "OPEN"
     assert res["valve_status_after"] == "OPEN"
     assert "readonly" in res["error"].lower()
+
+
+def test_rejects_duplicate_pending_action_and_logs_audit():
+    # First proposal stages cleanly as PENDING
+    first = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-12",
+        proposed_value=0.0,
+        rationale="Isolate Sector 4 leak at J-14",
+    )
+    assert first["status"] == "STAGED_PENDING_APPROVAL"
+    first_id = first["action_id"]
+
+    # Second identical proposal while first is still PENDING must be rejected as duplicate
+    dup = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-12",
+        proposed_value=0.0,
+        rationale="Duplicate close request",
+    )
+    assert dup["status"] == "REJECTED_DUPLICATE_PENDING"
+    assert dup["existing_action_id"] == first_id
+    assert str(first_id) in dup["reason"]
+
+    conn = get_db_connection()
+    try:
+        # Exactly 1 PENDING row must exist for CLOSE_VALVE V-12
+        pending = conn.execute(
+            "SELECT * FROM pending_actions WHERE target_id = 'V-12' AND action_type = 'CLOSE_VALVE' AND status = 'PENDING';"
+        ).fetchall()
+        assert len(pending) == 1
+        assert pending[0]["id"] == first_id
+
+        # Duplicate rejection must be logged in audit_log
+        audit = conn.execute(
+            "SELECT * FROM audit_log WHERE event_type = 'DUPLICATE_PENDING_REJECTED' AND target_id = 'V-12';"
+        ).fetchone()
+        assert audit is not None
+        assert audit["status"] == "BLOCKED"
+    finally:
+        conn.close()
+
+    # Once the first action is resolved (e.g., rejected), a new proposal is allowed again
+    execute_human_rejection(first_id, rejection_reason="Deferred", approver="Operator_Test")
+    third = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-12",
+        proposed_value=0.0,
+        rationale="Re-proposed after rejection",
+    )
+    assert third["status"] == "STAGED_PENDING_APPROVAL"
