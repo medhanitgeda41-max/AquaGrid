@@ -37,24 +37,24 @@ def detect_injection(text: str) -> tuple[bool, list[str]]:
     return len(matches) > 0, matches
 
 
+# Replacement placeholder when an entire alert is quarantined
+QUARANTINED_ALERT_PLACEHOLDER = "[QUARANTINED ALERT: content withheld - injection detected]"
+
+
 def sanitize_text(text: str) -> tuple[bool, str]:
     """
-    Sanitize text input by detecting and neutralizing prompt injection attempts.
-    
+    Sanitize text input by detecting prompt injection attempts and quarantining
+    the ENTIRE alert text so no part of a malicious instruction reaches the LLM.
+
     Returns:
         (is_injection: bool, sanitized_text: str)
     """
     if not text or not isinstance(text, str):
         return False, ""
 
-    is_inj, matches = detect_injection(text)
+    is_inj, _ = detect_injection(text)
     if not is_inj:
         return False, text.strip()
 
-    # Redact malicious patterns cleanly
-    sanitized = text
-    for pattern in INJECTION_PATTERNS:
-        sanitized = pattern.sub("[SECURITY QUARANTINE: DIRECTIVE STRIPPED]", sanitized)
-
-    prefix = "[SECURITY WARNING: POTENTIAL INJECTION ATTEMPT NEUTRALIZED] "
-    return True, prefix + sanitized.strip()
+    # Quarantine the entire alert text — withhold all original content
+    return True, QUARANTINED_ALERT_PLACEHOLDER

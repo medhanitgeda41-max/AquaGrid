@@ -7,7 +7,7 @@ the pure Python regex injection filter before presenting data to the agent.
 from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection
-from guards.injection_filter import sanitize_text
+from guards.injection_filter import sanitize_text, QUARANTINED_ALERT_PLACEHOLDER
 from guards.safety_floors import evaluate_quality_and_bloom_derating
 
 
@@ -31,11 +31,8 @@ def read_tariff_and_quality_feeds(
     """
     conn = get_db_connection(db_path)
     try:
-        # Determine current hour from telemetry or default to 14:00 (peak start)
-        latest_hour_row = conn.execute("SELECT MAX(hour) as max_h FROM telemetry;").fetchone()
-        current_hour = latest_hour_row["max_h"] if latest_hour_row and latest_hour_row["max_h"] is not None else 14
-
-        # 1. Fetch upcoming Tariffs
+        # Use the requested operational hour (defaults to DEFAULT_SCADA_HOUR = 14)
+        # 1. Fetch upcoming Tariffs for the requested horizon
         end_hour = min(23, current_hour + horizon_hours)
         tariff_rows = conn.execute(
             """
@@ -57,7 +54,7 @@ def read_tariff_and_quality_feeds(
         ]
         is_current_peak = any(t["is_peak"] for t in tariff_schedule if t["hour"] == current_hour)
 
-        # 2. Fetch Demand Forecast
+        # 2. Fetch Demand Forecast for the requested horizon
         demand_rows = conn.execute(
             """
             SELECT hour, demand_mld
@@ -72,6 +69,40 @@ def read_tariff_and_quality_feeds(
             {"hour": r["hour"], "demand_mld": r["demand_mld"]}
             for r in demand_rows
         ]
+
+        # 2b. Compute full 24h tariff & demand window summary so the agent can schedule across the whole day
+        window_defs = [
+            ("00:00-06:00", "off_peak", 0, 5),
+            ("06:00-14:00", "mid_peak", 6, 13),
+            ("14:00-18:00", "peak", 14, 18),
+            ("19:00-24:00", "evening_mid_peak", 19, 23),
+        ]
+        daily_windows = []
+        for label, tier, start_h, end_h in window_defs:
+            row = conn.execute(
+                """
+                SELECT
+                    ROUND(AVG(t.rate_per_kwh), 3) AS avg_rate,
+                    ROUND(AVG(d.demand_mld), 1) AS avg_demand_mld
+                FROM tariffs t
+                JOIN demand_forecast d ON t.hour = d.hour
+                WHERE t.hour >= ? AND t.hour <= ?;
+                """,
+                (start_h, end_h),
+            ).fetchone()
+            if row and row["avg_rate"] is not None:
+                daily_windows.append({
+                    "window": label,
+                    "tier": tier,
+                    "avg_rate_per_kwh": row["avg_rate"],
+                    "avg_demand_mld": row["avg_demand_mld"],
+                })
+
+        # 2c. Full 24h hourly demand map for deterministic schedule validation
+        all_demand_rows = conn.execute(
+            "SELECT hour, demand_mld FROM demand_forecast ORDER BY hour ASC;"
+        ).fetchall()
+        hourly_demand_24h = {int(r["hour"]): float(r["demand_mld"]) for r in all_demand_rows}
 
         # 3. Fetch Current Reservoir Status
         res_row = conn.execute("SELECT * FROM reservoirs WHERE id = 'RES-01';").fetchone()
@@ -103,6 +134,18 @@ def read_tariff_and_quality_feeds(
             raw = a["raw_text"]
             # Layer 0: Deterministic pure Python regex sanitization
             is_inj, cleaned = sanitize_text(raw)
+            flagged = is_inj or bool(a["is_injection"])
+
+            if flagged:
+                # Quarantine the ENTIRE alert text: pass only placeholder + metadata (id, source, severity)
+                sanitized_alerts.append({
+                    "alert_id": a["id"],
+                    "source": a["location"],
+                    "severity": a["severity"],
+                    "text": QUARANTINED_ALERT_PLACEHOLDER,
+                    "injection_detected": True,
+                })
+                continue
 
             if "algal bloom" in raw.lower() or "bloom" in raw.lower():
                 bloom_detected = True
@@ -113,9 +156,10 @@ def read_tariff_and_quality_feeds(
                 "alert_id": a["id"],
                 "timestamp": a["timestamp"],
                 "severity": a["severity"],
+                "source": a["location"],
                 "location": a["location"],
                 "text": cleaned,
-                "injection_detected": is_inj or bool(a["is_injection"]),
+                "injection_detected": False,
             })
 
         # 5. Fetch Latest Intake Water Quality Telemetry
@@ -143,6 +187,8 @@ def read_tariff_and_quality_feeds(
             "is_current_peak_tariff": is_current_peak,
             "tariffs": tariff_schedule,
             "demand_forecast": demand_forecast,
+            "daily_windows": daily_windows,
+            "hourly_demand_24h": hourly_demand_24h,
             "reservoir": reservoir_status,
             "sanitized_alerts": sanitized_alerts,
             "water_quality": {

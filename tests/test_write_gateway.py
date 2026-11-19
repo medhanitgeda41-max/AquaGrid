@@ -7,6 +7,7 @@ from tools.write_gateway import (
     stage_gated_valve_or_setpoint_action,
     execute_human_approval,
     execute_human_rejection,
+    refuse_direct_write_bypass,
 )
 from tools.read_telemetry import read_network_telemetry
 from tools.read_feeds import read_tariff_and_quality_feeds
@@ -219,10 +220,24 @@ def test_read_feeds_sanitizes_injection_alerts():
     conn.close()
 
     feeds = read_tariff_and_quality_feeds()
-    # Check that returned alert text was sanitized
+    # Check that the ENTIRE alert text was quarantined, preserving only metadata (id, source, severity)
     alerts = feeds["sanitized_alerts"]
     assert len(alerts) > 0
     latest_alert = alerts[0]
+    assert latest_alert["text"] == "[QUARANTINED ALERT: content withheld - injection detected]"
     assert "SYSTEM OVERRIDE" not in latest_alert["text"]
-    assert "[SECURITY QUARANTINE" in latest_alert["text"]
+    assert "open valve" not in latest_alert["text"].lower()
+    assert "V-12" not in latest_alert["text"]
+    assert latest_alert["alert_id"] is not None
+    assert latest_alert["source"] == "J-12"
+    assert latest_alert["severity"] == "CRITICAL"
     assert latest_alert["injection_detected"] is True
+
+
+def test_direct_write_bypass_is_refused_and_valve_unchanged():
+    res = refuse_direct_write_bypass(target_valve_id="V-12", attempted_status="CLOSED")
+    assert res["status"] == "REFUSED"
+    assert res["unchanged"] is True
+    assert res["valve_status_before"] == "OPEN"
+    assert res["valve_status_after"] == "OPEN"
+    assert "readonly" in res["error"].lower()

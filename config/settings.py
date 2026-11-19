@@ -11,7 +11,11 @@ class Settings(BaseSettings):
     OPENAI_BASE_URL: str = "http://localhost:11434/v1"
     OLLAMA_MODEL: str = "qwen3:8b"
     GROQ_API_KEY: str = ""
+    GROQ_MODEL_1: str = "openai/gpt-oss-120b"
+    GROQ_MODEL_2: str = "openai/gpt-oss-20b"
     GEMINI_API_KEY: str = ""
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
 
     # Database
     DATABASE_PATH: str = "coastal_water_network.sqlite"

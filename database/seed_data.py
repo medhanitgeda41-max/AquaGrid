@@ -78,10 +78,11 @@ def seed_database(db_path: str | None = None) -> None:
             )
 
         # 4. Sensor Registry (20 Junctions across 4 Sectors + Raw Water Intakes)
+        # J-01..J-05 -> Sector 1, J-06..J-10 -> Sector 2, J-11..J-13 -> Sector 3, J-14..J-20 -> Sector 4
         sensors_to_insert = []
         for i in range(1, 21):
             j_id = f"J-{i:02d}"
-            sector = f"Sector {(i - 1) // 5 + 1}"
+            sector = "Sector 4" if i >= 14 else f"Sector {(i - 1) // 5 + 1}"
             # Pressure sensor
             sensors_to_insert.append((f"P-{i:02d}", "pressure", j_id, sector, "psi", 45.0, 65.0, "ACTIVE"))
             # Flow sensor

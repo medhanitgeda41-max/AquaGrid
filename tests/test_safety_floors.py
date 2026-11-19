@@ -54,10 +54,10 @@ def test_reservoir_floor_allows_safe_production():
 
 
 def test_algal_bloom_derating_factors():
-    # Critical bloom halts or derates to 0
+    # Critical bloom at Intake 2 isolates Intake 2 and caps plant at 50% (60 MLD)
     crit = evaluate_quality_and_bloom_derating(turbidity_ntu=1.2, chlorine_ppm=2.0, bloom_severity="CRITICAL")
-    assert crit["derating_factor"] == 0.0
-    assert crit["max_safe_output_mld"] == 0.0
+    assert crit["derating_factor"] == 0.50
+    assert crit["max_safe_output_mld"] == 60.0
 
     # Moderate bloom cuts capacity to 50% (60 MLD)
     mod = evaluate_quality_and_bloom_derating(turbidity_ntu=1.5, chlorine_ppm=2.2, bloom_severity="MODERATE")

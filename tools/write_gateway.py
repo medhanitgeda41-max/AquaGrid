@@ -61,6 +61,7 @@ def stage_gated_valve_or_setpoint_action(
         }
 
     conn = get_db_connection(db_path)
+    sim_min_projected_percent: Optional[float] = None
     try:
         current_value = 0.0
         # Fetch current actuator state
@@ -92,6 +93,7 @@ def stage_gated_valve_or_setpoint_action(
                 total_capacity_ml=RESERVOIR_TOTAL_CAPACITY_ML,
                 min_floor_percent=RESERVOIR_FLOOR_PERCENT,
             )
+            sim_min_projected_percent = sim_result["min_level_percent"]
 
             # If simulation violates the 35% floor, abort immediately
             if not sim_result["is_safe"]:
@@ -178,7 +180,7 @@ def stage_gated_valve_or_setpoint_action(
             ),
         )
 
-    return {
+    response = {
         "status": "STAGED_PENDING_APPROVAL",
         "action_id": action_id,
         "action_type": action_type,
@@ -188,6 +190,10 @@ def stage_gated_valve_or_setpoint_action(
         "rationale": rationale,
         "message": "Action staged successfully in PENDING state. Awaiting mandatory human operator authorization.",
     }
+    if sim_min_projected_percent is not None:
+        response["min_projected_percent"] = sim_min_projected_percent
+        response["floor_threshold_percent"] = 35.0
+    return response
 
 
 def execute_human_approval(
@@ -348,4 +354,73 @@ def execute_human_rejection(
         "action_id": action_id,
         "reason": rejection_reason,
         "approver": approver,
+    }
+
+
+def refuse_direct_write_bypass(
+    target_valve_id: str = "V-12",
+    attempted_status: str = "OPEN",
+    db_path: Optional[str] = None,
+) -> dict:
+    """
+    Demonstrate and enforce refusal of an un-gated direct write to the valves table.
+
+    Executes the attempted write against a read-only SQLite connection
+    (PRAGMA query_only = ON, matching the agent's read-only database boundary)
+    so SQLite itself refuses any mutation outside execute_human_approval().
+    Logs the refused attempt in audit_log and verifies the valve status is unchanged.
+    """
+    import sqlite3
+
+    ro_conn = get_db_connection(db_path)
+    try:
+        before_row = ro_conn.execute(
+            "SELECT status FROM valves WHERE valve_id = ?;", (target_valve_id,)
+        ).fetchone()
+        status_before = before_row["status"] if before_row else "UNKNOWN"
+
+        # Enforce read-only database perimeter (zero direct write access outside gateway approval)
+        ro_conn.execute("PRAGMA query_only = ON;")
+        refusal_error = ""
+        refused = False
+        try:
+            ro_conn.execute(
+                "UPDATE valves SET status = ? WHERE valve_id = ?;",
+                (attempted_status, target_valve_id),
+            )
+            ro_conn.commit()
+        except sqlite3.OperationalError as exc:
+            refused = True
+            refusal_error = f"{type(exc).__name__}: {exc}"
+
+        after_row = ro_conn.execute(
+            "SELECT status FROM valves WHERE valve_id = ?;", (target_valve_id,)
+        ).fetchone()
+        status_after = after_row["status"] if after_row else "UNKNOWN"
+    finally:
+        ro_conn.close()
+
+    with transaction_scope(db_path) as audit_conn:
+        audit_conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "DIRECT_WRITE_REFUSED",
+                target_valve_id,
+                f"Direct un-gated write (set {target_valve_id} -> {attempted_status}) REFUSED: {refusal_error}",
+                "CODE_GUARD",
+                "REFUSED",
+            ),
+        )
+
+    return {
+        "status": "REFUSED" if refused else "UNEXPECTED_WRITE",
+        "target_id": target_valve_id,
+        "attempted_action": f"Direct SQL UPDATE valves SET status='{attempted_status}' WHERE valve_id='{target_valve_id}' (bypassing write_gateway)",
+        "error": refusal_error,
+        "valve_status_before": status_before,
+        "valve_status_after": status_after,
+        "unchanged": status_before == status_after,
     }

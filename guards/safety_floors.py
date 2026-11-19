@@ -106,8 +106,8 @@ def evaluate_quality_and_bloom_derating(
     """
     Evaluate raw water quality and calculate maximum safe desalination plant capacity.
 
-    Algal Bloom Derating Rules:
-    - CRITICAL: Plant output clamped to 0 MLD (or safe minimum intake flush).
+    Algal Bloom Derating Rules (Intake 2 affected; Intake 1 remains operational):
+    - CRITICAL: Intake 2 isolated — plant capacity capped at 50% (max 60.0 MLD).
     - MODERATE: Plant capacity derated by 50% (max 60.0 MLD).
     - LOW: Plant capacity derated by 20% (max 96.0 MLD).
     - NONE: Full capacity (120.0 MLD) available.
@@ -121,7 +121,7 @@ def evaluate_quality_and_bloom_derating(
         "NONE": 1.0,
         "LOW": 0.80,
         "MODERATE": 0.50,
-        "CRITICAL": 0.0,
+        "CRITICAL": 0.50,
     }
     derating_factor = derating_factors.get(severity, 0.50)
     max_safe_output_mld = DESAL_MAX_CAPACITY_MLD * derating_factor
