@@ -9,12 +9,16 @@ Enforces strict architectural perimeter:
 from typing import Optional
 from config.constants import (
     ALLOWED_ACTION_TYPES,
+    KNOWN_PLANTS,
+    KNOWN_SECTOR_TARGETS,
     KNOWN_TARGET_IDS,
+    KNOWN_VALVES,
     RESERVOIR_TOTAL_CAPACITY_ML,
     RESERVOIR_FLOOR_PERCENT,
 )
 from database.connection import get_db_connection, transaction_scope
 from guards.safety_floors import simulate_reservoir_trajectory, evaluate_quality_and_bloom_derating
+from guards.water_quality import evaluate_sector_chlorine, target_id_to_sector_name
 
 
 def stage_gated_valve_or_setpoint_action(
@@ -42,8 +46,13 @@ def stage_gated_valve_or_setpoint_action(
         Result dict with status 'STAGED_PENDING_APPROVAL', 'REJECTED_INVALID_TARGET',
         or 'REJECTED_BY_SAFETY_GUARD'.
     """
-    # 1. Target and Action Type Whitelist Validation
-    if action_type not in ALLOWED_ACTION_TYPES or target_id not in KNOWN_TARGET_IDS:
+    # 1. Target and Action Type Whitelist Validation (including action-to-target pairing)
+    valid_target_for_action = (
+        (action_type in ("CLOSE_VALVE", "OPEN_VALVE") and target_id in KNOWN_VALVES)
+        or (action_type == "SET_PLANT_OUTPUT" and target_id in KNOWN_PLANTS)
+        or (action_type == "ISOLATE_AND_FLUSH" and target_id in KNOWN_SECTOR_TARGETS)
+    )
+    if action_type not in ALLOWED_ACTION_TYPES or target_id not in KNOWN_TARGET_IDS or not valid_target_for_action:
         error_msg = f"Rejected invalid action_type '{action_type}' or unknown target_id '{target_id}'"
         with transaction_scope(db_path) as conn:
             conn.execute(
@@ -101,9 +110,49 @@ def stage_gated_valve_or_setpoint_action(
         if action_type in ("CLOSE_VALVE", "OPEN_VALVE"):
             v_row = conn.execute("SELECT status FROM valves WHERE valve_id = ?;", (target_id,)).fetchone()
             current_value = 1.0 if (v_row and v_row["status"] == "OPEN") else 0.0
+        elif action_type == "ISOLATE_AND_FLUSH":
+            sec_name = target_id_to_sector_name(target_id)
+            wq_row = conn.execute(
+                """
+                SELECT chlorine_mg_l FROM sector_water_quality
+                WHERE sector = ?
+                ORDER BY id DESC LIMIT 1;
+                """,
+                (sec_name,),
+            ).fetchone()
+            current_value = float(wq_row["chlorine_mg_l"]) if wq_row else 0.5
         elif action_type == "SET_PLANT_OUTPUT":
             p_row = conn.execute("SELECT production_mld FROM plant_setpoints WHERE plant_id = ?;", (target_id,)).fetchone()
             current_value = float(p_row["production_mld"]) if p_row else 100.0
+
+            # 1c. Per-sector chlorine compliance guard: reject tariff-driven cuts while any sector is NON_COMPLIANT
+            wq_rows = conn.execute(
+                """
+                SELECT sector, chlorine_mg_l, timestamp
+                FROM sector_water_quality
+                WHERE id IN (SELECT MAX(id) FROM sector_water_quality GROUP BY sector);
+                """
+            ).fetchall()
+            wq_eval = evaluate_sector_chlorine([dict(r) for r in wq_rows])
+            if not wq_eval["all_compliant"] and proposed_value < current_value:
+                excl = ", ".join(wq_eval["excluded_from_tariff_scheduling"])
+                reason = (
+                    f"REJECTED_WATER_QUALITY: Production cut ({proposed_value:.1f} MLD < {current_value:.1f} MLD) "
+                    f"blocked while sector(s) {excl} are NON_COMPLIANT (< 0.20 mg/L chlorine)."
+                )
+                with transaction_scope(db_path) as audit_conn:
+                    audit_conn.execute(
+                        """
+                        INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                        VALUES (?, ?, ?, ?, ?);
+                        """,
+                        ("WATER_QUALITY_CUT_BLOCKED", target_id, reason, "CODE_GUARD", "REJECTED_WATER_QUALITY"),
+                    )
+                return {
+                    "status": "REJECTED_WATER_QUALITY",
+                    "reason": reason,
+                    "excluded_sectors": wq_eval["excluded_from_tariff_scheduling"],
+                }
 
             # 2. Pure Python Safety Floor Verification (for production changes)
             # Fetch latest reservoir volume
@@ -315,6 +364,38 @@ def execute_human_approval(
             conn.execute(
                 "UPDATE plant_setpoints SET production_mld = ?, last_updated = CURRENT_TIMESTAMP WHERE plant_id = ?;",
                 (proposed_value, target_id),
+            )
+        elif action_type == "ISOLATE_AND_FLUSH":
+            # Safety re-check: verify reservoir is above mandatory floor before flushing sector
+            res_row = conn.execute("SELECT volume_ml, capacity_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
+            latest_vol = float(res_row["volume_ml"]) if res_row else 240.0
+            cap_ml = float(res_row["capacity_ml"]) if res_row else RESERVOIR_TOTAL_CAPACITY_ML
+            if latest_vol < cap_ml * RESERVOIR_FLOOR_PERCENT:
+                reason = (
+                    f"Reservoir volume ({latest_vol:.1f} ML) is below safety floor "
+                    f"({cap_ml * RESERVOIR_FLOOR_PERCENT:.1f} ML); cannot initiate flush for {target_id}."
+                )
+                conn.execute(
+                    """
+                    UPDATE pending_actions
+                    SET status = 'CANCELLED_BY_SAFETY_RECHECK', executed_at = CURRENT_TIMESTAMP, approver = ?
+                    WHERE id = ?;
+                    """,
+                    (approver, action_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    ("APPROVAL_CANCELLED_BY_SAFETY", target_id, reason, "CODE_GUARD", "BLOCKED"),
+                )
+                return {"status": "CANCELLED_BY_SAFETY_RECHECK", "reason": reason}
+
+            sec_name = target_id_to_sector_name(target_id)
+            conn.execute(
+                "UPDATE valves SET status = 'CLOSED', last_updated = CURRENT_TIMESTAMP WHERE sector = ?;",
+                (sec_name,),
             )
 
         # Update action status to APPROVED

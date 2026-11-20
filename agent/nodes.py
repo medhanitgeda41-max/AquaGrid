@@ -44,6 +44,8 @@ def node_ingest(state: AgentState) -> dict:
         "hourly_demand_24h": feeds_data.get("hourly_demand_24h", {}),
         "reservoir_status": feeds_data.get("reservoir", {}),
         "sanitized_alerts": feeds_data.get("sanitized_alerts", []),
+        "sector_water_quality_compliance": feeds_data.get("sector_water_quality_compliance", {}),
+        "excluded_sectors": feeds_data.get("excluded_sectors", []),
         "agent_step_count": state.get("agent_step_count", 0) + 1,
     }
 
@@ -57,6 +59,8 @@ def node_reason(state: AgentState) -> dict:
         "leak_alerts": state.get("leak_alerts", []),
         "quarantined_sensors": state.get("quarantined_sensors", []),
         "sanitized_alerts": state.get("sanitized_alerts", []),
+        "sector_water_quality_compliance": state.get("sector_water_quality_compliance", {}),
+        "excluded_sectors_from_tariff_scheduling": state.get("excluded_sectors", []),
         "tariff_data": state.get("tariff_data", {}),
         "safety_violations_from_previous_attempts": state.get("safety_violations", []),
         "replan_count": state.get("replan_count", 0),
@@ -91,6 +95,7 @@ def node_reason(state: AgentState) -> dict:
         chlorine_ppm=float(wq.get("intake_chlorine_ppm", 1.8)),
         current_hour=state.get("current_hour", 14),
         current_plant_output_mld=float(state.get("tariff_data", {}).get("current_plant_output_mld", 100.0)),
+        excluded_sectors=state.get("excluded_sectors", []),
     )
 
     # Record LLM provider & reasoning pass in immutable audit_log

@@ -65,7 +65,7 @@ def build_aquagrid_graph():
 aquagrid_graph = build_aquagrid_graph()
 
 
-def run_agent(scenario_id: int | None = None, current_hour: int = 14) -> AgentState:
+def run_agent(scenario_id: int | str | None = None, current_hour: int = 14) -> AgentState:
     """Execute the AquaGrid agent on the current network state."""
     initial_state: AgentState = {
         "scenario_id": scenario_id,
@@ -78,6 +78,8 @@ def run_agent(scenario_id: int | None = None, current_hour: int = 14) -> AgentSt
         "hourly_demand_24h": {},
         "reservoir_status": {},
         "sanitized_alerts": [],
+        "sector_water_quality_compliance": {},
+        "excluded_sectors": [],
         "last_user_prompt": "",
         "operator_brief": "",
         "maintenance_advisory": "",

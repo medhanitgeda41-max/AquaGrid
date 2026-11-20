@@ -37,6 +37,7 @@ from config.constants import (
 from config.region_config import REGION_CONFIG, now_local
 from database.connection import get_db_connection, transaction_scope
 from database.dubai_network import point_on_polyline
+from guards.water_quality import evaluate_sector_chlorine
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
 
@@ -524,6 +525,8 @@ class LiveScadaSimulator:
             log_audit=False,
         )
 
+        sector_wq_eval = evaluate_sector_chlorine(sector_chlorine_summary)
+
         raised_alerts: list[str] = []
         for lk in telemetry_check.get("leak_alerts", []):
             raised_alerts.append(f"LEAK CONFIRMED: {lk['diagnostic']}")
@@ -531,6 +534,8 @@ class LiveScadaSimulator:
             raised_alerts.append(
                 f"SENSOR QUARANTINED: {qs['sensor_id']} ({qs['junction_id']}) — {'; '.join(qs['reasons'])}"
             )
+        for wq_alert in sector_wq_eval.get("alerts", []):
+            raised_alerts.append(wq_alert)
         if new_level_pct < RESERVOIR_FLOOR_PERCENT * 100.0:
             raised_alerts.append(
                 f"RESERVOIR FLOOR BREACH: RES-01 at {new_level_pct:.1f}% (< 35.0% mandatory floor)"
@@ -578,6 +583,7 @@ class LiveScadaSimulator:
             "raised_alerts": raised_alerts,
             "water_quality_safe": feeds_check.get("water_quality", {}).get("is_quality_safe", True),
             "sector_water_quality": sector_chlorine_summary,
+            "sector_water_quality_compliance": sector_wq_eval,
             "ai_run": ai_result,
         }
 

@@ -114,6 +114,7 @@ def validate_production_schedule(
     min_floor_percent: float = RESERVOIR_FLOOR_PERCENT,
     current_hour: int = DEFAULT_SCADA_HOUR,
     current_plant_output_mld: float = DESAL_BASELINE_OUTPUT_MLD,
+    excluded_sectors: Sequence[str] | None = None,
 ) -> dict:
     """
     Validate an LLM-proposed 24h production schedule using CUMULATIVE hour-by-hour
@@ -350,6 +351,9 @@ def validate_production_schedule(
 
     validated_blocks: list[dict] = []
     rejected_blocks: list[dict] = []
+    excluded_list = [str(s) for s in (excluded_sectors or []) if s]
+    schedule_text_lower = proposed_schedule.lower() if isinstance(proposed_schedule, str) else ""
+    water_quality_rejected = False
 
     for idx, block in enumerate(parsed_blocks):
         start_h = block["start_hour"]
@@ -357,6 +361,7 @@ def validate_production_schedule(
         mld = float(block["proposed_mld"])
         st = block_stats[idx]
         reasons: list[str] = []
+        block_wq_violation = False
 
         # 1. Physical plant capacity check
         if mld < 0.0:
@@ -373,6 +378,21 @@ def validate_production_schedule(
                 f"of {bloom_max_mld:.1f} MLD (derating factor {derating['derating_factor']:.0%})."
             )
 
+        # 2b. Per-sector water quality exclusion check (water quality outranks tariff savings)
+        if excluded_list and mld < raw_current_setpoint:
+            # Check whether this tariff-driven production cut explicitly excludes the non-compliant sector(s)
+            all_explicitly_excluded = all(
+                (sec.lower() in schedule_text_lower and "exclud" in schedule_text_lower)
+                for sec in excluded_list
+            )
+            if not all_explicitly_excluded:
+                block_wq_violation = True
+                water_quality_rejected = True
+                reasons.append(
+                    f"REJECTED_WATER_QUALITY: Tariff-driven production cut ({mld:.1f} MLD < {raw_current_setpoint:.1f} MLD) "
+                    f"affects NON_COMPLIANT sector(s): {', '.join(excluded_list)}. Water quality outranks tariff savings."
+                )
+
         # 3. Cumulative 35% reservoir floor check
         if st["caused_or_deepened_breach"] and st["breach_hours"]:
             breach_hr = st["breach_hours"][0]
@@ -384,7 +404,12 @@ def validate_production_schedule(
                 f"({floor_volume_ml:.1f} ML), first breached at {breach_hr}."
             )
 
-        block_status = "REJECTED_BY_CODE" if reasons else "VALID"
+        if block_wq_violation:
+            block_status = "REJECTED_WATER_QUALITY"
+        elif reasons:
+            block_status = "REJECTED_BY_CODE"
+        else:
+            block_status = "VALID"
         effective_inflow = min(
             max(mld, 0.0),
             max_capacity_mld,
@@ -405,24 +430,35 @@ def validate_production_schedule(
             "effective_capped_mld": effective_inflow,
         }
         validated_blocks.append(entry)
-        if block_status == "REJECTED_BY_CODE":
+        if block_status != "VALID":
             rejected_blocks.append(entry)
 
     chronological_blocks = sorted(validated_blocks + gap_blocks, key=lambda b: b["first_seen_offset"])
 
-    # Overall schedule is REJECTED_BY_CODE if ANY block failed OR ANY hour breached the 35% floor
+    # Overall schedule is REJECTED_WATER_QUALITY or REJECTED_BY_CODE if ANY block failed OR ANY hour breached floor
     breach_occurred = first_breach_hour is not None
     is_valid = (len(rejected_blocks) == 0) and (not breach_occurred)
-    overall_status = "VALID" if is_valid else "REJECTED_BY_CODE"
+    if is_valid:
+        overall_status = "VALID"
+    elif water_quality_rejected:
+        overall_status = "REJECTED_WATER_QUALITY"
+    else:
+        overall_status = "REJECTED_BY_CODE"
 
     if is_valid:
+        excl_note = f" Excluded from tariff scheduling: {', '.join(excluded_list)}." if excluded_list else ""
         summary = (
             f"VALID: All {len(validated_blocks)} schedule block(s) passed capacity, bloom derating, "
-            f"and 24h cumulative 35.0% reservoir floor checks (min projected: {min_overall_pct:.2f}%)."
+            f"and 24h cumulative {floor_pct_display:.1f}% reservoir floor checks (min projected: {min_overall_pct:.2f}%).{excl_note}"
+        )
+    elif water_quality_rejected:
+        summary = (
+            f"REJECTED_WATER_QUALITY: Tariff-driven production cut affects NON_COMPLIANT sector(s): "
+            f"{', '.join(excluded_list)}. Remove non-compliant sector(s) from tariff scheduling first."
         )
     else:
         breach_note = (
-            f" First 35.0% floor breach at {first_breach_hour} ({first_breach_percent:.2f}%)."
+            f" First {floor_pct_display:.1f}% floor breach at {first_breach_hour} ({first_breach_percent:.2f}%)."
             if breach_occurred
             else ""
         )
@@ -438,6 +474,7 @@ def validate_production_schedule(
         "max_capacity_mld": max_capacity_mld,
         "bloom_severity": normalized_bloom,
         "bloom_max_safe_mld": bloom_max_mld,
+        "excluded_sectors": excluded_list,
         "min_overall_percent": min_overall_pct,
         "first_breach_hour": first_breach_hour,
         "first_breach_percent": first_breach_percent,

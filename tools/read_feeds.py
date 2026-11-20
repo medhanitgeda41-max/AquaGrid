@@ -9,6 +9,7 @@ from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
 from guards.injection_filter import sanitize_text, QUARANTINED_ALERT_PLACEHOLDER
 from guards.safety_floors import evaluate_quality_and_bloom_derating
+from guards.water_quality import evaluate_sector_chlorine
 
 
 def read_tariff_and_quality_feeds(
@@ -243,6 +244,8 @@ def read_tariff_and_quality_feeds(
             for r in ticket_rows
         ]
 
+        sector_wq_compliance = evaluate_sector_chlorine(sector_water_quality)
+
         result = {
             "current_hour": current_hour,
             "horizon_hours": horizon_hours,
@@ -255,6 +258,8 @@ def read_tariff_and_quality_feeds(
             "reservoir": reservoir_status,
             "sanitized_alerts": sanitized_alerts,
             "sector_water_quality": sector_water_quality,
+            "sector_water_quality_compliance": sector_wq_compliance,
+            "excluded_sectors": sector_wq_compliance["excluded_from_tariff_scheduling"],
             "emergency_commitments": emergency_commitments,
             "field_tickets": field_tickets,
             "water_quality": {
@@ -264,8 +269,8 @@ def read_tariff_and_quality_feeds(
                 "bloom_severity": highest_bloom_severity,
                 "derating_factor": derating_eval["derating_factor"],
                 "max_allowable_output_mld": derating_eval["max_safe_output_mld"],
-                "is_quality_safe": derating_eval["is_quality_safe"],
-                "violations": derating_eval["violations"],
+                "is_quality_safe": derating_eval["is_quality_safe"] and sector_wq_compliance["all_compliant"],
+                "violations": derating_eval["violations"] + sector_wq_compliance["alerts"],
             },
         }
     finally:
@@ -285,12 +290,30 @@ def read_tariff_and_quality_feeds(
                     (
                         f"Ingested {len(tariff_schedule)}h tariff/demand horizon from hour {current_hour}, "
                         f"bloom={highest_bloom_severity} (max {derating_eval['max_safe_output_mld']} MLD), "
+                        f"non_compliant_sectors={sector_wq_compliance['excluded_from_tariff_scheduling']}, "
                         f"alerts={len(sanitized_alerts)} ({len(inj_alerts)} quarantined)."
                     ),
                     "CODE_GUARD",
                     "ALLOWED",
                 ),
             )
+            for nc in sector_wq_compliance["non_compliant_sectors"]:
+                audit_conn.execute(
+                    """
+                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (
+                        "WATER_QUALITY_NON_COMPLIANT",
+                        nc["target_id"],
+                        (
+                            f"{nc['alert']} (timestamp={nc['timestamp']}). "
+                            f"Excluded {nc['sector']} from tariff-driven scheduling."
+                        ),
+                        "CODE_GUARD",
+                        "NON_COMPLIANT",
+                    ),
+                )
             for ia in inj_alerts:
                 audit_conn.execute(
                     """

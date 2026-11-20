@@ -11,6 +11,8 @@ def _format_actuator_value(action_type: str, value: float) -> str:
     """Format actuator values cleanly for control-room display."""
     if action_type in ("CLOSE_VALVE", "OPEN_VALVE"):
         return "OPEN (1.0)" if float(value) >= 0.5 else "CLOSED (0.0)"
+    if action_type == "ISOLATE_AND_FLUSH":
+        return f"{float(value):.2f} mg/L" if float(value) > 0 else "ISOLATE_AND_FLUSH"
     return f"{float(value):.1f} MLD"
 
 

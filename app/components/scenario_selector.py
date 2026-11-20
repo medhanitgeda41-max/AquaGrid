@@ -49,7 +49,8 @@ def _execute_scenario(scenario_key: str) -> None:
     entry["injector"]()
 
     scenario_num = entry.get("scenario_num")
-    result = run_agent(scenario_id=scenario_num, current_hour=DEFAULT_SCADA_HOUR)
+    agent_scenario_id = scenario_num if scenario_num is not None else entry["id"]
+    result = run_agent(scenario_id=agent_scenario_id, current_hour=DEFAULT_SCADA_HOUR)
 
     bypass_result = None
     flagged = [a for a in result.get("sanitized_alerts", []) if a.get("injection_detected")]

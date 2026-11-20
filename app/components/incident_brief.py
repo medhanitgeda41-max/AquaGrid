@@ -43,6 +43,14 @@ def render_incident_brief() -> None:
         _render_final_valve_v12_status()
         return
 
+    # 0. Per-Sector Water Quality Non-Compliance Alert (U-5.1)
+    wq_comp = result.get("sector_water_quality_compliance") or {}
+    if wq_comp.get("alerts"):
+        excl = ", ".join(wq_comp.get("excluded_from_tariff_scheduling", []))
+        section_header("Sector Water Quality Guard", ["CODE"], extra_badge=status_badge("NON_COMPLIANT"))
+        for alert_msg in wq_comp["alerts"]:
+            st.error(f"**{alert_msg}** — Removed from tariff-driven scheduling: {excl}")
+
     # 1. Operator Brief & Maintenance Advisory / Work Orders
     b_col, m_col = st.columns(2)
     with b_col:

@@ -31,7 +31,9 @@ def test_scenario_registry_has_round_1_and_round_2_entries():
             assert field in entry and entry[field]
 
     for entry in r2:
-        assert entry["enabled"] is False
+        assert isinstance(entry["enabled"], bool)
+        if entry["enabled"]:
+            assert callable(entry["injector"])
         for field in ("id", "round", "title", "brief", "watch_for"):
             assert field in entry and entry[field]
 

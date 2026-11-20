@@ -29,10 +29,13 @@ def _parse_json_response(raw_content: str) -> dict:
         raise
 
 
-def _detect_scenario(user_prompt: str) -> int | None:
-    """Extract scenario_id from the user prompt JSON or plain text."""
-    import re
-    # Match JSON key: "scenario_id": 1
+def _detect_scenario(user_prompt: str) -> int | str | None:
+    """Extract scenario_id (int 1..4 or str 'U-5.1'..'U-5.5') from the user prompt JSON or plain text."""
+    # Match string JSON key: "scenario_id": "U-5.1"
+    m_str = re.search(r'"scenario_id"\s*:\s*"(U-5\.\d+)"', user_prompt, re.IGNORECASE)
+    if m_str:
+        return m_str.group(1).upper()
+    # Match numeric JSON key: "scenario_id": 1
     m = re.search(r'"scenario_id"\s*:\s*(\d+)', user_prompt)
     if m:
         return int(m.group(1))
@@ -47,6 +50,33 @@ def generate_offline_mock_response(system_prompt: str, user_prompt: str) -> dict
     """Deterministic rule-based mock engine providing realistic reasoning outputs without external APIs."""
     user_lower = user_prompt.lower()
     scenario_id = _detect_scenario(user_prompt)
+
+    if scenario_id == "U-5.1" or ('"non_compliant"' in user_lower and "sector 2" in user_lower):
+        return {
+            "operator_brief": (
+                "WATER QUALITY NON-COMPLIANT — SECTOR 2 (0.12 mg/L < 0.20): Free chlorine residual in Sector 2 "
+                "dropped below the mandatory 0.20 mg/L potable floor during the 14:00 peak tariff ($0.48/kWh). "
+                "Water quality outranks tariff savings; Sector 2 has been removed from tariff-driven scheduling."
+            ),
+            "maintenance_advisory": (
+                "Dispatch water quality and flushing crew to Sector 2 immediately; after operator approval, "
+                "execute ISOLATE_AND_FLUSH on SECTOR-02 and verify chlorine residual >= 0.20 mg/L before restoration."
+            ),
+            "proposed_schedule": (
+                "00:00-06:00 at 115 MLD (off-peak $0.09/kWh), 06:00-14:00 at 100 MLD (mid-peak $0.20/kWh), "
+                "14:00-18:00 at 100 MLD (peak $0.48/kWh; Sector 2 excluded from tariff-driven cuts — water quality priority), "
+                "19:00-24:00 at 95 MLD."
+            ),
+            "action_proposal": {
+                "action_type": "ISOLATE_AND_FLUSH",
+                "target_id": "SECTOR-02",
+                "proposed_value": 0.0,
+                "rationale": (
+                    "Sector 2 chlorine residual is 0.12 mg/L (< 0.20 mg/L threshold); isolate and flush SECTOR-02 "
+                    "pending operator approval. Water quality outranks peak-tariff optimization."
+                ),
+            },
+        }
 
     if scenario_id == 1 or ("leak" in user_lower and "p-17" in user_lower):
         return {

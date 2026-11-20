@@ -40,11 +40,13 @@ ALLOWED_ACTION_TYPES: tuple[str, ...] = (
     "CLOSE_VALVE",
     "OPEN_VALVE",
     "SET_PLANT_OUTPUT",
+    "ISOLATE_AND_FLUSH",
 )
 
 KNOWN_VALVES: tuple[str, ...] = tuple(f"V-{i:02d}" for i in range(1, 21))
 KNOWN_PLANTS: tuple[str, ...] = ("DESAL-01",)
-KNOWN_TARGET_IDS: tuple[str, ...] = KNOWN_VALVES + KNOWN_PLANTS
+KNOWN_SECTOR_TARGETS: tuple[str, ...] = tuple(f"SECTOR-{i:02d}" for i in range(1, 7))
+KNOWN_TARGET_IDS: tuple[str, ...] = KNOWN_VALVES + KNOWN_PLANTS + KNOWN_SECTOR_TARGETS
 
 KNOWN_SECTORS: tuple[str, ...] = (
     "Sector 1",

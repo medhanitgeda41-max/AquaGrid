@@ -90,6 +90,10 @@ def _render_live_sim_feed() -> None:
     if ai_err:
         st.error(f"**AI Agent Error:** {ai_err}")
 
+    wq_compliance = feeds_check.get("sector_water_quality_compliance", {})
+    for wq_alert in wq_compliance.get("alerts", []):
+        st.error(wq_alert)
+
     if res_pct < RESERVOIR_FLOOR_PERCENT * 100.0:
         st.error(
             f"**RESERVOIR ALERT:** Strategic Reservoir RES-01 dropped to **{res_pct:.2f}% ({res_vol:.1f} ML)** — "

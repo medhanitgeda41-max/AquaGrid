@@ -270,6 +270,65 @@ def inject_scenario_4(db_path: str | None = None) -> dict:
     }
 
 
+def inject_scenario_u51(db_path: str | None = None) -> dict:
+    """
+    Scenario U-5.1: Chlorine drops in Sector 2 during 14:00 peak tariff ($0.48/kWh).
+    - Sector 2 chlorine residual drops to 0.12 mg/L (< CHLORINE_MIN_MG_L = 0.20 mg/L).
+    - Water quality outranks tariff savings: Sector 2 is NON_COMPLIANT, removed from
+      tariff-driven scheduling, and ISOLATE_AND_FLUSH on SECTOR-02 is staged PENDING.
+    """
+    from datetime import datetime, timezone
+
+    now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with transaction_scope(db_path) as conn:
+        # Ensure 14:00 peak tariff ($0.48/kWh) is active
+        conn.execute("UPDATE tariffs SET rate_per_kwh = 0.48, is_peak = 1 WHERE hour = 14;")
+
+        # Inject low chlorine residual in Sector 2 (0.12 mg/L < 0.20 mg/L)
+        conn.execute(
+            """
+            INSERT INTO sector_water_quality (sector, chlorine_mg_l, timestamp)
+            VALUES (?, ?, ?);
+            """,
+            ("Sector 2", 0.12, now_utc_str),
+        )
+
+        # Log water quality compliance alert
+        alert_txt = (
+            "WATER QUALITY NON-COMPLIANT — SECTOR 2 (0.12 mg/L < 0.20): "
+            "Free chlorine residual dropped below minimum threshold during 14:00 peak tariff ($0.48/kWh). "
+            "Exclude Sector 2 from tariff-driven scheduling and stage ISOLATE_AND_FLUSH for operator approval."
+        )
+        conn.execute(
+            """
+            INSERT INTO quality_alerts (severity, location, raw_text, sanitized_text, is_injection)
+            VALUES ('CRITICAL', 'Sector 2', ?, ?, 0);
+            """,
+            (alert_txt, alert_txt),
+        )
+
+        # Audit log
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "SCENARIO_INJECTED",
+                "U-5.1",
+                "Injected Sector 2 chlorine drop (0.12 mg/L < 0.20 mg/L) at 14:00 peak tariff ($0.48/kWh)",
+                "CODE_GUARD",
+                "ALLOWED",
+            ),
+        )
+
+    return {
+        "scenario": "U-5.1",
+        "name": "Chlorine drops in Sector 2",
+        "description": "Sector 2 chlorine residual drops to 0.12 mg/L (< 0.20 mg/L) during 14:00 peak tariff.",
+    }
+
+
 # Single source of truth for all Round 1 and Round 2 scenarios shown in the SCADA Scenario Panel.
 SCENARIO_REGISTRY: list[dict] = [
     # ROUND 1 — Core scenarios
@@ -321,8 +380,8 @@ SCENARIO_REGISTRY: list[dict] = [
         "title": "Chlorine drops in Sector 2",
         "brief": "chlorine residual in Sector 2 drops below 0.2 mg/L during the 2 PM peak tariff. Water quality outranks tariff savings.",
         "watch_for": "Sector 2 NON_COMPLIANT, removed from tariff scheduling, isolation-and-flush staged for operator approval.",
-        "enabled": False,
-        "injector": None,
+        "enabled": True,
+        "injector": inject_scenario_u51,
     },
     {
         "id": "U-5.2",

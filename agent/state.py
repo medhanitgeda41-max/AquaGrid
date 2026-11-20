@@ -1,11 +1,11 @@
 """LangGraph Agent State schema using Pydantic / TypedDict."""
-from typing import TypedDict, Any, Optional
+from typing import TypedDict, Any, Optional, Union
 
 
 class AgentState(TypedDict):
     """Execution state passed between LangGraph agent nodes."""
     # Run context & mode
-    scenario_id: Optional[int]
+    scenario_id: Optional[Union[int, str]]
     current_hour: int
     llm_provider: str
 
@@ -17,6 +17,8 @@ class AgentState(TypedDict):
     hourly_demand_24h: dict[int, float]
     reservoir_status: dict
     sanitized_alerts: list[dict]
+    sector_water_quality_compliance: dict
+    excluded_sectors: list[str]
 
     # Cognitive Reasoning (Layer 2 output)
     last_user_prompt: str

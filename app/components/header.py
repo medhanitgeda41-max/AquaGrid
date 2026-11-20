@@ -131,6 +131,10 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
         delta_color="inverse" if pending_count > 0 else "off",
     )
 
+    wq_compliance = feeds_data.get("sector_water_quality_compliance", {})
+    for wq_alert in wq_compliance.get("alerts", []):
+        st.error(wq_alert)
+
     return {
         "telemetry_data": telemetry_data,
         "feeds_data": feeds_data,
