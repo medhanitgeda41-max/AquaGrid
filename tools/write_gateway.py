@@ -189,31 +189,66 @@ def add_emergency_commitment(
     }
 
 
+_FORBIDDEN_APPROVAL_KEYS = (
+    "pre_approved",
+    "preapproved",
+    "approved",
+    "approval",
+    "approved_by",
+    "operator_approved",
+    "bypass_approval",
+    "auto_approve",
+    "force_execute",
+    "override_approval",
+)
+
+
 def stage_gated_valve_or_setpoint_action(
     action_type: str,
     target_id: str,
     proposed_value: float,
     rationale: str,
     db_path: Optional[str] = None,
+    provenance: str = "AGENT_ANALYSIS",
+    provenance_ref: str = "",
+    **extra_kwargs,
 ) -> dict:
     """
     The ONLY authorized write staging gateway for AquaGrid.
 
-    Validates targets against whitelists, runs mathematical safety floor checks,
-    and inserts approved proposals into 'pending_actions' with status 'PENDING'.
+    Validates targets against whitelists, refuses any LLM approval claim (pre_approved,
+    approved, approval, etc.), runs mathematical safety floor checks, records action
+    provenance (AGENT_ANALYSIS or UNTRUSTED_TEXT), and inserts approved proposals into
+    'pending_actions' with status 'PENDING'.
     DOES NOT modify 'valves' or 'plant_setpoints' directly.
-
-    Args:
-        action_type: Must be 'CLOSE_VALVE', 'OPEN_VALVE', or 'SET_PLANT_OUTPUT'.
-        target_id: Must be in V-01..V-20 or 'DESAL-01'.
-        proposed_value: Proposed actuator value (0.0/1.0 for valves, MLD for plant).
-        rationale: Plain English justification.
-        db_path: Optional database path override.
-
-    Returns:
-        Result dict with status 'STAGED_PENDING_APPROVAL', 'REJECTED_INVALID_TARGET',
-        or 'REJECTED_BY_SAFETY_GUARD'.
     """
+    # 0. Refuse any unauthorized approval claim passed by the LLM or untrusted caller
+    bad_keys = [
+        k for k in extra_kwargs
+        if k.lower() in _FORBIDDEN_APPROVAL_KEYS
+        or any(tok in k.lower() for tok in ("approv", "bypass", "override", "auto_exec"))
+    ]
+    if bad_keys:
+        error_msg = (
+            f"REJECTED_UNAUTHORIZED_APPROVAL_CLAIM: Gateway accepts no approval field from LLM "
+            f"(received forbidden parameter(s): {', '.join(bad_keys)} for {action_type} {target_id}). "
+            f"Only the console Approve button can authorize execution."
+        )
+        with transaction_scope(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                ("UNAUTHORIZED_APPROVAL_CLAIM_REFUSED", target_id, error_msg, "CODE_GUARD", "REJECTED_UNAUTHORIZED_APPROVAL_CLAIM"),
+            )
+        return {
+            "status": "REJECTED_UNAUTHORIZED_APPROVAL_CLAIM",
+            "target_id": target_id,
+            "action_type": action_type,
+            "forbidden_fields": bad_keys,
+            "reason": error_msg,
+        }
     # 1. Target and Action Type Whitelist Validation (including action-to-target pairing)
     valid_target_for_action = (
         (action_type in ("CLOSE_VALVE", "OPEN_VALVE") and target_id in KNOWN_VALVES)
@@ -409,14 +444,20 @@ def stage_gated_valve_or_setpoint_action(
     finally:
         conn.close()
 
-    # 3. Stage Action as PENDING in pending_actions (Atomic)
+    # 3. Stage Action as PENDING in pending_actions (Atomic, with provenance)
+    norm_provenance = "UNTRUSTED_TEXT" if str(provenance or "").upper() == "UNTRUSTED_TEXT" else "AGENT_ANALYSIS"
+    prov_ref_clean = str(provenance_ref or "").strip()
+    prov_label = f"{norm_provenance} ({prov_ref_clean})" if prov_ref_clean else norm_provenance
+
     with transaction_scope(db_path) as tx_conn:
         cursor = tx_conn.execute(
             """
-            INSERT INTO pending_actions (action_type, target_id, proposed_value, current_value, rationale, status)
-            VALUES (?, ?, ?, ?, ?, 'PENDING');
+            INSERT INTO pending_actions (
+                action_type, target_id, proposed_value, current_value, rationale, provenance, provenance_ref, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING');
             """,
-            (action_type, target_id, proposed_value, current_value, rationale),
+            (action_type, target_id, proposed_value, current_value, rationale, norm_provenance, prov_ref_clean),
         )
         action_id = cursor.lastrowid
 
@@ -428,7 +469,10 @@ def stage_gated_valve_or_setpoint_action(
             (
                 "GATEWAY_PROPOSAL",
                 target_id,
-                f"Action {action_type} for {target_id} staged as PENDING (ID: {action_id}). Awaiting human authorization.",
+                (
+                    f"Action {action_type} for {target_id} staged as PENDING (ID: {action_id}, "
+                    f"provenance={prov_label}). Awaiting human authorization."
+                ),
                 "CODE_GUARD",
                 "PENDING",
             ),
@@ -442,6 +486,8 @@ def stage_gated_valve_or_setpoint_action(
         "proposed_value": proposed_value,
         "current_value": current_value,
         "rationale": rationale,
+        "provenance": norm_provenance,
+        "provenance_ref": prov_ref_clean,
         "message": "Action staged successfully in PENDING state. Awaiting mandatory human operator authorization.",
     }
     if sim_min_projected_percent is not None:

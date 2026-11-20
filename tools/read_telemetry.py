@@ -7,6 +7,7 @@ and returns verified telemetry to the agent.
 from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
+from guards.injection_filter import inspect_untrusted_text
 from guards.sensor_checks import (
     check_flatline,
     check_drift,
@@ -238,15 +239,22 @@ def read_network_telemetry(
             }
             for r in wq_rows
         ]
-        field_tickets = [
-            {
+        field_tickets = []
+        for r in ticket_rows:
+            insp = inspect_untrusted_text(r["text"], source_id=f"TICKET-{r['id']}")
+            field_tickets.append({
                 "id": r["id"],
+                "ticket_ref": f"TICKET-{r['id']}",
                 "sector": r["sector"],
-                "text": r["text"],
+                "trust_level": "UNTRUSTED_TEXT",
+                "text": insp["sanitized_text"],
+                "quoted_data": insp["quoted_data"],
+                "is_injection": insp["is_injection"],
+                "command_or_approval_claim_detected": insp["command_or_approval_claim_detected"],
+                "flagged_patterns": insp["flagged_patterns"],
+                "mentioned_valves": insp["mentioned_valves"],
                 "created_at": r["created_at"],
-            }
-            for r in ticket_rows
-        ]
+            })
         all_timestamps = [
             item["timestamp"]
             for item in (verified_telemetry + quarantined_sensors)

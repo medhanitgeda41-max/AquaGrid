@@ -82,11 +82,13 @@ CREATE TABLE IF NOT EXISTS plant_setpoints (
 -- Gated Pending Actions (HITL Queue)
 CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    action_type TEXT NOT NULL, -- 'CLOSE_VALVE', 'OPEN_VALVE', 'SET_PLANT_OUTPUT'
-    target_id TEXT NOT NULL,   -- 'V-01'..'V-20', 'DESAL-01'
+    action_type TEXT NOT NULL, -- 'CLOSE_VALVE', 'OPEN_VALVE', 'SET_PLANT_OUTPUT', 'ISOLATE_AND_FLUSH'
+    target_id TEXT NOT NULL,   -- 'V-01'..'V-20', 'DESAL-01', 'SECTOR-01'..'SECTOR-06'
     proposed_value REAL NOT NULL,
     current_value REAL NOT NULL,
     rationale TEXT NOT NULL,
+    provenance TEXT NOT NULL DEFAULT 'AGENT_ANALYSIS', -- 'AGENT_ANALYSIS' or 'UNTRUSTED_TEXT'
+    provenance_ref TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'APPROVED', 'REJECTED', 'CANCELLED_BY_SAFETY_RECHECK'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     executed_at TIMESTAMP,

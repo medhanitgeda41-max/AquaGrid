@@ -7,7 +7,7 @@ the pure Python regex injection filter before presenting data to the agent.
 from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
-from guards.injection_filter import sanitize_text, QUARANTINED_ALERT_PLACEHOLDER
+from guards.injection_filter import inspect_untrusted_text, sanitize_text, QUARANTINED_ALERT_PLACEHOLDER
 from guards.safety_floors import compute_effective_reservoir_floor, evaluate_quality_and_bloom_derating
 from guards.water_quality import evaluate_sector_chlorine
 
@@ -138,9 +138,9 @@ def read_tariff_and_quality_feeds(
 
         for a in alert_rows:
             raw = a["raw_text"]
-            # Layer 0: Deterministic pure Python regex sanitization
-            is_inj, cleaned = sanitize_text(raw)
-            flagged = is_inj or bool(a["is_injection"])
+            # Layer 0: Deterministic pure Python regex sanitization + UNTRUSTED_TEXT tagging
+            inspected = inspect_untrusted_text(raw, source_id=f"ALERT-{a['id']}")
+            flagged = inspected["is_injection"] or bool(a["is_injection"])
 
             if flagged:
                 # Quarantine the ENTIRE alert text: pass only placeholder + metadata (id, source, severity)
@@ -148,8 +148,11 @@ def read_tariff_and_quality_feeds(
                     "alert_id": a["id"],
                     "source": a["location"],
                     "severity": a["severity"],
+                    "trust_level": "UNTRUSTED_TEXT",
                     "text": QUARANTINED_ALERT_PLACEHOLDER,
+                    "quoted_data": f'UNTRUSTED_TEXT[ALERT-{a["id"]}]: "{QUARANTINED_ALERT_PLACEHOLDER}"',
                     "injection_detected": True,
+                    "command_or_approval_claim_detected": True,
                 })
                 continue
 
@@ -164,8 +167,12 @@ def read_tariff_and_quality_feeds(
                 "severity": a["severity"],
                 "source": a["location"],
                 "location": a["location"],
-                "text": cleaned,
+                "trust_level": "UNTRUSTED_TEXT",
+                "text": inspected["sanitized_text"],
+                "quoted_data": inspected["quoted_data"],
                 "injection_detected": False,
+                "command_or_approval_claim_detected": inspected["command_or_approval_claim_detected"],
+                "flagged_patterns": inspected["flagged_patterns"],
             })
 
         # 5. Fetch Latest Intake Water Quality Telemetry
@@ -234,15 +241,22 @@ def read_tariff_and_quality_feeds(
             LIMIT 20;
             """
         ).fetchall()
-        field_tickets = [
-            {
+        field_tickets = []
+        for r in ticket_rows:
+            insp = inspect_untrusted_text(r["text"], source_id=f"TICKET-{r['id']}")
+            field_tickets.append({
                 "id": r["id"],
+                "ticket_ref": f"TICKET-{r['id']}",
                 "sector": r["sector"],
-                "text": r["text"],
+                "trust_level": "UNTRUSTED_TEXT",
+                "text": insp["sanitized_text"],
+                "quoted_data": insp["quoted_data"],
+                "is_injection": insp["is_injection"],
+                "command_or_approval_claim_detected": insp["command_or_approval_claim_detected"],
+                "flagged_patterns": insp["flagged_patterns"],
+                "mentioned_valves": insp["mentioned_valves"],
                 "created_at": r["created_at"],
-            }
-            for r in ticket_rows
-        ]
+            })
 
         sector_wq_compliance = evaluate_sector_chlorine(sector_water_quality)
         eff_floor = compute_effective_reservoir_floor(
@@ -341,5 +355,23 @@ def read_tariff_and_quality_feeds(
                         "BLOCKED",
                     ),
                 )
+            for ft in field_tickets:
+                if ft.get("command_or_approval_claim_detected"):
+                    audit_conn.execute(
+                        """
+                        INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                        VALUES (?, ?, ?, ?, ?);
+                        """,
+                        (
+                            "UNTRUSTED_TICKET_FLAGGED",
+                            ft["ticket_ref"],
+                            (
+                                f"Field ticket {ft['ticket_ref']} ({ft['sector']}) flagged as UNTRUSTED_TEXT "
+                                f"containing command/approval claim (valves={ft['mentioned_valves']})."
+                            ),
+                            "CODE_GUARD",
+                            "FLAGGED",
+                        ),
+                    )
 
     return result

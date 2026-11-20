@@ -30,6 +30,12 @@ def init_db(db_path: str | None = None) -> None:
         conn.execute("PRAGMA busy_timeout = 5000;")
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(schema_sql)
+        # Ensure new columns exist on existing SQLite files
+        pa_cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_actions);").fetchall()}
+        if "provenance" not in pa_cols:
+            conn.execute("ALTER TABLE pending_actions ADD COLUMN provenance TEXT NOT NULL DEFAULT 'AGENT_ANALYSIS';")
+        if "provenance_ref" not in pa_cols:
+            conn.execute("ALTER TABLE pending_actions ADD COLUMN provenance_ref TEXT NOT NULL DEFAULT '';")
         conn.commit()
     finally:
         conn.close()

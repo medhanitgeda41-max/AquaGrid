@@ -58,3 +58,54 @@ def sanitize_text(text: str) -> tuple[bool, str]:
 
     # Quarantine the entire alert text — withhold all original content
     return True, QUARANTINED_ALERT_PLACEHOLDER
+
+
+# Patterns flagging embedded actuator orders or unauthorized approval claims inside untrusted text
+COMMAND_OR_APPROVAL_CLAIM_PATTERNS = [
+    re.compile(r"\b(close|open|shut|actuate)\b.{0,30}\bV-\d{2}\b", re.IGNORECASE),
+    re.compile(r"\bV-\d{2}\b.{0,30}\b(close|open|shut|actuate)\b", re.IGNORECASE),
+    re.compile(r"\bapproved\s+by\b", re.IGNORECASE),
+    re.compile(r"\bpre[-_\s]?approved\b", re.IGNORECASE),
+    re.compile(r"\boverride\b", re.IGNORECASE),
+    re.compile(r"\bauthorized\s+by\s+(supervisor|manager|admin)\b", re.IGNORECASE),
+]
+
+
+def inspect_untrusted_text(text: str, source_id: str = "") -> dict:
+    """
+    Sanitize and classify external text (alerts, feeds, field tickets) as UNTRUSTED_TEXT.
+
+    - Runs prompt-injection detection (withholding full text if injection detected).
+    - Flags embedded valve commands (e.g., 'Close V-17') and unauthorized approval claims
+      ('approved by', 'pre-approved', 'override').
+    - Wraps safe text strictly as quoted UNTRUSTED_TEXT data for the LLM.
+    """
+    raw = str(text or "").strip()
+    is_inj, inj_patterns = detect_injection(raw)
+
+    claim_patterns: list[str] = []
+    for pat in COMMAND_OR_APPROVAL_CLAIM_PATTERNS:
+        if pat.search(raw):
+            claim_patterns.append(pat.pattern)
+
+    valve_mentions = sorted(set(re.findall(r"\bV-\d{2}\b", raw, flags=re.IGNORECASE)))
+    valve_mentions = [v.upper() for v in valve_mentions]
+
+    if is_inj:
+        sanitized = QUARANTINED_ALERT_PLACEHOLDER
+        quoted_data = f'UNTRUSTED_TEXT[{source_id}]: "{QUARANTINED_ALERT_PLACEHOLDER}"'
+    else:
+        sanitized = raw
+        escaped = raw.replace('"', "'")
+        quoted_data = f'UNTRUSTED_TEXT[{source_id}]: "{escaped}"'
+
+    return {
+        "trust_level": "UNTRUSTED_TEXT",
+        "source_id": source_id,
+        "sanitized_text": sanitized,
+        "quoted_data": quoted_data,
+        "is_injection": is_inj,
+        "command_or_approval_claim_detected": bool(claim_patterns) or is_inj,
+        "flagged_patterns": inj_patterns + claim_patterns,
+        "mentioned_valves": valve_mentions,
+    }
