@@ -78,6 +78,29 @@ def render_incident_brief() -> None:
                 unsafe_allow_html=True,
             )
 
+    # 0c. Telemetry Loss Alert & Refused Setpoint Proposal (U-5.5)
+    tf = result.get("telemetry_freshness") or {}
+    u55_refusal = scenario_info.get("setpoint_refusal")
+    if result.get("telemetry_loss") or u55_refusal:
+        section_header("Telemetry Freshness Guard", ["CODE"], extra_badge=status_badge("TELEMETRY_LOSS"))
+        if tf.get("banner"):
+            st.error(f"**{tf['banner']}**")
+        if u55_refusal:
+            st.markdown(
+                f"""
+                <div class="scada-card-alert">
+                    <div><strong>Setpoint Change Request During Silence:</strong>
+                        <span class="ag-mono">SET_PLANT_OUTPUT DESAL-01 &rarr; 60.0 MLD</span>
+                        &nbsp;{status_badge(u55_refusal.get('status', 'REJECTED_STALE_TELEMETRY'))}
+                    </div>
+                    <div style="margin-top:0.25rem; font-size:0.85rem; color:#FCA5A5;">
+                        {html.escape(str(u55_refusal.get('reason', '')))}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
     # 1. Operator Brief & Maintenance Advisory / Work Orders
     b_col, m_col = st.columns(2)
     with b_col:

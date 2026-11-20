@@ -47,12 +47,48 @@ def node_ingest(state: AgentState) -> dict:
         "field_tickets": feeds_data.get("field_tickets", []),
         "sector_water_quality_compliance": feeds_data.get("sector_water_quality_compliance", {}),
         "excluded_sectors": feeds_data.get("excluded_sectors", []),
+        "telemetry_freshness": telemetry_data.get("telemetry_freshness", {}),
+        "telemetry_loss": bool(telemetry_data.get("telemetry_loss", False)),
         "agent_step_count": state.get("agent_step_count", 0) + 1,
     }
 
 
 def node_reason(state: AgentState) -> dict:
     """Cognitive analysis: explain leak vs. fault and propose tariff schedule / physical actions."""
+    # Pure-Python TELEMETRY_LOSS halt: do NOT plan or optimize tariffs while telemetry is stale
+    if state.get("telemetry_loss"):
+        freshness = state.get("telemetry_freshness") or {}
+        banner = freshness.get("banner") or "TELEMETRY LOSS — Holding last safe state."
+        with transaction_scope() as audit_conn:
+            audit_conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (
+                    "TELEMETRY_LOSS_PLANNING_PAUSED",
+                    "SCADA_FEED",
+                    f"{banner} Planning and tariff optimisation paused; no proposals generated.",
+                    "CODE_GUARD",
+                    "TELEMETRY_LOSS",
+                ),
+            )
+        return {
+            "last_user_prompt": "",
+            "operator_brief": (
+                f"{banner} Tariff optimisation is paused and no new setpoint or valve proposals "
+                f"will be generated until telemetry returns and readings are re-validated."
+            ),
+            "maintenance_advisory": (
+                "Investigate SCADA telemetry link outage immediately. Restore feed and confirm "
+                "all pressure, flow, and quality sensors pass re-validation before resuming optimisation."
+            ),
+            "proposed_schedule": "TARIFF OPTIMISATION PAUSED — TELEMETRY_LOSS (holding last safe state).",
+            "schedule_validation": None,
+            "proposed_action": None,
+            "llm_provider": "CODE_GUARD (TELEMETRY_LOSS — Planning Paused)",
+            "agent_step_count": state.get("agent_step_count", 0) + 1,
+        }
     # Pass alerts and field tickets strictly as quoted UNTRUSTED_TEXT data
     quoted_tickets = [
         {

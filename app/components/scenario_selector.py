@@ -45,6 +45,11 @@ def _execute_scenario(scenario_key: str) -> None:
     if not entry or not entry.get("enabled") or not callable(entry.get("injector")):
         return
 
+    sim = get_simulator()
+    if entry["id"] != "U-5.5":
+        sim.resume_feed()
+    st.session_state["telemetry_restored_banner"] = None
+
     reset_database()
     info = entry["injector"]()
 
@@ -95,6 +100,7 @@ def _reset_database_callback() -> None:
         st.session_state["last_agent_result"] = None
         st.session_state["last_bypass_result"] = None
         st.session_state["last_pre_approved_refusal"] = None
+        st.session_state["telemetry_restored_banner"] = None
         st.session_state["selected_leak_id"] = None
         st.session_state["last_hitl_feedback"] = {
             "kind": "info",

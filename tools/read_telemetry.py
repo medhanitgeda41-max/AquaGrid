@@ -8,6 +8,7 @@ from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
 from guards.injection_filter import inspect_untrusted_text
+from guards.telemetry_freshness import evaluate_telemetry_freshness
 from guards.sensor_checks import (
     check_flatline,
     check_drift,
@@ -255,9 +256,17 @@ def read_network_telemetry(
                 "mentioned_valves": insp["mentioned_valves"],
                 "created_at": r["created_at"],
             })
+        all_readings_for_freshness = verified_telemetry + quarantined_sensors
+        freshness_report = evaluate_telemetry_freshness(all_readings_for_freshness)
+        stale_set = set(freshness_report["stale_sensor_ids"])
+        for item in verified_telemetry:
+            item["freshness"] = "STALE" if item["sensor_id"] in stale_set else "FRESH"
+        for item in quarantined_sensors:
+            item["freshness"] = "STALE" if item["sensor_id"] in stale_set else "FRESH"
+
         all_timestamps = [
             item["timestamp"]
-            for item in (verified_telemetry + quarantined_sensors)
+            for item in all_readings_for_freshness
             if item.get("timestamp")
         ]
         latest_telemetry_ts = max(all_timestamps) if all_timestamps else None
@@ -266,6 +275,8 @@ def read_network_telemetry(
             "sector_filter": sector_id or "ALL",
             "evaluation_hour": latest_hour,
             "latest_telemetry_timestamp": latest_telemetry_ts,
+            "telemetry_freshness": freshness_report,
+            "telemetry_loss": freshness_report["is_telemetry_loss"],
             "total_sensors_evaluated": len(sensors),
             "verified_sensor_count": len(verified_telemetry),
             "quarantined_sensor_count": len(quarantined_sensors),

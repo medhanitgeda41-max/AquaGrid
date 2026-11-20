@@ -549,6 +549,53 @@ def inject_scenario_u54(db_path: str | None = None) -> dict:
     }
 
 
+def inject_scenario_u55(db_path: str | None = None) -> dict:
+    """
+    Scenario U-5.5: SCADA goes quiet (10-minute telemetry loss).
+    - Pauses live telemetry feed and fast-forwards telemetry timestamps by 10 minutes (> 180s limit).
+    - Asks the gateway for a setpoint change (SET_PLANT_OUTPUT DESAL-01 -> 60.0 MLD), which is
+      refused with REJECTED_STALE_TELEMETRY.
+    - Agent runs under TELEMETRY_LOSS, pauses planning/tariff optimisation, and holds last safe state.
+    """
+    from guards.telemetry_freshness import fast_forward_telemetry_age
+    from simulator import get_simulator
+    from tools.write_gateway import stage_gated_valve_or_setpoint_action
+
+    sim = get_simulator()
+    sim.pause_feed()
+    freshness = fast_forward_telemetry_age(minutes=10, db_path=db_path)
+
+    setpoint_refusal = stage_gated_valve_or_setpoint_action(
+        action_type="SET_PLANT_OUTPUT",
+        target_id="DESAL-01",
+        proposed_value=60.0,
+        rationale="Requested peak-tariff setpoint change during 10-minute SCADA telemetry silence.",
+        db_path=db_path,
+    )
+
+    with transaction_scope(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "SCENARIO_INJECTED",
+                "U-5.5",
+                f"Stopped feed & fast-forwarded 10 min ({freshness['banner']}); setpoint proposal returned {setpoint_refusal['status']}.",
+                "CODE_GUARD",
+                "TELEMETRY_LOSS",
+            ),
+        )
+
+    return {
+        "scenario": "U-5.5",
+        "name": "SCADA goes quiet",
+        "telemetry_freshness": freshness,
+        "setpoint_refusal": setpoint_refusal,
+    }
+
+
 # Single source of truth for all Round 1 and Round 2 scenarios shown in the SCADA Scenario Panel.
 SCENARIO_REGISTRY: list[dict] = [
     # ROUND 1 — Core scenarios
@@ -640,8 +687,8 @@ SCENARIO_REGISTRY: list[dict] = [
         "title": "SCADA goes quiet",
         "brief": "the telemetry feed drops for 10 minutes.",
         "watch_for": "no new proposals, tariff optimisation paused, last safe state held, telemetry-loss alert; readings re-validated when data returns.",
-        "enabled": False,
-        "injector": None,
+        "enabled": True,
+        "injector": inject_scenario_u55,
     },
 ]
 

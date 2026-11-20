@@ -27,6 +27,7 @@ from guards.safety_floors import (
     simulate_reservoir_trajectory,
     evaluate_quality_and_bloom_derating,
 )
+from guards.telemetry_freshness import check_db_telemetry_freshness
 from guards.water_quality import evaluate_sector_chlorine, target_id_to_sector_name
 
 
@@ -198,6 +199,37 @@ def _execute_bound_action_in_tx(
             "token_id": token_id,
             "target_id": target_id,
             "expires_at": token_row["expires_at"],
+            "reason": reason,
+        }
+
+    # 3b. Telemetry freshness check at Approve (refuse execution if telemetry is STALE)
+    freshness_at_approve = check_db_telemetry_freshness(db_path=db_path, now_utc=now_utc, conn=conn)
+    if freshness_at_approve["is_telemetry_loss"]:
+        reason = (
+            f"CANCELLED_STALE_TELEMETRY: {freshness_at_approve['banner']} "
+            f"Refused Approve on Action #{action_id} ({action_type} {target_id}). Last safe state held."
+        )
+        conn.execute(
+            """
+            UPDATE pending_actions
+            SET status = 'CANCELLED_STALE_TELEMETRY', executed_at = ?, approver = ?
+            WHERE id = ?;
+            """,
+            (now_str, approver, action_id),
+        )
+        conn.execute("UPDATE approval_tokens SET used_at = ? WHERE token_id = ?;", (now_str, token_id))
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            ("APPROVAL_CANCELLED_STALE_TELEMETRY", target_id, reason, "CODE_GUARD", "CANCELLED_STALE_TELEMETRY"),
+        )
+        return {
+            "status": "CANCELLED_STALE_TELEMETRY",
+            "token_id": token_id,
+            "action_id": action_id,
+            "telemetry_freshness": freshness_at_approve,
             "reason": reason,
         }
 
@@ -609,6 +641,29 @@ def stage_gated_valve_or_setpoint_action(
             "forbidden_fields": bad_keys,
             "reason": error_msg,
         }
+    # 0b. Telemetry freshness guard: refuse new proposals during TELEMETRY_LOSS
+    freshness = check_db_telemetry_freshness(db_path=db_path)
+    if freshness["is_telemetry_loss"]:
+        reason = (
+            f"REJECTED_STALE_TELEMETRY: {freshness['banner']} "
+            f"Refusing new {action_type} proposal for {target_id} until telemetry returns and is re-validated."
+        )
+        with transaction_scope(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                ("STALE_TELEMETRY_REFUSED", target_id, reason, "CODE_GUARD", "REJECTED_STALE_TELEMETRY"),
+            )
+        return {
+            "status": "REJECTED_STALE_TELEMETRY",
+            "target_id": target_id,
+            "action_type": action_type,
+            "telemetry_freshness": freshness,
+            "reason": reason,
+        }
+
     # 1. Target and Action Type Whitelist Validation (including action-to-target pairing)
     valid_target_for_action = (
         (action_type in ("CLOSE_VALVE", "OPEN_VALVE") and target_id in KNOWN_VALVES)

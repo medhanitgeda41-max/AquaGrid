@@ -117,6 +117,22 @@ class LiveScadaSimulator:
         self._last_ai_error: Optional[str] = None
         self._prev_sensor_vals: dict[str, float] = {}
         self._prev_sector_chlorine: dict[str, float] = {}
+        self._feed_paused: bool = False
+
+    @property
+    def is_feed_paused(self) -> bool:
+        with self._lock:
+            return self._feed_paused
+
+    def pause_feed(self) -> None:
+        """Pause live simulator batch writes (Judge control: 'Stop telemetry feed')."""
+        with self._lock:
+            self._feed_paused = True
+
+    def resume_feed(self) -> None:
+        """Resume live simulator batch writes (Judge control: 'Restore feed')."""
+        with self._lock:
+            self._feed_paused = False
 
     @property
     def is_running(self) -> bool:
@@ -198,6 +214,7 @@ class LiveScadaSimulator:
             self._last_ai_error = None
             self._prev_sensor_vals.clear()
             self._prev_sector_chlorine.clear()
+            self._feed_paused = False
 
     def step(self, force_fault: Optional[str] = None, now_override: Optional[datetime] = None) -> dict:
         """
@@ -585,6 +602,7 @@ class LiveScadaSimulator:
             "water_quality_safe": feeds_check.get("water_quality", {}).get("is_quality_safe", True),
             "sector_water_quality": sector_chlorine_summary,
             "sector_water_quality_compliance": sector_wq_eval,
+            "telemetry_freshness": telemetry_check.get("telemetry_freshness"),
             "ai_run": ai_result,
         }
 
@@ -596,10 +614,11 @@ class LiveScadaSimulator:
     def _run_loop(self) -> None:
         """Background daemon loop ticking strictly every interval_seconds until stopped."""
         while not self._stop_event.is_set():
-            try:
-                self.step()
-            except Exception:
-                pass
+            if not self.is_feed_paused:
+                try:
+                    self.step()
+                except Exception:
+                    pass
             if self._stop_event.wait(self.interval_seconds):
                 break
 

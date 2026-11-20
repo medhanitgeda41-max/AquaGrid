@@ -1,8 +1,14 @@
-"""Real-Time (2-Minute) & Optional Accelerated Live Simulation Controls for AquaGrid."""
+"""Real-Time (2-Minute) & Optional Accelerated Live Simulation Controls + Telemetry Freshness Judge Controls."""
+import html
 import streamlit as st
 
-from config.constants import RESERVOIR_FLOOR_PERCENT
+from config.constants import DEFAULT_SCADA_HOUR, RESERVOIR_FLOOR_PERCENT
 from config.region_config import REGION_CONFIG, now_local
+from guards.telemetry_freshness import (
+    check_db_telemetry_freshness,
+    fast_forward_telemetry_age,
+    restore_telemetry_feed,
+)
 from simulator import get_simulator, realistic_daily_demand_mld, tariff_for_hour
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
@@ -15,13 +21,13 @@ def _format_countdown(seconds: int) -> str:
 
 @st.fragment(run_every=int(REGION_CONFIG["ui_refresh_seconds"]))
 def _render_live_sim_feed() -> None:
-    """Auto-refreshing live monitor showing non-duplicated live values and alerts."""
+    """Auto-refreshing live monitor showing non-duplicated live values, freshness status, and alerts."""
     sim = get_simulator()
     dt_now = now_local()
 
     last_dt = sim.last_update_at
     last_update_str = last_dt.strftime("%H:%M:%S") if last_dt else "Initializing..."
-    countdown_str = _format_countdown(sim.seconds_until_next_update())
+    countdown_str = "PAUSED" if sim.is_feed_paused else _format_countdown(sim.seconds_until_next_update())
 
     summary = sim.last_tick_summary
     sim_hour = summary["hour"] if summary else dt_now.hour
@@ -30,6 +36,8 @@ def _render_live_sim_feed() -> None:
 
     telemetry_check = read_network_telemetry(current_hour=sim_hour, log_audit=False)
     feeds_check = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=sim_hour, log_audit=False)
+    freshness = telemetry_check.get("telemetry_freshness") or check_db_telemetry_freshness(current_hour=sim_hour)
+    is_loss = bool(freshness.get("is_telemetry_loss", False))
 
     res = feeds_check.get("reservoir", {})
     res_pct = float(res.get("current_level_percent", 48.0))
@@ -48,16 +56,26 @@ def _render_live_sim_feed() -> None:
     ai_err = sim.last_ai_error
 
     mode_badge = (
-        '<span class="ag-badge ag-badge-warn">DEMO (5s)</span>'
-        if is_accel
-        else '<span class="ag-badge ag-badge-ok">REAL-TIME (2m)</span>'
+        '<span class="ag-badge ag-badge-danger">FEED PAUSED</span>'
+        if sim.is_feed_paused
+        else (
+            '<span class="ag-badge ag-badge-warn">DEMO (5s)</span>'
+            if is_accel
+            else '<span class="ag-badge ag-badge-ok">REAL-TIME (2m)</span>'
+        )
     )
+    loss_inline = (
+        f' &nbsp;|&nbsp; <span class="ag-badge ag-badge-danger">{html.escape(freshness["banner"])}</span>'
+        if is_loss
+        else ""
+    )
+    card_cls = "scada-card-alert" if is_loss else "scada-card-ok"
 
     st.markdown(
         f"""
-        <div class="scada-card-ok" style="margin-top:0.5rem; padding:0.65rem 1rem;">
+        <div class="{card_cls}" style="margin-top:0.5rem; padding:0.65rem 1rem;">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
-                <div>{mode_badge} <strong>Batch #{tick_num}</strong></div>
+                <div>{mode_badge} <strong>Batch #{tick_num}</strong>{loss_inline}</div>
                 <div class="ag-mono" style="font-size:0.84rem; color:#7CE8FF;">
                     Last update: <strong>{last_update_str}</strong> &nbsp;|&nbsp;
                     Next update in <strong>{countdown_str}</strong>
@@ -120,7 +138,7 @@ def _render_live_sim_feed() -> None:
 
 
 def render_live_sim_controls() -> bool:
-    """Render Live Simulation ON/OFF (default OFF), Demo mode (accelerated) toggle (default OFF), and fault chance."""
+    """Render Live Simulation ON/OFF, Demo accelerated toggle, fault chance, and telemetry feed judge controls."""
     sim = get_simulator()
 
     c_toggle, c_demo, c_prob = st.columns([1.1, 1.2, 1.4])
@@ -156,6 +174,31 @@ def render_live_sim_controls() -> bool:
         run_ai_after_batch=True,
     )
 
+    # Judge Controls for U-5.5 Telemetry Feed Outage & Restoration
+    jc1, jc2, jc3 = st.columns(3)
+    with jc1:
+        if st.button("Stop telemetry feed", key="btn_stop_feed", width="stretch"):
+            sim.pause_feed()
+            st.session_state["telemetry_restored_banner"] = None
+            st.rerun()
+    with jc2:
+        if st.button("Fast-forward 10 minutes", key="btn_ff_10min", width="stretch"):
+            sim.pause_feed()
+            fast_forward_telemetry_age(minutes=10)
+            st.session_state["telemetry_restored_banner"] = None
+            st.rerun()
+    with jc3:
+        if st.button("Restore feed", key="btn_restore_feed", width="stretch"):
+            sim.resume_feed()
+            res_hour = sim.current_hour if live_on else DEFAULT_SCADA_HOUR
+            restored = restore_telemetry_feed(current_hour=res_hour)
+            st.session_state["telemetry_restored_banner"] = restored["message"]
+            st.rerun()
+
+    restored_msg = st.session_state.get("telemetry_restored_banner")
+    if restored_msg:
+        st.success(f"**{restored_msg}**")
+
     if live_on:
         if not sim.is_running:
             sim.start()
@@ -163,5 +206,8 @@ def render_live_sim_controls() -> bool:
     else:
         if sim.is_running:
             sim.stop()
+        freshness_off = check_db_telemetry_freshness()
+        if freshness_off["is_telemetry_loss"]:
+            st.error(f"**{freshness_off['banner']}**")
 
     return bool(live_on)

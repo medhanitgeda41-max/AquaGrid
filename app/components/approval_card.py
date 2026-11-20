@@ -136,11 +136,11 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                                 f"by {res.get('approver')}: {detail}"
                             ),
                         }
-                    elif res_status == "CANCELLED_BY_SAFETY_RECHECK":
+                    elif res_status in ("CANCELLED_BY_SAFETY_RECHECK", "CANCELLED_STALE_TELEMETRY"):
                         st.session_state["last_hitl_feedback"] = {
                             "kind": "error",
                             "message": (
-                                f"Action #{action_id} -> CANCELLED_BY_SAFETY_RECHECK. "
+                                f"Action #{action_id} -> {res_status}. "
                                 f"Reason: {res.get('reason')}"
                             ),
                         }

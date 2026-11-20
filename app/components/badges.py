@@ -253,7 +253,7 @@ def actor_badge(actor: str) -> str:
 def status_badge(status: str) -> str:
     """Return color-coded HTML status badge."""
     s = (status or "UNKNOWN").strip().upper()
-    if s in ("VALID", "EXECUTED", "APPROVED", "ALLOWED", "COMPLETED", "OPEN", "ONLINE", "NORMAL", "RESOLVED", "NOMINAL", "COMPLIANT"):
+    if s in ("VALID", "EXECUTED", "APPROVED", "ALLOWED", "COMPLETED", "OPEN", "ONLINE", "NORMAL", "RESOLVED", "NOMINAL", "COMPLIANT", "FRESH", "TELEMETRY_RESTORED"):
         cls = "ag-badge-ok"
     elif s in (
         "PENDING",
@@ -278,6 +278,10 @@ def status_badge(status: str) -> str:
         "REJECTED_APPROVAL_MISMATCH",
         "REJECTED_APPROVAL_ALREADY_USED",
         "REJECTED_APPROVAL_EXPIRED",
+        "REJECTED_STALE_TELEMETRY",
+        "CANCELLED_STALE_TELEMETRY",
+        "TELEMETRY_LOSS",
+        "STALE",
         "REJECTED_INVALID_TARGET",
         "CANCELLED_BY_SAFETY_RECHECK",
         "ABORTED_BY_SAFETY",

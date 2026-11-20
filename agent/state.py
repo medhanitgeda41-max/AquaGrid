@@ -20,6 +20,8 @@ class AgentState(TypedDict):
     field_tickets: list[dict]
     sector_water_quality_compliance: dict
     excluded_sectors: list[str]
+    telemetry_freshness: dict
+    telemetry_loss: bool
 
     # Cognitive Reasoning (Layer 2 output)
     last_user_prompt: str

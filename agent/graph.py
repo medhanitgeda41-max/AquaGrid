@@ -81,6 +81,8 @@ def run_agent(scenario_id: int | str | None = None, current_hour: int = 14) -> A
         "field_tickets": [],
         "sector_water_quality_compliance": {},
         "excluded_sectors": [],
+        "telemetry_freshness": {},
+        "telemetry_loss": False,
         "last_user_prompt": "",
         "operator_brief": "",
         "maintenance_advisory": "",
