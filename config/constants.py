@@ -41,4 +41,11 @@ KNOWN_VALVES: tuple[str, ...] = tuple(f"V-{i:02d}" for i in range(1, 13))
 KNOWN_PLANTS: tuple[str, ...] = ("DESAL-01",)
 KNOWN_TARGET_IDS: tuple[str, ...] = KNOWN_VALVES + KNOWN_PLANTS
 
-KNOWN_SECTORS: tuple[str, ...] = ("Sector 1", "Sector 2", "Sector 3", "Sector 4")
+KNOWN_SECTORS: tuple[str, ...] = (
+    "Sector 1",
+    "Sector 2",
+    "Sector 3",
+    "Sector 4",
+    "Sector 5",
+    "Sector 6",
+)

@@ -33,6 +33,7 @@ def format_dubai_time(ts: str | None) -> str:
     except ValueError:
         return raw
 
+
 SCADA_CSS = """
 <style>
     .block-container {
@@ -202,9 +203,21 @@ def actor_badge(actor: str) -> str:
 def status_badge(status: str) -> str:
     """Return color-coded HTML status badge."""
     s = (status or "UNKNOWN").strip().upper()
-    if s in ("VALID", "EXECUTED", "APPROVED", "ALLOWED", "COMPLETED", "OPEN", "ONLINE", "NORMAL"):
+    if s in ("VALID", "EXECUTED", "APPROVED", "ALLOWED", "COMPLETED", "OPEN", "ONLINE", "NORMAL", "RESOLVED", "NOMINAL"):
         cls = "ag-badge-ok"
-    elif s in ("PENDING", "STAGED_PENDING_APPROVAL", "AWAITING_HUMAN_APPROVAL", "THROTTLED", "REJECTED_DUPLICATE_PENDING", "GAP"):
+    elif s in (
+        "PENDING",
+        "STAGED_PENDING_APPROVAL",
+        "AWAITING_HUMAN_APPROVAL",
+        "THROTTLED",
+        "REJECTED_DUPLICATE_PENDING",
+        "GAP",
+        "SUSPECTED",
+        "UNDER REPAIR",
+        "MEDIUM",
+        "LOW",
+        "ELEVATED WATCH",
+    ):
         cls = "ag-badge-warn"
     elif s in (
         "REJECTED_BY_CODE",
@@ -217,7 +230,11 @@ def status_badge(status: str) -> str:
         "BLOCKED",
         "QUARANTINED",
         "CONFIRMED_PIPE_LEAK",
+        "CONFIRMED",
+        "CRITICAL",
+        "HIGH",
         "CLOSED",
+        "ALERT ACTIVE",
     ):
         cls = "ag-badge-danger"
     else:
@@ -225,9 +242,10 @@ def status_badge(status: str) -> str:
     return f'<span class="ag-badge {cls}">{html.escape(s)}</span>'
 
 
-def section_header(title: str, actors: list[str], extra_badge: str = "") -> None:
-    """Render a consistent SCADA section header with LLM / CODE / HUMAN badges."""
-    badges_html = "".join(actor_badge(a) for a in actors)
+def section_header(title: str, actors: list[str] | None = None, extra_badge: str = "", show_actors: bool = False) -> None:
+    """Render a consistent SCADA section header (CODE/LLM/HUMAN badges hidden unless technical details are enabled)."""
+    show_tech = bool(show_actors or st.session_state.get("show_tech_details", False))
+    badges_html = "".join(actor_badge(a) for a in (actors or [])) if show_tech else ""
     st.markdown(
         f'<div class="scada-section-hdr">{badges_html}<span>{html.escape(title)}</span>{extra_badge}</div>',
         unsafe_allow_html=True,

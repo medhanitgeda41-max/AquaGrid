@@ -1,12 +1,12 @@
-"""SCADA Control Room header: system status, active LLM tier, grid health, and live KPIs."""
+"""SCADA Control Room header: system status, grid health, and live KPIs."""
 import html
 import streamlit as st
-from config.settings import settings
 from config.constants import DEFAULT_SCADA_HOUR, RESERVOIR_FLOOR_PERCENT
+from config.region_config import REGION_CONFIG, now_local
 from database.connection import get_db_connection
 from tools.read_telemetry import read_network_telemetry
 from tools.read_feeds import read_tariff_and_quality_feeds
-from components.badges import actor_badge, status_badge
+from components.badges import status_badge
 
 
 def _compute_grid_health(telemetry_data: dict, feeds_data: dict, pending_count: int) -> tuple[int, str]:
@@ -43,7 +43,7 @@ def _compute_grid_health(telemetry_data: dict, feeds_data: dict, pending_count: 
     return score, label
 
 
-def render_header() -> dict:
+def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     """Render top SCADA banner and real-time KPI row. Returns live snapshot dict for reuse."""
     conn = get_db_connection()
     try:
@@ -55,17 +55,10 @@ def render_header() -> dict:
     finally:
         conn.close()
 
-    telemetry_data = read_network_telemetry(current_hour=DEFAULT_SCADA_HOUR)
-    feeds_data = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=DEFAULT_SCADA_HOUR)
+    telemetry_data = read_network_telemetry(current_hour=display_hour)
+    feeds_data = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=display_hour)
 
     health_score, health_label = _compute_grid_health(telemetry_data, feeds_data, pending_count)
-
-    last_result = st.session_state.get("last_agent_result")
-    provider_used = (
-        last_result.get("llm_provider")
-        if last_result
-        else f"Ready (LLM_MODE={settings.LLM_MODE})"
-    )
     active_scenario_name = st.session_state.get("active_scenario_name", "Clean 24h Baseline")
 
     res = feeds_data.get("reservoir", {})
@@ -80,28 +73,22 @@ def render_header() -> dict:
     is_peak = feeds_data.get("is_current_peak_tariff", True)
     v12_status = v12["status"] if v12 else "OPEN"
 
+    dubai_clock_str = now_local().strftime("%H:%M:%S")
+
     st.markdown(
         f"""
         <div class="scada-banner">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
                 <div>
-                    <div class="scada-title">AQUAGRID SCADA CONTROL ROOM</div>
+                    <div class="scada-title">AQUAGRID SCADA CONTROL ROOM — {html.escape(REGION_CONFIG['region_name'].upper())}</div>
                     <div class="scada-subtitle">
-                        Autonomous Desalination, Tariff-Aware Network &amp; Valve Safety Agent
+                        Local Time ({html.escape(REGION_CONFIG['timezone'])}): <strong>{dubai_clock_str}</strong>
                         &nbsp;|&nbsp; Active View: <strong>{html.escape(active_scenario_name)}</strong>
                     </div>
                 </div>
                 <div style="text-align:right;">
-                    {actor_badge("CODE")} {status_badge(health_label)}
-                    {actor_badge("LLM")} <span class="ag-badge ag-badge-neutral">{html.escape(provider_used)}</span>
-                    <span class="ag-badge ag-badge-neutral">LLM_MODE={html.escape(settings.LLM_MODE)}</span>
+                    {status_badge(health_label)}
                 </div>
-            </div>
-            <div style="margin-top:0.55rem; font-size:0.78rem; color:#9FB3C8;">
-                Responsibility Legend:&nbsp;
-                {actor_badge("CODE")} Deterministic Python Safety Guards &amp; SQLite Gateway &nbsp;&nbsp;
-                {actor_badge("LLM")} Cognitive Analysis, Briefs &amp; Proposals &nbsp;&nbsp;
-                {actor_badge("HUMAN")} Mandatory Approve / Reject Signoff
             </div>
         </div>
         """,
@@ -110,35 +97,35 @@ def render_header() -> dict:
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric(
-        "Grid Health [CODE]",
+        "Grid Health",
         f"{health_score}/100",
         delta=health_label,
         delta_color="normal" if health_score >= 85 else "inverse",
     )
     c2.metric(
-        "Reservoir RES-01 [CODE]",
+        "Reservoir RES-01",
         f"{res_pct:.1f}%",
         delta=f"{res_vol:.0f} ML (Floor 35%)",
         delta_color="normal" if res_pct >= 35.0 else "inverse",
     )
     c3.metric(
-        "DESAL-01 Output [CODE]",
+        "DESAL-01 Output",
         f"{plant_mld:.1f} MLD",
         delta=f"{plant_status} / {plant_max:.0f} Max",
     )
     c4.metric(
-        "Tariff @ 14:00 [CODE]",
+        f"Tariff @ {display_hour:02d}:00",
         f"${curr_tariff:.2f}/kWh",
         delta="PEAK WINDOW" if is_peak else "OFF-PEAK",
         delta_color="inverse" if is_peak else "normal",
     )
     c5.metric(
-        "Valve V-12 [CODE]",
+        "Valve V-12",
         v12_status,
         delta="Sector 4 Main",
     )
     c6.metric(
-        "Pending HITL [HUMAN]",
+        "Pending HITL",
         str(pending_count),
         delta="Action Required" if pending_count > 0 else "Queue Clear",
         delta_color="inverse" if pending_count > 0 else "off",

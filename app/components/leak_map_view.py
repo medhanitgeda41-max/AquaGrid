@@ -1,0 +1,588 @@
+"""Interactive 2D OpenStreetMap Leak Map (Folium + streamlit-folium) & Synced Leak Details Panel."""
+from datetime import datetime, timedelta, timezone
+import html
+import json
+import altair as alt
+import folium
+import pandas as pd
+import streamlit as st
+from streamlit_folium import st_folium
+
+from config.region_config import LEAK_SEVERITY_COLORS, REGION_CONFIG, SECTOR_COLORS
+from database.connection import get_db_connection
+from database.dubai_network import JUNCTION_COORDINATES
+from tools.write_gateway import (
+    execute_human_approval,
+    execute_human_rejection,
+    stage_gated_valve_or_setpoint_action,
+    update_leak_status_by_operator,
+)
+from components.badges import format_dubai_time, section_header, status_badge
+
+
+def _parse_utc(ts_str: str | None) -> datetime:
+    if not ts_str:
+        return datetime.now(timezone.utc)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(str(ts_str).strip(), fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return datetime.now(timezone.utc)
+
+
+def _leak_color(severity: str, status: str) -> str:
+    if status == "Resolved":
+        return LEAK_SEVERITY_COLORS["Resolved"]
+    return LEAK_SEVERITY_COLORS.get(severity, "#F97316")
+
+
+def _pressure_color(pressure_psi: float | None) -> str:
+    if pressure_psi is None:
+        return "#38BDF8"
+    if pressure_psi < 38.0:
+        return "#EF4444"
+    if pressure_psi < 46.0:
+        return "#F59E0B"
+    return "#10B981"
+
+
+def _build_segment_history_charts(segment_id: str) -> tuple[alt.Chart | None, alt.Chart | None]:
+    """Build 2-hour Pressure & Flow Altair charts for a pipe segment from scada_history."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT recorded_at, pressure_psi, flow_lps
+            FROM scada_history
+            WHERE pipe_segment_id = ?
+            ORDER BY recorded_at DESC
+            LIMIT 60;
+            """,
+            (segment_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return None, None
+
+    ordered = list(reversed(rows))
+    df = pd.DataFrame(
+        [
+            {
+                "time_label": format_dubai_time(r["recorded_at"])[11:16],
+                "full_time": format_dubai_time(r["recorded_at"]),
+                "pressure_psi": float(r["pressure_psi"] or 55.0),
+                "flow_lps": float(r["flow_lps"] or 110.0),
+            }
+            for r in ordered
+        ]
+    )
+
+    p_chart = (
+        alt.Chart(df)
+        .mark_line(color="#38BDF8", strokeWidth=2.4)
+        .encode(
+            x=alt.X("time_label:N", sort=None, title="Time (Asia/Dubai)", axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+            y=alt.Y("pressure_psi:Q", title="Pressure (psi)", scale=alt.Scale(domain=[15, 70])),
+            tooltip=[
+                alt.Tooltip("full_time:N", title="Time"),
+                alt.Tooltip("pressure_psi:Q", title="Pressure (psi)", format=".1f"),
+            ],
+        )
+        .properties(height=150)
+    )
+
+    f_chart = (
+        alt.Chart(df)
+        .mark_line(color="#F59E0B", strokeWidth=2.4)
+        .encode(
+            x=alt.X("time_label:N", sort=None, title="Time (Asia/Dubai)", axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+            y=alt.Y("flow_lps:Q", title="Flow (L/s)", scale=alt.Scale(domain=[60, 220])),
+            tooltip=[
+                alt.Tooltip("full_time:N", title="Time"),
+                alt.Tooltip("flow_lps:Q", title="Flow (L/s)", format=".1f"),
+            ],
+        )
+        .properties(height=150)
+    )
+    return p_chart, f_chart
+
+
+def build_leak_folium_map(
+    segments: list[dict],
+    leaks: list[dict],
+    quarantined_ids: set[str],
+    latest_pressures: dict[str, float],
+    selected_leak: dict | None,
+    show_pipes: bool = True,
+    pipe_color_mode: str = "Sector",
+    show_leaks: bool = True,
+    show_sensors: bool = True,
+) -> folium.Map:
+    """Construct the interactive Leaflet/OpenStreetMap Folium map centered on the configured region."""
+    if selected_leak:
+        center = [float(selected_leak["latitude"]), float(selected_leak["longitude"])]
+        zoom = max(int(REGION_CONFIG["map_zoom"]) + 2, 14)
+    else:
+        center = list(REGION_CONFIG["map_center"])
+        zoom = int(REGION_CONFIG["map_zoom"])
+
+    fmap = folium.Map(
+        location=center,
+        zoom_start=zoom,
+        tiles=REGION_CONFIG["osm_tiles"],
+        attr=REGION_CONFIG["osm_attribution"],
+        control_scale=True,
+    )
+
+    if show_pipes:
+        pipe_group = folium.FeatureGroup(name="Pipe Network")
+        for seg in segments:
+            coords = json.loads(seg["geometry_json"])
+            seg_pressure = latest_pressures.get(seg["segment_id"])
+            color = (
+                _pressure_color(seg_pressure)
+                if pipe_color_mode == "Pressure Status"
+                else SECTOR_COLORS.get(seg["sector"], "#38BDF8")
+            )
+            is_selected_seg = selected_leak and selected_leak["pipe_segment_id"] == seg["segment_id"]
+            tooltip_txt = (
+                f"{seg['segment_id']} — {seg['name']} | {seg['sector']} | "
+                f"{seg['diameter_mm']}mm {seg['material']} ({seg['install_year']}) | "
+                f"Valve: {seg['isolation_valve_id']}"
+            )
+            folium.PolyLine(
+                locations=coords,
+                color=color,
+                weight=6 if is_selected_seg else 4,
+                opacity=0.95 if is_selected_seg else 0.78,
+                tooltip=tooltip_txt,
+            ).add_to(pipe_group)
+        pipe_group.add_to(fmap)
+
+    if show_sensors:
+        sensor_group = folium.FeatureGroup(name="Sensors")
+        for j_id, (lat, lon) in JUNCTION_COORDINATES.items():
+            p_id = j_id.replace("J-", "P-") if j_id.startswith("J-") else ("T-INTAKE-1" if j_id == "INTAKE-01" else "T-INTAKE-2")
+            is_quarantined = p_id in quarantined_ids
+            if is_quarantined:
+                folium.Marker(
+                    location=[lat, lon],
+                    tooltip=f"QUARANTINED SENSOR: {p_id} ({j_id})",
+                    icon=folium.Icon(color="orange", icon="exclamation-triangle", prefix="fa"),
+                ).add_to(sensor_group)
+            else:
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=4,
+                    color="#0EA5E9",
+                    fill=True,
+                    fill_color="#38BDF8",
+                    fill_opacity=0.9,
+                    tooltip=f"Sensor {p_id} ({j_id}) — ACTIVE",
+                ).add_to(sensor_group)
+        sensor_group.add_to(fmap)
+
+    if show_leaks:
+        leak_group = folium.FeatureGroup(name="Leaks")
+        for lk in leaks:
+            lat = float(lk["latitude"])
+            lon = float(lk["longitude"])
+            loss = float(lk["estimated_loss_m3_per_hour"])
+            color = _leak_color(lk["severity"], lk["status"])
+            is_sel = selected_leak and selected_leak["leak_id"] == lk["leak_id"]
+
+            radius_m = max(110.0, min(620.0, loss * 6.5))
+            folium.Circle(
+                location=[lat, lon],
+                radius=radius_m,
+                color=color,
+                weight=3 if is_sel else 1.5,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.28 if is_sel else 0.16,
+                tooltip=f"{lk['leak_id']} | Affected zone (~{int(radius_m)}m radius, {loss:.1f} m³/hr)",
+            ).add_to(leak_group)
+
+            marker_tooltip = f"{lk['leak_id']} | {lk['severity']} ({lk['status']}) — {lk['location_name']}"
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=11 if is_sel else 8,
+                color="#FFFFFF" if is_sel else color,
+                weight=3 if is_sel else 2,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.95,
+                tooltip=marker_tooltip,
+            ).add_to(leak_group)
+        leak_group.add_to(fmap)
+
+    return fmap
+
+
+def _render_leak_details_panel(leak: dict, segment: dict) -> None:
+    """Render the synced Leak Details panel beside the map with 2h charts, AI suggestions & HITL buttons."""
+    leak_id = leak["leak_id"]
+    sev = leak["severity"]
+    status = leak["status"]
+    loss_hr = float(leak["estimated_loss_m3_per_hour"])
+    conf = float(leak["confidence"])
+
+    det_dt = _parse_utc(leak["detected_at"])
+    hours_elapsed = max(0.05, (datetime.now(timezone.utc) - det_dt).total_seconds() / 3600.0)
+    est_total_loss_m3 = round(loss_hr * hours_elapsed, 1)
+
+    try:
+        sugg = json.loads(leak.get("ai_suggestions_json") or "{}")
+    except json.JSONDecodeError:
+        sugg = {}
+
+    section_header(f"Leak Details — {leak_id}", ["CODE", "LLM", "HUMAN"], extra_badge=status_badge(status))
+
+    st.markdown(
+        f"""
+        <div class="scada-card-alert">
+            <div style="font-size:0.95rem; font-weight:700; color:#F8FAFC;">
+                {html.escape(leak['location_name'])}
+            </div>
+            <div style="margin-top:0.35rem; font-size:0.84rem; color:#CBD5E1;">
+                <strong>Sector:</strong> {html.escape(leak['sector'])} &nbsp;|&nbsp;
+                <strong>Severity:</strong> {status_badge(sev)} &nbsp;|&nbsp;
+                <strong>Status:</strong> {status_badge(status)}
+            </div>
+            <div style="margin-top:0.3rem; font-size:0.83rem; color:#9FB3C8;" class="ag-mono">
+                Coords: ({float(leak['latitude']):.5f}, {float(leak['longitude']):.5f}) &nbsp;|&nbsp;
+                Detected: {html.escape(format_dubai_time(leak['detected_at']))}
+            </div>
+            <div style="margin-top:0.3rem; font-size:0.83rem; color:#CBD5E1;">
+                <strong>Pipe Segment:</strong> <span class="ag-mono">{html.escape(segment.get('segment_id', leak['pipe_segment_id']))}</span>
+                ({segment.get('diameter_mm', '-')}mm {html.escape(str(segment.get('material', '-')))}, installed {segment.get('install_year', '-')})
+            </div>
+            <div style="margin-top:0.3rem; font-size:0.84rem; color:#FDE68A;">
+                <strong>Est. Loss Rate:</strong> {loss_hr:.1f} m³/hr &nbsp;|&nbsp;
+                <strong>Est. Loss So Far:</strong> {est_total_loss_m3:.1f} m³ ({hours_elapsed:.1f}h) &nbsp;|&nbsp;
+                <strong>Sensors:</strong> <span class="ag-mono">{html.escape(leak['related_sensor_ids'])}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    section_header(f"Last 2 Hours — {leak['pipe_segment_id']} Pressure & Flow", ["CODE"])
+    p_chart, f_chart = _build_segment_history_charts(leak["pipe_segment_id"])
+    if p_chart and f_chart:
+        c_p, c_f = st.columns(2)
+        with c_p:
+            st.altair_chart(p_chart, width="stretch")
+        with c_f:
+            st.altair_chart(f_chart, width="stretch")
+    else:
+        st.caption("No 2-hour history available for this pipe segment yet.")
+
+    section_header("AI Diagnosis & Practical Suggestions", ["LLM", "CODE"])
+    st.markdown(
+        f"""
+        <div class="scada-card">
+            <div><strong>Diagnosis (Confidence: {conf:.0%}):</strong><br/>
+                {html.escape(str(leak.get('ai_summary', '')))}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if sugg:
+        valve_id = sugg.get("isolation_valve_id", segment.get("isolation_valve_id", "V-12"))
+        verify_badge = (
+            '<span class="ag-badge ag-badge-warn">VERIFY FIRST</span>'
+            if sugg.get("physical_verification_first")
+            else '<span class="ag-badge ag-badge-ok">HIGH CONFIDENCE</span>'
+        )
+        st.markdown(
+            f"""
+            <div class="scada-card-pending">
+                <div><strong>Isolation Proposal (HITL Required):</strong> {html.escape(str(sugg.get('proposed_action', '')))}</div>
+                <div style="margin-top:0.3rem; font-size:0.85rem;">
+                    <strong>Impact:</strong> ~{int(sugg.get('affected_customers', 0)):,} customers in {html.escape(str(sugg.get('affected_area', '')))}
+                </div>
+                <div style="margin-top:0.25rem; font-size:0.85rem;">
+                    <strong>Repair Priority:</strong> {html.escape(str(sugg.get('repair_priority', '')))}
+                </div>
+                <div style="margin-top:0.25rem; font-size:0.85rem;">
+                    <strong>Field Verification:</strong> {verify_badge} {html.escape(str(sugg.get('verification_note', '')))}
+                </div>
+                <div style="margin-top:0.25rem; font-size:0.85rem; color:#FCA5A5;">
+                    <strong>Unfixed Loss Cost:</strong> {sugg.get('estimated_loss_m3_per_hour', loss_hr)} m³/hr
+                    &asymp; <strong>${sugg.get('estimated_cost_usd_per_hour', 0):.2f}/hr</strong>
+                    (<strong>AED {sugg.get('estimated_cost_aed_per_hour', 0):.2f}/hr</strong> @ ${sugg.get('tariff_used_per_kwh', 0.20)}/kWh)
+                </div>
+                <div style="margin-top:0.35rem; font-size:0.77rem; color:#9FB3C8;">
+                    Generated: {html.escape(format_dubai_time(sugg.get('generated_at_utc')))} &nbsp;|&nbsp;
+                    Confidence: {float(sugg.get('confidence', conf)):.0%} &nbsp;|&nbsp;
+                    Based on: {html.escape(str(sugg.get('based_on', '')))}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        valve_id = segment.get("isolation_valve_id", "V-12")
+
+    section_header(f"Operator Controls — {leak_id} (Valve {valve_id})", ["HUMAN", "CODE"])
+    operator_sig = st.session_state.get("operator_signature", "Lead_Operator_SCADA")
+
+    conn = get_db_connection()
+    try:
+        pending_row = conn.execute(
+            "SELECT id FROM pending_actions WHERE target_id = ? AND action_type = 'CLOSE_VALVE' AND status = 'PENDING' ORDER BY id DESC LIMIT 1;",
+            (valve_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    pending_id = int(pending_row["id"]) if pending_row else None
+
+    b1, b2, b3, b4 = st.columns(4)
+    with b1:
+        approve_label = f"Approve Close {valve_id}" if pending_id else f"Stage Close {valve_id}"
+        if st.button(approve_label, key=f"map_approve_{leak_id}", type="primary", width="stretch"):
+            if pending_id:
+                res = execute_human_approval(pending_id, approver=operator_sig)
+                if res.get("status") == "EXECUTED":
+                    update_leak_status_by_operator(leak_id, "Under Repair", operator_sig, f"Valve {valve_id} closed via Action #{pending_id}")
+                    st.session_state["last_hitl_feedback"] = {
+                        "kind": "success",
+                        "message": f"Valve {valve_id} closed (Action #{pending_id}) and {leak_id} marked Under Repair.",
+                    }
+                else:
+                    st.session_state["last_hitl_feedback"] = {
+                        "kind": "error",
+                        "message": f"Action #{pending_id} -> {res.get('status')}: {res.get('reason')}",
+                    }
+            else:
+                gw = stage_gated_valve_or_setpoint_action(
+                    action_type="CLOSE_VALVE",
+                    target_id=valve_id,
+                    proposed_value=0.0,
+                    rationale=f"Operator-requested staging from Leak Map for {leak_id} on {segment.get('street_area', leak['location_name'])}.",
+                )
+                st.session_state["last_hitl_feedback"] = {
+                    "kind": "info",
+                    "message": f"{valve_id} closure staged ({gw.get('status')}). Click Approve again or use HITL Queue to execute.",
+                }
+            st.rerun()
+
+    with b2:
+        if st.button("Reject", key=f"map_reject_{leak_id}", width="stretch"):
+            if pending_id:
+                execute_human_rejection(pending_id, f"Operator declined isolation for {leak_id}", approver=operator_sig)
+                st.session_state["last_hitl_feedback"] = {
+                    "kind": "warning",
+                    "message": f"Pending Action #{pending_id} ({valve_id}) REJECTED for {leak_id}. Valve unchanged.",
+                }
+            else:
+                st.session_state["last_hitl_feedback"] = {
+                    "kind": "info",
+                    "message": f"No pending valve action for {valve_id} to reject.",
+                }
+            st.rerun()
+
+    with b3:
+        if st.button("False Alarm", key=f"map_false_{leak_id}", width="stretch"):
+            update_leak_status_by_operator(leak_id, "False Alarm – Sensor Fault", operator_sig, "Marked via Leak Map")
+            st.session_state["last_hitl_feedback"] = {
+                "kind": "warning",
+                "message": f"{leak_id} marked as 'False Alarm – Sensor Fault' by {operator_sig}.",
+            }
+            st.rerun()
+
+    with b4:
+        if st.button("Mark Resolved", key=f"map_resolve_{leak_id}", width="stretch"):
+            update_leak_status_by_operator(leak_id, "Resolved", operator_sig, "Marked resolved via Leak Map")
+            st.session_state["last_hitl_feedback"] = {
+                "kind": "success",
+                "message": f"{leak_id} marked as 'Resolved' by {operator_sig}.",
+            }
+            st.rerun()
+
+
+def render_leak_map_view(snapshot: dict) -> None:
+    """Render filters, interactive 2D OpenStreetMap Leak Map, synced details panel, and Leak Locations table."""
+    section_header(
+        f"2D Leak & Pipe Network Map — {REGION_CONFIG['region_name']} (OpenStreetMap)",
+        ["CODE", "LLM", "HUMAN"],
+    )
+
+    conn = get_db_connection()
+    try:
+        seg_rows = conn.execute("SELECT * FROM pipe_segments ORDER BY sector, segment_id;").fetchall()
+        leak_rows = conn.execute("SELECT * FROM leaks ORDER BY detected_at DESC;").fetchall()
+        p_rows = conn.execute(
+            """
+            SELECT pipe_segment_id, pressure_psi
+            FROM scada_history
+            WHERE id IN (SELECT MAX(id) FROM scada_history GROUP BY pipe_segment_id);
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    segments = [dict(r) for r in seg_rows]
+    all_leaks = [dict(r) for r in leak_rows]
+    seg_by_id = {s["segment_id"]: s for s in segments}
+    latest_pressures = {r["pipe_segment_id"]: float(r["pressure_psi"]) for r in p_rows if r["pressure_psi"] is not None}
+    quarantined_ids = {s["sensor_id"] for s in snapshot.get("telemetry_data", {}).get("quarantined_sensors", [])}
+
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        sev_filter = st.multiselect(
+            "Severity",
+            options=["Critical", "High", "Medium", "Low"],
+            default=["Critical", "High", "Medium", "Low"],
+            key="map_filter_severity",
+        )
+    with f2:
+        status_filter = st.multiselect(
+            "Status",
+            options=["Suspected", "Confirmed", "Under Repair", "Resolved", "False Alarm – Sensor Fault"],
+            default=["Suspected", "Confirmed", "Under Repair", "Resolved", "False Alarm – Sensor Fault"],
+            key="map_filter_status",
+        )
+    with f3:
+        all_sectors = sorted({s["sector"] for s in segments})
+        sector_filter = st.multiselect(
+            "Sector",
+            options=all_sectors,
+            default=all_sectors,
+            key="map_filter_sector",
+        )
+    with f4:
+        time_range = st.selectbox(
+            "Time Range",
+            options=["All", "Last 1h", "Last 6h", "Last 24h"],
+            index=0,
+            key="map_filter_time",
+        )
+
+    l1, l2, l3, l4 = st.columns([1.0, 1.2, 1.0, 1.3])
+    with l1:
+        show_pipes = st.checkbox("Layer: Pipe Network", value=True, key="map_layer_pipes")
+    with l2:
+        show_leaks = st.checkbox("Layer: Leaks & Loss Circles", value=True, key="map_layer_leaks")
+    with l3:
+        show_sensors = st.checkbox("Layer: Sensors", value=True, key="map_layer_sensors")
+    with l4:
+        pipe_color_mode = st.selectbox(
+            "Color Pipes By",
+            options=["Sector", "Pressure Status"],
+            index=0,
+            key="map_pipe_color_mode",
+            label_visibility="collapsed",
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff_hours = {"Last 1h": 1, "Last 6h": 6, "Last 24h": 24}.get(time_range)
+    filtered_segments = [s for s in segments if s["sector"] in sector_filter]
+    filtered_leaks = []
+    for lk in all_leaks:
+        if lk["severity"] not in sev_filter:
+            continue
+        if lk["status"] not in status_filter:
+            continue
+        if lk["sector"] not in sector_filter:
+            continue
+        if cutoff_hours is not None:
+            if (now_utc - _parse_utc(lk["detected_at"])) > timedelta(hours=cutoff_hours):
+                continue
+        filtered_leaks.append(lk)
+
+    filtered_ids = [lk["leak_id"] for lk in filtered_leaks]
+    selected_id = st.session_state.get("selected_leak_id")
+    if selected_id not in filtered_ids:
+        selected_id = filtered_ids[0] if filtered_ids else None
+        st.session_state["selected_leak_id"] = selected_id
+
+    selected_leak = next((lk for lk in filtered_leaks if lk["leak_id"] == selected_id), None)
+
+    col_map, col_detail = st.columns([1.35, 1.05])
+
+    with col_map:
+        fmap = build_leak_folium_map(
+            segments=filtered_segments,
+            leaks=filtered_leaks,
+            quarantined_ids=quarantined_ids,
+            latest_pressures=latest_pressures,
+            selected_leak=selected_leak,
+            show_pipes=show_pipes,
+            pipe_color_mode=pipe_color_mode,
+            show_leaks=show_leaks,
+            show_sensors=show_sensors,
+        )
+        map_event = st_folium(
+            fmap,
+            height=520,
+            width=None,
+            returned_objects=["last_object_clicked_tooltip"],
+            key="aquagrid_dubai_leak_map",
+        )
+        clicked_tip = (map_event or {}).get("last_object_clicked_tooltip") or ""
+        if clicked_tip:
+            for lid in filtered_ids:
+                if clicked_tip.startswith(lid) and lid != selected_id:
+                    st.session_state["selected_leak_id"] = lid
+                    st.rerun()
+
+        st.caption(
+            "Map Legend — Leaks: Yellow = Low | Orange = Medium | Red = High | Dark Red = Critical | Grey = Resolved. "
+            "Map data © OpenStreetMap contributors."
+        )
+
+    with col_detail:
+        if selected_leak:
+            _render_leak_details_panel(selected_leak, seg_by_id.get(selected_leak["pipe_segment_id"], {}))
+        else:
+            st.info("No leaks match the active filters.")
+
+    st.divider()
+
+    section_header("Leak Locations Registry (Click a row to focus & zoom on map)", ["CODE", "LLM"])
+    if not filtered_leaks:
+        st.info("No leaks match the active filters.")
+        return
+
+    table_df = pd.DataFrame(
+        [
+            {
+                "leak_id": lk["leak_id"],
+                "pipe_segment_id": lk["pipe_segment_id"],
+                "sector": lk["sector"],
+                "location_name": lk["location_name"],
+                "latitude": round(float(lk["latitude"]), 5),
+                "longitude": round(float(lk["longitude"]), 5),
+                "detected_at (Asia/Dubai)": format_dubai_time(lk["detected_at"]),
+                "severity": lk["severity"],
+                "estimated_loss_m3_per_hour": round(float(lk["estimated_loss_m3_per_hour"]), 1),
+                "confidence": f"{float(lk['confidence']):.0%}",
+                "status": lk["status"],
+                "related_sensor_ids": lk["related_sensor_ids"],
+                "ai_summary": lk["ai_summary"],
+            }
+            for lk in filtered_leaks
+        ]
+    )
+
+    selection = st.dataframe(
+        table_df,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="leak_locations_table",
+    )
+    selected_rows = (selection or {}).get("selection", {}).get("rows", [])
+    if selected_rows:
+        chosen_lid = table_df.iloc[selected_rows[0]]["leak_id"]
+        if chosen_lid != st.session_state.get("selected_leak_id"):
+            st.session_state["selected_leak_id"] = chosen_lid
+            st.rerun()

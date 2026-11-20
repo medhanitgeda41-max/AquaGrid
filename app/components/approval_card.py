@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 from database.connection import get_db_connection
 from tools.write_gateway import execute_human_approval, execute_human_rejection
-from components.badges import actor_badge, format_dubai_time, section_header, status_badge
+from components.badges import format_dubai_time, section_header, status_badge
 
 
 def _format_actuator_value(action_type: str, value: float) -> str:
@@ -32,14 +32,7 @@ def _render_feedback_banner() -> None:
 
 
 def render_approval_card(key_prefix: str = "main", show_history: bool = True) -> None:
-    """
-    Render all PENDING actions from pending_actions with [Approve] and [Reject] buttons.
-
-    - [Approve] calls execute_human_approval(), which re-runs the 35% reservoir floor
-      and water-quality checks with the latest DB state BEFORE committing.
-      If the re-check fails, status becomes CANCELLED_BY_SAFETY_RECHECK (no commit).
-    - [Reject] calls execute_human_rejection(), marking status REJECTED and logging to audit_log.
-    """
+    """Render all PENDING actions from pending_actions with [Approve] and [Reject] buttons."""
     section_header(
         "Human-in-the-Loop (HITL) Approval Queue",
         ["HUMAN", "CODE"],
@@ -62,7 +55,6 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
             """
             <div class="scada-card-ok">
                 <strong>No PENDING physical actuator actions.</strong>
-                All valves and desalination setpoints remain locked under human supervision.
             </div>
             """,
             unsafe_allow_html=True,
@@ -89,7 +81,7 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                 <div class="scada-card-pending">
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
                         <div>
-                            {actor_badge("HUMAN")} {status_badge("PENDING")}
+                            {status_badge("PENDING")}
                             <strong>Action #{action_id}:</strong>
                             <span class="ag-mono">{html.escape(action_type)} &rarr; {html.escape(target_id)}</span>
                         </div>
@@ -100,11 +92,7 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                         <span class="ag-mono">{html.escape(curr_fmt)} &rarr; {html.escape(prop_fmt)}</span>
                     </div>
                     <div style="margin-top:0.35rem; font-size:0.87rem;">
-                        {actor_badge("LLM")} <strong>Rationale:</strong> {html.escape(str(rationale))}
-                    </div>
-                    <div style="margin-top:0.35rem; font-size:0.8rem; color:#9FB3C8;">
-                        {actor_badge("CODE")} Clicking <strong>Approve</strong> automatically re-runs the 35% reservoir floor
-                        and water-quality checks against latest telemetry before committing an atomic SQLite transaction.
+                        <strong>Rationale:</strong> {html.escape(str(rationale))}
                     </div>
                 </div>
                 """,
@@ -133,20 +121,20 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                     )
                     res_status = res.get("status")
                     if res_status == "EXECUTED":
-                        detail = res.get("details") or res.get("message") or "Atomic SQLite transaction committed."
+                        detail = res.get("details") or res.get("message") or "Executed."
                         st.session_state["last_hitl_feedback"] = {
                             "kind": "success",
                             "message": (
-                                f"[HUMAN APPROVED -> CODE EXECUTED] Action #{action_id} "
-                                f"({action_type} {target_id}) committed by {res.get('approver')}: {detail}"
+                                f"Action #{action_id} ({action_type} {target_id}) EXECUTED "
+                                f"by {res.get('approver')}: {detail}"
                             ),
                         }
                     elif res_status == "CANCELLED_BY_SAFETY_RECHECK":
                         st.session_state["last_hitl_feedback"] = {
                             "kind": "error",
                             "message": (
-                                f"[CODE GUARD BLOCKED] Action #{action_id} -> CANCELLED_BY_SAFETY_RECHECK. "
-                                f"Physical table NOT modified. Reason: {res.get('reason')}"
+                                f"Action #{action_id} -> CANCELLED_BY_SAFETY_RECHECK. "
+                                f"Reason: {res.get('reason')}"
                             ),
                         }
                     else:
@@ -169,8 +157,8 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                     st.session_state["last_hitl_feedback"] = {
                         "kind": "warning",
                         "message": (
-                            f"[HUMAN REJECTED] Action #{action_id} ({action_type} {target_id}) marked REJECTED "
-                            f"by {res.get('approver')}. Physical actuators unchanged. Reason: {res.get('reason')}"
+                            f"Action #{action_id} ({action_type} {target_id}) REJECTED "
+                            f"by {res.get('approver')}. Reason: {res.get('reason')}"
                         ),
                     }
                     st.rerun()

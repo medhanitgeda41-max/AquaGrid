@@ -103,3 +103,70 @@ CREATE TABLE IF NOT EXISTS audit_log (
     actor TEXT NOT NULL, -- 'LLM_AGENT', 'CODE_GUARD', 'HUMAN_OPERATOR'
     status TEXT NOT NULL -- 'ALLOWED', 'BLOCKED', 'PENDING', 'APPROVED', 'REJECTED'
 );
+
+-- Real-World Street Pipe Network Segments (Default: Dubai, UAE)
+CREATE TABLE IF NOT EXISTS pipe_segments (
+    segment_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    sector TEXT NOT NULL,
+    street_area TEXT NOT NULL,
+    diameter_mm INTEGER NOT NULL,
+    material TEXT NOT NULL,
+    install_year INTEGER NOT NULL,
+    geometry_json TEXT NOT NULL, -- JSON list of [lat, lon] points along real OSM streets
+    isolation_valve_id TEXT NOT NULL,
+    est_customers_affected INTEGER NOT NULL DEFAULT 350,
+    related_sensor_ids TEXT NOT NULL DEFAULT ''
+);
+
+-- Geospatial Leak Registry (Every leak snapped onto a pipe_segment polyline)
+CREATE TABLE IF NOT EXISTS leaks (
+    leak_id TEXT PRIMARY KEY,
+    pipe_segment_id TEXT NOT NULL,
+    sector TEXT NOT NULL,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    location_name TEXT NOT NULL,
+    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    severity TEXT NOT NULL, -- 'Low', 'Medium', 'High', 'Critical'
+    estimated_loss_m3_per_hour REAL NOT NULL,
+    confidence REAL NOT NULL, -- 0.0 to 1.0
+    status TEXT NOT NULL DEFAULT 'Suspected', -- 'Suspected', 'Confirmed', 'Under Repair', 'Resolved', 'False Alarm – Sensor Fault'
+    related_sensor_ids TEXT NOT NULL,
+    ai_summary TEXT NOT NULL,
+    ai_suggestions_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (pipe_segment_id) REFERENCES pipe_segments(segment_id)
+);
+
+-- Time-Series SCADA History (2-minute real-time batches & 2h segment charting)
+CREATE TABLE IF NOT EXISTS scada_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    pipe_segment_id TEXT,
+    sensor_id TEXT,
+    sector TEXT,
+    pressure_psi REAL,
+    flow_lps REAL,
+    turbidity_ntu REAL,
+    reservoir_level_percent REAL,
+    reservoir_volume_ml REAL,
+    plant_output_mld REAL,
+    demand_mld REAL,
+    tariff_rate REAL,
+    tariff_tier TEXT,
+    sensor_health TEXT DEFAULT 'NORMAL'
+);
+
+-- AI Agent Run Log (Records every 2-minute or scenario AI analysis run)
+CREATE TABLE IF NOT EXISTS ai_run_log (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    trigger_source TEXT NOT NULL, -- 'SCHEDULED_2MIN', 'DEMO_ACCEL', 'SCENARIO'
+    llm_provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    inputs_summary TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    suggestions_json TEXT NOT NULL,
+    grid_suggestions_json TEXT NOT NULL DEFAULT '[]',
+    error_message TEXT
+);

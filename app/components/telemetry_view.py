@@ -27,19 +27,15 @@ def _build_reservoir_chart(
     demands_6h = [float(hourly_24.get((DEFAULT_SCADA_HOUR + i) % 24, 90.0)) for i in range(6)]
     demands_24h = [float(hourly_24.get((DEFAULT_SCADA_HOUR + i) % 24, 90.0)) for i in range(24)]
 
-    # Build chronological x-axis labels from 14:00 through 14:00 (+1d)
     x_labels_24h = [f"{DEFAULT_SCADA_HOUR:02d}:00"] + [
         f"{(DEFAULT_SCADA_HOUR + off) % 24:02d}:00{' (+1d)' if (DEFAULT_SCADA_HOUR + off) >= 24 else ''}"
         for off in range(1, 25)
     ]
 
-    # (label, inflow_mld, hex_color, horizon_demands)
     series_defs: list[tuple[str, float, str, list[float]]] = []
     seen_vals: set[float] = set()
 
     if active_scenario == 2:
-        # Scenario 2: always plot the 6h peak rejected 15 MLD throttle (dips below 35%)
-        # and the 6h peak 60 MLD bloom-safe replan (stays above 35%)
         series_defs.append(("Rejected 15 MLD Throttle (Breaches 35%)", 15.0, "#F59E0B", demands_6h))
         seen_vals.add(15.0)
         series_defs.append(("60 MLD Bloom-Safe Replan (>= 35%)", 60.0, "#10B981", demands_6h))
@@ -48,7 +44,6 @@ def _build_reservoir_chart(
         series_defs.append((f"Current Setpoint ({plant_mld:.0f} MLD)", plant_mld, "#00C2FF", demands_24h))
         seen_vals.add(round(plant_mld, 1))
 
-    # Overlay any additional distinct SET_PLANT_OUTPUT attempts from proposal_history (6h horizon)
     if agent_result:
         for entry in agent_result.get("proposal_history", []):
             prop = entry.get("action_proposal") or {}
@@ -172,7 +167,6 @@ def render_telemetry_view(snapshot: dict) -> None:
     agent_result = st.session_state.get("last_agent_result")
     active_scenario = st.session_state.get("active_scenario")
 
-    # Row 1: Reservoir Level Chart (with red 35% floor) & 24h Tariff/Demand
     left_col, right_col = st.columns([1.15, 1.05])
 
     with left_col:
@@ -207,7 +201,6 @@ def render_telemetry_view(snapshot: dict) -> None:
             ]
         )
 
-        # Clean alphanumeric field names prevent Vega-Lite field-path parsing bugs
         tariff_bars = (
             alt.Chart(td_df)
             .mark_bar(cornerRadiusTopLeft=2, cornerRadiusTopRight=2, opacity=0.92)
@@ -273,7 +266,6 @@ def render_telemetry_view(snapshot: dict) -> None:
 
     st.divider()
 
-    # Row 2: Hydraulic Network Pressure & Flow Telemetry + Diagnostics
     p_col, d_col = st.columns([1.15, 1.05])
 
     with p_col:
@@ -337,7 +329,7 @@ def render_telemetry_view(snapshot: dict) -> None:
         st.altair_chart(p_chart, width="stretch")
 
     with d_col:
-        section_header("Deterministic Leak & Sensor Quarantine Diagnostics", ["CODE"])
+        section_header("Leak & Sensor Quarantine Diagnostics", ["CODE"])
         leaks = telemetry_data.get("leak_alerts", [])
         quarantined = telemetry_data.get("quarantined_sensors", [])
 
@@ -351,7 +343,7 @@ def render_telemetry_view(snapshot: dict) -> None:
             st.success("No active hydraulic pipe leak signatures detected.")
 
         if quarantined:
-            st.warning(f"{len(quarantined)} sensor(s) quarantined by pure Python rules:")
+            st.warning(f"{len(quarantined)} sensor(s) quarantined:")
             rows_html = []
             for q in quarantined:
                 reason_text = "; ".join(q.get("reasons", []))
@@ -384,11 +376,10 @@ def render_telemetry_view(snapshot: dict) -> None:
                 unsafe_allow_html=True,
             )
         else:
-            st.info("All 44 pressure, flow, and intake water-quality sensors passed health checks.")
+            st.info("All 44 sensors healthy.")
 
     st.divider()
 
-    # Row 3: Live 12-Valve Matrix
     section_header("Live Isolation Valve Matrix (V-01 through V-12)", ["CODE", "HUMAN"])
     conn = get_db_connection()
     try:

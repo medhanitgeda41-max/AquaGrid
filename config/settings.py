@@ -20,6 +20,19 @@ class Settings(BaseSettings):
     # Database
     DATABASE_PATH: str = "coastal_water_network.sqlite"
 
+    # Region & Map Configuration (Default: Dubai, UAE)
+    REGION_NAME: str = "Dubai, UAE"
+    REGION_TIMEZONE: str = "Asia/Dubai"
+    MAP_CENTER_LAT: float = 25.1972
+    MAP_CENTER_LON: float = 55.2744
+    MAP_DEFAULT_ZOOM: int = 12
+
+    # Real-Time Scheduler & UI Refresh Intervals
+    LIVE_INTERVAL_SECONDS: int = 120          # 2-minute real-time SCADA + AI batch interval
+    DEMO_ACCELERATED_INTERVAL_SECONDS: int = 5  # Optional accelerated demo mode
+    UI_REFRESH_SECONDS: int = 15              # UI polling interval (15-30s)
+    DEFAULT_FAULT_PROBABILITY: float = 0.05   # Probability per 2-minute cycle
+
     # Timeouts & Retries
     REQUEST_TIMEOUT: int = 45
     MAX_RETRIES: int = 1

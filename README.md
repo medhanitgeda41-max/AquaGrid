@@ -52,6 +52,28 @@ Edit `.env` to choose your execution mode:
   ```
 - **Offline Fail-Safe:** If no local or cloud model is reachable, AquaGrid automatically falls back to the built-in `Deterministic Offline Engine` without crashing.
 
+### 4. Region, Map & Real-Time Interval Configuration
+Defaults are configured in [`config/region_config.py`](config/region_config.py) and [`config/settings.py`](config/settings.py) and can be overridden in `.env`:
+
+```env
+# Region & 2D OpenStreetMap Center (Default: Dubai, UAE)
+REGION_NAME=Dubai, UAE
+REGION_TIMEZONE=Asia/Dubai
+MAP_CENTER_LAT=25.1972
+MAP_CENTER_LON=55.2744
+MAP_DEFAULT_ZOOM=12
+
+# Real-Time 2-Minute Data + AI Batch Scheduler & UI Polling
+LIVE_INTERVAL_SECONDS=120
+UI_REFRESH_SECONDS=15
+DEMO_ACCELERATED_INTERVAL_SECONDS=5
+DEFAULT_FAULT_PROBABILITY=0.05
+```
+
+- **To change the region:** update `REGION_NAME`, `REGION_TIMEZONE`, `MAP_CENTER_LAT`, `MAP_CENTER_LON`, and `MAP_DEFAULT_ZOOM` in `.env` (and optionally swap street polylines in `database/dubai_network.py`).
+- **To adjust batch/refresh intervals:** set `LIVE_INTERVAL_SECONDS` (default `120` = 2 minutes), `UI_REFRESH_SECONDS` (default `15`), `DEMO_ACCELERATED_INTERVAL_SECONDS` (default `5`), and `DEFAULT_FAULT_PROBABILITY` (default `0.05` per 2-minute cycle).
+- **Live Simulation vs. Demo Mode:** Toggle **`Live Simulation: ON/OFF`** (default `OFF`) to stream real-time 2-minute SCADA + AI batches synced to the real Dubai clock (`HH:MM:SS`) with a countdown (`Next update in M:SS`). Turn on **`Demo mode (accelerated)`** (default `OFF`) during live presentations for 5-second ticks.
+
 ---
 
 ## How to Run the App
@@ -66,8 +88,11 @@ Open **http://localhost:8501** in your browser.
 
 ### Optional CLI & Test Commands
 ```powershell
-# Run full automated test suite (46 tests)
+# Run full automated test suite
 python -m pytest tests/ -v
+
+# Run standalone 2-minute real-time simulator (add --accelerated for 5s demo ticks)
+python simulator.py --interval 120 --fault-prob 0.05
 
 # Run any scenario from the command line
 python run_agent.py --scenario 1

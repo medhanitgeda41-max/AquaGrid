@@ -13,14 +13,26 @@ from database.scenarios import (
     reset_database,
 )
 from agent.graph import run_agent
+from simulator import get_simulator
 from tools.write_gateway import refuse_direct_write_bypass
 from components.badges import section_header
+
+
+def _stop_live_sim_if_running() -> None:
+    """Ensure live simulator thread is stopped and toggles reset before deterministic scenarios or DB reset."""
+    sim = get_simulator()
+    if sim.is_running:
+        sim.stop()
+    sim.reset_clock(DEFAULT_SCADA_HOUR)
+    st.session_state["live_sim_toggle"] = False
+    st.session_state["demo_accel_toggle"] = False
 
 
 def _queue_scenario(scenario_id: int) -> None:
     """Callback: queue a single scenario run if not already running or queued."""
     if st.session_state.get("_scenario_lock") or st.session_state.get("_queued_scenario") is not None:
         return
+    _stop_live_sim_if_running()
     st.session_state["_queued_scenario"] = scenario_id
 
 
@@ -50,21 +62,23 @@ def _execute_scenario(scenario_id: int) -> None:
 
 
 def _reset_database_callback() -> None:
-    """Callback: reset and re-seed database once."""
+    """Callback: stop live simulator and reset/re-seed database once."""
     if st.session_state.get("_scenario_lock"):
         return
 
     st.session_state["_scenario_lock"] = True
     try:
+        _stop_live_sim_if_running()
         reset_database()
         st.session_state["_queued_scenario"] = None
         st.session_state["active_scenario"] = None
         st.session_state["active_scenario_name"] = "Clean 24h Baseline (Re-seeded)"
         st.session_state["last_agent_result"] = None
         st.session_state["last_bypass_result"] = None
+        st.session_state["selected_leak_id"] = None
         st.session_state["last_hitl_feedback"] = {
             "kind": "info",
-            "message": "Database reset and re-seeded to clean 24h baseline (seed 42).",
+            "message": "Database reset to clean 24h baseline.",
         }
     finally:
         st.session_state["_scenario_lock"] = False
@@ -85,7 +99,6 @@ def render_scenario_selector() -> None:
             disabled=is_locked,
             on_click=_queue_scenario,
             args=(1,),
-            help="Sector 4 J-14 leak + P-17 flatline + T-INTAKE-2 drift",
         )
 
     with col2:
@@ -96,7 +109,6 @@ def render_scenario_selector() -> None:
             disabled=is_locked,
             on_click=_queue_scenario,
             args=(2,),
-            help="Peak tariff ($0.48/kWh) + Intake 2 bloom derating vs. 35% floor & replan",
         )
 
     with col3:
@@ -107,7 +119,6 @@ def render_scenario_selector() -> None:
             disabled=is_locked,
             on_click=_queue_scenario,
             args=(3,),
-            help="Isolate Sector 4 leak via V-12 staged PENDING for operator Approve/Reject",
         )
 
     with col4:
@@ -118,7 +129,6 @@ def render_scenario_selector() -> None:
             disabled=is_locked,
             on_click=_queue_scenario,
             args=(4,),
-            help="Full-alert regex quarantine + direct SQLite write bypass refused",
         )
 
     with col5:
@@ -129,7 +139,6 @@ def render_scenario_selector() -> None:
             type="secondary",
             disabled=is_locked,
             on_click=_reset_database_callback,
-            help="Restore pristine 24h baseline with fixed seed 42",
         )
 
     queued_scenario = st.session_state.pop("_queued_scenario", None)

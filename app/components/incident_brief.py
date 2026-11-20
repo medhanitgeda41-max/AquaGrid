@@ -1,10 +1,10 @@
-"""Incident Brief & Pure-Python Guard Report — mirrors every run_agent.py section with LLM/CODE/HUMAN badges."""
+"""Incident Brief & Pure-Python Guard Report."""
 import html
 import json
 import streamlit as st
 from database.connection import get_db_connection
 from guards.injection_filter import detect_injection
-from components.badges import actor_badge, format_dubai_time, section_header, status_badge
+from components.badges import format_dubai_time, section_header, status_badge
 
 
 def _render_final_valve_v12_status() -> None:
@@ -15,7 +15,7 @@ def _render_final_valve_v12_status() -> None:
     finally:
         conn.close()
 
-    section_header("Final Valve V-12 Status (Live SQLite State)", ["CODE", "HUMAN"])
+    section_header("Final Valve V-12 Status", ["CODE", "HUMAN"])
     if v12:
         card_cls = "scada-card-ok" if v12["status"] == "OPEN" else "scada-card-pending"
         st.markdown(
@@ -33,41 +33,17 @@ def _render_final_valve_v12_status() -> None:
 
 
 def render_incident_brief() -> None:
-    """Render the full scenario run report with all sections matching run_agent.py."""
+    """Render the scenario run report with original technical labels and status codes."""
     result = st.session_state.get("last_agent_result")
     scenario_id = st.session_state.get("active_scenario")
     bypass_result = st.session_state.get("last_bypass_result")
 
     if not result:
-        st.info(
-            "Select one of the 4 scenario buttons above to run the AquaGrid agent and inspect the "
-            "live LLM brief, pure-Python schedule validation, gateway history, and security shields."
-        )
+        st.info("Select one of the 4 scenario buttons above to run the AquaGrid agent.")
         _render_final_valve_v12_status()
         return
 
-    # 1. Execution Summary Banner (Model Provider, Status, Steps/Replans)
-    provider = result.get("llm_provider", "Unknown")
-    status = result.get("status", "UNKNOWN")
-    steps = result.get("agent_step_count", 0)
-    replans = result.get("replan_count", 0)
-
-    st.markdown(
-        f"""
-        <div class="scada-card">
-            <div style="display:flex; flex-wrap:wrap; gap:1.25rem; align-items:center;">
-                <div>{actor_badge("LLM")} <strong>Model Provider Used:</strong>
-                    <span class="ag-mono">{html.escape(str(provider))}</span>
-                </div>
-                <div>{actor_badge("CODE")} <strong>Agent Status:</strong> {status_badge(status)}</div>
-                <div>{actor_badge("CODE")} <strong>Steps:</strong> {steps} (Replans: {replans})</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # 2. Operator Brief & Maintenance Advisory / Work Orders [LLM]
+    # 1. Operator Brief & Maintenance Advisory / Work Orders
     b_col, m_col = st.columns(2)
     with b_col:
         section_header("Operator Action Brief", ["LLM"])
@@ -82,7 +58,7 @@ def render_incident_brief() -> None:
             unsafe_allow_html=True,
         )
 
-    # 3. Proposed Production Schedule [LLM] + Schedule Validation [CODE]
+    # 2. Proposed Production Schedule + Schedule Validation
     section_header("Proposed Production Schedule", ["LLM"])
     st.markdown(
         f'<div class="scada-card ag-mono">{html.escape(str(result.get("proposed_schedule", "")))}</div>',
@@ -138,13 +114,12 @@ def render_incident_brief() -> None:
                     )
         st.markdown(f'<div class="{card_cls}">{"".join(lines_html)}</div>', unsafe_allow_html=True)
 
-    # 4. Proposal & Gateway History (Layer 3 Python Code Guards) [LLM -> CODE]
+    # 3. Proposal & Gateway History
     proposal_history = result.get("proposal_history", [])
     if proposal_history:
-        section_header("Proposal & Gateway History (Layer 3 Python Code Guards)", ["LLM", "CODE"])
+        section_header("Proposal & Gateway History", ["LLM", "CODE"])
         for entry in proposal_history:
             attempt = entry.get("attempt")
-            replan = entry.get("replan_count")
             prop = entry.get("action_proposal") or {}
             gw = entry.get("gateway_response") or {}
             gw_status = gw.get("status", "UNKNOWN")
@@ -160,27 +135,27 @@ def render_incident_brief() -> None:
                 f"""
                 <div class="{card_cls}">
                     <div>
-                        {actor_badge("LLM")} <strong>Attempt #{attempt} (replan={replan}):</strong>
+                        <strong>Attempt #{attempt}:</strong>
                         <span class="ag-mono">{html.escape(str(prop.get('action_type')))}
                         {html.escape(str(prop.get('target_id')))} &rarr; {html.escape(str(prop.get('proposed_value')))}</span>
-                        &nbsp;&nbsp;{actor_badge("CODE")} {status_badge(gw_status)}{pct_html}
+                        &nbsp;&nbsp;{status_badge(gw_status)}{pct_html}
                     </div>
                     <div style="margin-top:0.35rem; font-size:0.86rem;">
-                        <strong>LLM Rationale:</strong> {html.escape(str(prop.get('rationale', '')))}
+                        <strong>Rationale:</strong> {html.escape(str(prop.get('rationale', '')))}
                     </div>
                     <div style="margin-top:0.25rem; font-size:0.86rem; color:#CBD5E1;">
-                        <strong>Code Guard Verdict:</strong> {html.escape(str(guard_msg))}
+                        <strong>Safety Guard Verdict:</strong> {html.escape(str(guard_msg))}
                     </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-    # 5. Injection Shield (Pure Python Guard) [CODE]
+    # 4. Injection Shield
     sanitized_alerts = result.get("sanitized_alerts", [])
     flagged_alerts = [a for a in sanitized_alerts if a.get("injection_detected")]
     if scenario_id == 4 or flagged_alerts:
-        section_header("Injection Shield (Pure Python Guard)", ["CODE"], extra_badge=status_badge("BLOCKED"))
+        section_header("Injection Shield", ["CODE"], extra_badge=status_badge("BLOCKED"))
         conn = get_db_connection()
         try:
             raw_rows = conn.execute(
@@ -195,42 +170,39 @@ def render_incident_brief() -> None:
             a_id = alert.get("alert_id")
             raw_text = raw_by_id.get(a_id, "")
             _, matched_patterns = detect_injection(raw_text)
-            sanitized_text = alert.get("text", "")
             raw_reached_llm = bool(raw_text) and (raw_text in last_prompt)
             leaked_fragments = [
                 frag
                 for frag in ("SYSTEM OVERRIDE", "ignore safety", "open valve", "V-12", "emergency flushing")
                 if frag.lower() in last_prompt.lower()
             ]
-            sanitized_reached_llm = bool(sanitized_text) and (sanitized_text in last_prompt)
             confirm_text = (
                 "YES (BREACH!)"
                 if (raw_reached_llm or leaked_fragments)
-                else "NO — CONFIRMED (entire malicious text withheld; zero original instruction reached LLM)"
+                else "NO — CONFIRMED (quarantined before model context)"
             )
             st.markdown(
                 f"""
                 <div class="scada-card-alert">
                     <div><strong>Alert Metadata:</strong> <span class="ag-mono">id={html.escape(str(a_id))}, source={html.escape(str(alert.get('source')))}, severity={html.escape(str(alert.get('severity')))}</span></div>
-                    <div style="margin-top:0.35rem;"><strong>Original Malicious Alert (Quarantined in DB):</strong><br/>
+                    <div style="margin-top:0.35rem;"><strong>Quarantined Alert:</strong><br/>
                         <span class="ag-mono" style="color:#FCA5A5;">{html.escape(raw_text)}</span>
                     </div>
-                    <div style="margin-top:0.35rem;"><strong>Matched Regex Pattern(s):</strong><br/>
+                    <div style="margin-top:0.35rem;"><strong>Matched Pattern(s):</strong><br/>
                         <span class="ag-mono" style="color:#FDE68A;">{html.escape(str(matched_patterns))}</span>
                     </div>
-                    <div style="margin-top:0.35rem;"><strong>Sanitized Payload Sent to LLM:</strong><br/>
+                    <div style="margin-top:0.35rem;"><strong>Sanitized Payload:</strong><br/>
                         <span class="ag-mono" style="color:#7CE8FF;">{html.escape(json.dumps(alert))}</span>
                     </div>
-                    <div style="margin-top:0.4rem;"><strong>Raw Text Reached LLM?</strong>
+                    <div style="margin-top:0.4rem;"><strong>Raw Text Reached Model?</strong>
                         <span style="color:#6EE7B7; font-weight:700;">{html.escape(confirm_text)}</span>
-                        <span class="ag-mono" style="color:#9FB3C8;"> [sanitized_in_prompt={sanitized_reached_llm}, leaked_fragments={leaked_fragments}]</span>
                     </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-    # 6. Direct Write Bypass Attempt [CODE]
+    # 5. Direct Write Bypass Attempt
     if bypass_result:
         section_header(
             "Direct Write Bypass Attempt",
@@ -252,5 +224,5 @@ def render_incident_brief() -> None:
             unsafe_allow_html=True,
         )
 
-    # 7. Final Valve V-12 Status (Always displayed at the bottom of the report)
+    # 6. Final Valve V-12 Status
     _render_final_valve_v12_status()

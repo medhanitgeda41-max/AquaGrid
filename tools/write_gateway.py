@@ -457,3 +457,61 @@ def refuse_direct_write_bypass(
         "valve_status_after": status_after,
         "unchanged": status_before == status_after,
     }
+
+
+ALLOWED_LEAK_STATUSES: tuple[str, ...] = (
+    "Suspected",
+    "Confirmed",
+    "Under Repair",
+    "Resolved",
+    "False Alarm – Sensor Fault",
+)
+
+
+def update_leak_status_by_operator(
+    leak_id: str,
+    new_status: str,
+    operator_name: str = "ControlRoom_Operator",
+    note: str = "",
+    db_path: Optional[str] = None,
+) -> dict:
+    """
+    Record a human operator's status decision on a leak (e.g., Mark as False Alarm,
+    Mark Resolved, Confirmed, Under Repair) and write an immutable audit_log entry.
+    Does NOT modify valves or plant_setpoints.
+    """
+    if new_status not in ALLOWED_LEAK_STATUSES:
+        return {
+            "status": "REJECTED_INVALID_STATUS",
+            "reason": f"Invalid leak status '{new_status}'. Allowed: {ALLOWED_LEAK_STATUSES}",
+        }
+
+    with transaction_scope(db_path) as conn:
+        row = conn.execute("SELECT leak_id, status, pipe_segment_id FROM leaks WHERE leak_id = ?;", (leak_id,)).fetchone()
+        if not row:
+            return {"status": "ERROR_NOT_FOUND", "reason": f"Leak {leak_id} not found."}
+
+        prev_status = row["status"]
+        conn.execute("UPDATE leaks SET status = ? WHERE leak_id = ?;", (new_status, leak_id))
+        details = (
+            f"Operator {operator_name} updated {leak_id} ({row['pipe_segment_id']}) "
+            f"from '{prev_status}' to '{new_status}'."
+        )
+        if note:
+            details += f" Note: {note}"
+
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            ("LEAK_STATUS_UPDATED", leak_id, details, "HUMAN_OPERATOR", new_status.upper()),
+        )
+
+    return {
+        "status": "UPDATED",
+        "leak_id": leak_id,
+        "previous_status": prev_status,
+        "new_status": new_status,
+        "operator": operator_name,
+    }
