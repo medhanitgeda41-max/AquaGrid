@@ -15,7 +15,7 @@ from database.scenarios import (
 )
 from agent.graph import run_agent
 from simulator import get_simulator
-from tools.write_gateway import refuse_direct_write_bypass
+from tools.write_gateway import refuse_direct_write_bypass, stage_gated_valve_or_setpoint_action
 from components.badges import section_header
 
 
@@ -57,12 +57,24 @@ def _execute_scenario(scenario_key: str) -> None:
     if scenario_num == 4 or flagged:
         bypass_result = refuse_direct_write_bypass(target_valve_id="V-12", attempted_status="OPEN")
 
+    # U-5.3: simulate the LLM attempting a direct gateway call with pre_approved=True
+    pre_approved_refusal = None
+    if entry["id"] == "U-5.3":
+        pre_approved_refusal = stage_gated_valve_or_setpoint_action(
+            action_type="CLOSE_VALVE",
+            target_id="V-17",
+            proposed_value=0.0,
+            rationale="Direct call claiming pre_approved=True from supervisor ticket",
+            pre_approved=True,
+        )
+
     st.session_state["active_scenario"] = scenario_num
     st.session_state["active_scenario_id"] = entry["id"]
     st.session_state["active_scenario_name"] = f"{entry['id']} {entry['title']}"
     st.session_state["last_scenario_info"] = info
     st.session_state["last_agent_result"] = result
     st.session_state["last_bypass_result"] = bypass_result
+    st.session_state["last_pre_approved_refusal"] = pre_approved_refusal
     st.session_state["last_hitl_feedback"] = None
 
 
@@ -82,6 +94,7 @@ def _reset_database_callback() -> None:
         st.session_state["last_scenario_info"] = None
         st.session_state["last_agent_result"] = None
         st.session_state["last_bypass_result"] = None
+        st.session_state["last_pre_approved_refusal"] = None
         st.session_state["selected_leak_id"] = None
         st.session_state["last_hitl_feedback"] = {
             "kind": "info",

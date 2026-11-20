@@ -44,6 +44,7 @@ def node_ingest(state: AgentState) -> dict:
         "hourly_demand_24h": feeds_data.get("hourly_demand_24h", {}),
         "reservoir_status": feeds_data.get("reservoir", {}),
         "sanitized_alerts": feeds_data.get("sanitized_alerts", []),
+        "field_tickets": feeds_data.get("field_tickets", []),
         "sector_water_quality_compliance": feeds_data.get("sector_water_quality_compliance", {}),
         "excluded_sectors": feeds_data.get("excluded_sectors", []),
         "agent_step_count": state.get("agent_step_count", 0) + 1,
@@ -52,6 +53,19 @@ def node_ingest(state: AgentState) -> dict:
 
 def node_reason(state: AgentState) -> dict:
     """Cognitive analysis: explain leak vs. fault and propose tariff schedule / physical actions."""
+    # Pass alerts and field tickets strictly as quoted UNTRUSTED_TEXT data
+    quoted_tickets = [
+        {
+            "ticket_ref": t.get("ticket_ref"),
+            "sector": t.get("sector"),
+            "trust_level": "UNTRUSTED_TEXT",
+            "quoted_data": t.get("quoted_data"),
+            "command_or_approval_claim_detected": t.get("command_or_approval_claim_detected", False),
+            "mentioned_valves": t.get("mentioned_valves", []),
+        }
+        for t in state.get("field_tickets", [])
+    ]
+
     user_context = {
         "scenario_id": state.get("scenario_id"),
         "current_hour": state.get("current_hour", 14),
@@ -59,6 +73,7 @@ def node_reason(state: AgentState) -> dict:
         "leak_alerts": state.get("leak_alerts", []),
         "quarantined_sensors": state.get("quarantined_sensors", []),
         "sanitized_alerts": state.get("sanitized_alerts", []),
+        "untrusted_field_tickets": quoted_tickets,
         "sector_water_quality_compliance": state.get("sector_water_quality_compliance", {}),
         "excluded_sectors_from_tariff_scheduling": state.get("excluded_sectors", []),
         "tariff_data": state.get("tariff_data", {}),
@@ -154,11 +169,32 @@ def node_stage_action(state: AgentState) -> dict:
     except (TypeError, ValueError):
         proposed_value = 0.0
 
+    # Determine deterministic provenance (UNTRUSTED_TEXT if proposal originates from a flagged ticket/alert)
+    target_id_str = str(action.get("target_id") or "").upper()
+    provenance = "AGENT_ANALYSIS"
+    provenance_ref = ""
+    for ft in state.get("field_tickets", []):
+        if ft.get("command_or_approval_claim_detected") and (
+            target_id_str in [v.upper() for v in ft.get("mentioned_valves", [])]
+            or target_id_str in str(ft.get("text", "")).upper()
+        ):
+            provenance = "UNTRUSTED_TEXT"
+            provenance_ref = str(ft.get("ticket_ref") or f"TICKET-{ft.get('id')}")
+            break
+    if provenance == "AGENT_ANALYSIS":
+        for al in state.get("sanitized_alerts", []):
+            if al.get("command_or_approval_claim_detected") and target_id_str and target_id_str in str(al.get("text", "")).upper():
+                provenance = "UNTRUSTED_TEXT"
+                provenance_ref = f"ALERT-{al.get('alert_id')}"
+                break
+
     result = stage_gated_valve_or_setpoint_action(
         action_type=str(action.get("action_type") or ""),
         target_id=str(action.get("target_id") or ""),
         proposed_value=proposed_value,
         rationale=str(action.get("rationale") or "Proposed by AquaGrid Agent"),
+        provenance=provenance,
+        provenance_ref=provenance_ref,
     )
 
     history = list(state.get("proposal_history", []))

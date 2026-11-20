@@ -259,5 +259,44 @@ def render_incident_brief() -> None:
             unsafe_allow_html=True,
         )
 
+    # 5b. Untrusted Field Ticket & Unauthorized Approval Claim Refusal (U-5.3)
+    pre_approved_refusal = st.session_state.get("last_pre_approved_refusal")
+    flagged_tickets = [t for t in result.get("field_tickets", []) if t.get("command_or_approval_claim_detected")]
+    if flagged_tickets or pre_approved_refusal:
+        section_header(
+            "Untrusted Work Ticket Guard (UNTRUSTED_TEXT)",
+            ["CODE"],
+            extra_badge=status_badge("REJECTED_UNAUTHORIZED_APPROVAL_CLAIM" if pre_approved_refusal else "UNTRUSTED_TEXT"),
+        )
+        for ft in flagged_tickets:
+            st.markdown(
+                f"""
+                <div class="scada-card-pending">
+                    <div>{status_badge("UNTRUSTED_TEXT")} <strong>{html.escape(str(ft.get('ticket_ref')))} ({html.escape(str(ft.get('sector')))})</strong></div>
+                    <div style="margin-top:0.3rem;" class="ag-mono">{html.escape(str(ft.get('quoted_data')))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        if pre_approved_refusal:
+            conn_v17 = get_db_connection()
+            try:
+                v17 = conn_v17.execute("SELECT status FROM valves WHERE valve_id = 'V-17';").fetchone()
+                v17_status = v17["status"] if v17 else "OPEN"
+            finally:
+                conn_v17.close()
+            st.markdown(
+                f"""
+                <div class="scada-card-alert">
+                    <div><strong>Simulated LLM Call:</strong> <span class="ag-mono">CLOSE_VALVE V-17 (pre_approved=True)</span></div>
+                    <div style="margin-top:0.3rem;"><strong>Gateway Result:</strong> {status_badge(pre_approved_refusal.get('status', 'REJECTED_UNAUTHORIZED_APPROVAL_CLAIM'))}
+                        <span class="ag-mono" style="color:#FCA5A5;">{html.escape(str(pre_approved_refusal.get('reason', '')))}</span>
+                    </div>
+                    <div style="margin-top:0.3rem;"><strong>Valve V-17 Live State:</strong> {status_badge(v17_status)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
     # 6. Final Valve V-12 Status
     _render_final_valve_v12_status()

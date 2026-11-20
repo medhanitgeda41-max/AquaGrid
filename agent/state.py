@@ -17,6 +17,7 @@ class AgentState(TypedDict):
     hourly_demand_24h: dict[int, float]
     reservoir_status: dict
     sanitized_alerts: list[dict]
+    field_tickets: list[dict]
     sector_water_quality_compliance: dict
     excluded_sectors: list[str]
 

@@ -77,6 +77,10 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
             prop_fmt = _format_actuator_value(action_type, float(row["proposed_value"]))
             rationale = row["rationale"]
             created_at = format_dubai_time(row["created_at"])
+            prov = row["provenance"] if "provenance" in row.keys() and row["provenance"] else "AGENT_ANALYSIS"
+            prov_ref = row["provenance_ref"] if "provenance_ref" in row.keys() and row["provenance_ref"] else ""
+            prov_text = f"{prov} ({prov_ref})" if prov_ref else prov
+            prov_badge_cls = "ag-badge-warn" if prov == "UNTRUSTED_TEXT" else "ag-badge-neutral"
 
             st.markdown(
                 f"""
@@ -84,6 +88,7 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
                         <div>
                             {status_badge("PENDING")}
+                            <span class="ag-badge {prov_badge_cls}">SOURCE: {html.escape(prov_text)}</span>
                             <strong>Action #{action_id}:</strong>
                             <span class="ag-mono">{html.escape(action_type)} &rarr; {html.escape(target_id)}</span>
                         </div>

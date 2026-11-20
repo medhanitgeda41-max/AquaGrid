@@ -267,12 +267,14 @@ def status_badge(status: str) -> str:
         "MEDIUM",
         "LOW",
         "ELEVATED WATCH",
+        "UNTRUSTED_TEXT",
     ):
         cls = "ag-badge-warn"
     elif s in (
         "REJECTED_BY_CODE",
         "REJECTED_BY_SAFETY_GUARD",
         "REJECTED_WATER_QUALITY",
+        "REJECTED_UNAUTHORIZED_APPROVAL_CLAIM",
         "REJECTED_INVALID_TARGET",
         "CANCELLED_BY_SAFETY_RECHECK",
         "ABORTED_BY_SAFETY",

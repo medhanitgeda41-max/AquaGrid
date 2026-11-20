@@ -78,6 +78,7 @@ def run_agent(scenario_id: int | str | None = None, current_hour: int = 14) -> A
         "hourly_demand_24h": {},
         "reservoir_status": {},
         "sanitized_alerts": [],
+        "field_tickets": [],
         "sector_water_quality_compliance": {},
         "excluded_sectors": [],
         "last_user_prompt": "",
