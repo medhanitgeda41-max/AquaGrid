@@ -5,7 +5,7 @@ import streamlit as st
 from agent.operator_prompt import run_operator_prompt
 from config.constants import DEFAULT_SCADA_HOUR
 from components.badges import section_header, status_badge
-from simulator import get_simulator
+from simulator import get_simulator, simulator_step_lock
 
 
 def _format_proposed_action(action: dict | None) -> str:
@@ -44,7 +44,7 @@ def render_ai_prompt_panel(display_hour: int = DEFAULT_SCADA_HOUR) -> None:
         else:
             sim = get_simulator()
             with st.spinner("Reading SCADA data, running code checks, asking AI..."):
-                with sim.step_lock:
+                with simulator_step_lock(sim):
                     prompt_res = run_operator_prompt(
                         prompt_text=prompt_text,
                         current_hour=display_hour,

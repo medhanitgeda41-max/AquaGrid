@@ -18,6 +18,7 @@ HARD ARCHITECTURAL INVARIANT:
 - It NEVER writes to `valves` or `plant_setpoints` (those remain gateway + human only).
 """
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -108,7 +109,7 @@ class LiveScadaSimulator:
         self._rng = random.Random(seed)
 
         self._lock = threading.Lock()
-        self._step_lock = threading.RLock()
+        self.step_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._tick_count: int = 0
@@ -119,11 +120,6 @@ class LiveScadaSimulator:
         self._prev_sensor_vals: dict[str, float] = {}
         self._prev_sector_chlorine: dict[str, float] = {}
         self._feed_paused: bool = False
-
-    @property
-    def step_lock(self) -> threading.RLock:
-        """Re-entrant lock serializing simulator batch writes against scenario DB resets."""
-        return self._step_lock
 
     @property
     def is_feed_paused(self) -> bool:
@@ -226,7 +222,11 @@ class LiveScadaSimulator:
         """
         Execute one SCADA batch tick (serialized with step_lock so concurrent scenarios never contend on SQLite).
         """
-        with self._step_lock:
+        lock = getattr(self, "step_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.step_lock = lock
+        with lock:
             return self._step_impl(force_fault=force_fault, now_override=now_override)
 
     def _step_impl(self, force_fault: Optional[str] = None, now_override: Optional[datetime] = None) -> dict:
@@ -663,11 +663,47 @@ _GLOBAL_SIMULATOR: Optional[LiveScadaSimulator] = None
 _GLOBAL_LOCK = threading.Lock()
 
 
+def _is_stale_simulator(sim: Optional[object]) -> bool:
+    """Return True if a cached simulator object is missing required attributes like step_lock."""
+    if sim is None:
+        return True
+    if not isinstance(sim, LiveScadaSimulator):
+        return True
+    if getattr(sim, "step_lock", None) is None:
+        return True
+    if not hasattr(sim, "resume_feed") or not hasattr(sim, "pause_feed"):
+        return True
+    return False
+
+
+def simulator_step_lock(sim: Optional[object]):
+    """Return sim.step_lock when sim is running, else a no-op context manager.
+
+    If a running simulator object is stale and lacks step_lock, attaches a threading.Lock safely.
+    """
+    if sim is None or not getattr(sim, "is_running", False):
+        return nullcontext()
+    lock = getattr(sim, "step_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        try:
+            setattr(sim, "step_lock", lock)
+        except Exception:
+            return nullcontext()
+    return lock
+
+
 def get_simulator() -> LiveScadaSimulator:
-    """Return the shared LiveScadaSimulator singleton configured for 2-min real-time Dubai mode."""
+    """Return the shared LiveScadaSimulator singleton, replacing any old/stale instance missing step_lock."""
     global _GLOBAL_SIMULATOR
     with _GLOBAL_LOCK:
-        if _GLOBAL_SIMULATOR is None:
+        if _is_stale_simulator(_GLOBAL_SIMULATOR):
+            old_sim = _GLOBAL_SIMULATOR
+            if old_sim is not None and getattr(old_sim, "is_running", False):
+                try:
+                    old_sim.stop()
+                except Exception:
+                    pass
             _GLOBAL_SIMULATOR = LiveScadaSimulator(
                 interval_seconds=float(REGION_CONFIG["live_interval_seconds"]),
                 fault_probability=float(REGION_CONFIG["default_fault_probability"]),

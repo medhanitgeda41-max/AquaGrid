@@ -14,7 +14,7 @@ from database.scenarios import (
     reset_database,
 )
 from agent.graph import run_agent
-from simulator import get_simulator
+from simulator import get_simulator, simulator_step_lock
 from tools.write_gateway import refuse_direct_write_bypass, stage_gated_valve_or_setpoint_action
 from components.badges import section_header
 
@@ -22,9 +22,11 @@ from components.badges import section_header
 def _stop_live_sim_if_running() -> None:
     """Stop live simulator thread and reset toggles (called only on Reset and Re-seed Database)."""
     sim = get_simulator()
-    if sim.is_running:
-        sim.stop()
-    sim.reset_clock(DEFAULT_SCADA_HOUR)
+    if sim is not None:
+        if getattr(sim, "is_running", False) and hasattr(sim, "stop"):
+            sim.stop()
+        if hasattr(sim, "reset_clock"):
+            sim.reset_clock(DEFAULT_SCADA_HOUR)
     st.session_state["live_sim_toggle"] = False
     st.session_state["demo_accel_toggle"] = False
 
@@ -46,11 +48,11 @@ def _execute_scenario(scenario_key: str) -> None:
         return
 
     sim = get_simulator()
-    if entry["id"] != "U-5.5":
+    if entry["id"] != "U-5.5" and sim is not None and hasattr(sim, "resume_feed"):
         sim.resume_feed()
     st.session_state["telemetry_restored_banner"] = None
 
-    with sim.step_lock:
+    with simulator_step_lock(sim):
         reset_database()
         info = entry["injector"]()
 
@@ -92,7 +94,7 @@ def _reset_database_callback() -> None:
     st.session_state["_scenario_lock"] = True
     try:
         _stop_live_sim_if_running()
-        with get_simulator().step_lock:
+        with simulator_step_lock(get_simulator()):
             reset_database()
         st.session_state["_queued_scenario"] = None
         st.session_state["active_scenario"] = None
