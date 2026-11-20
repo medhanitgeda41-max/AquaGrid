@@ -6,10 +6,13 @@ Enforces strict architectural perimeter:
 - Physical mutations MUST be staged as 'PENDING' for human approval.
 - Just-in-time safety re-check upon human 'Approve' before any database commit.
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import hashlib
+import secrets
 from typing import Optional
 from config.constants import (
     ALLOWED_ACTION_TYPES,
+    APPROVAL_TOKEN_TTL_MINUTES,
     KNOWN_PLANTS,
     KNOWN_SECTOR_TARGETS,
     KNOWN_TARGET_IDS,
@@ -19,11 +22,368 @@ from config.constants import (
 )
 from database.connection import get_db_connection, transaction_scope
 from guards.safety_floors import (
+    _parse_utc_timestamp,
     compute_effective_reservoir_floor,
     simulate_reservoir_trajectory,
     evaluate_quality_and_bloom_derating,
 )
 from guards.water_quality import evaluate_sector_chlorine, target_id_to_sector_name
+
+
+def compute_action_params_hash(action_type: str, target_id: str, proposed_value: float) -> str:
+    """Deterministic SHA-256 hash binding an approval token to exact action parameters."""
+    canonical = f"{str(action_type).strip().upper()}|{str(target_id).strip().upper()}|{float(proposed_value):.4f}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def issue_approval_token(
+    action_id: int,
+    operator: str = "ControlRoom_Operator",
+    issued_at: Optional[datetime] = None,
+    db_path: Optional[str] = None,
+) -> dict:
+    """
+    Issue a single-use cryptographic approval token bound to a specific PENDING action.
+    Only callable from the operator approval console (never exposed to agent/).
+    """
+    now_utc = _parse_utc_timestamp(issued_at) or datetime.now(timezone.utc)
+    expires_utc = now_utc + timedelta(minutes=APPROVAL_TOKEN_TTL_MINUTES)
+    issued_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+    expires_str = expires_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    with transaction_scope(db_path) as conn:
+        action_row = conn.execute(
+            "SELECT * FROM pending_actions WHERE id = ? AND status = 'PENDING';",
+            (action_id,),
+        ).fetchone()
+        if not action_row:
+            return {
+                "status": "ERROR_NOT_FOUND",
+                "message": f"Pending action with ID {action_id} not found or already processed.",
+            }
+
+        action_type = action_row["action_type"]
+        target_id = action_row["target_id"]
+        proposed_value = float(action_row["proposed_value"])
+        params_hash = compute_action_params_hash(action_type, target_id, proposed_value)
+        token_id = f"TOK-{secrets.token_hex(10).upper()}"
+
+        conn.execute(
+            """
+            INSERT INTO approval_tokens (
+                token_id, action_id, action_type, target, params_hash, operator, issued_at, expires_at, used_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL);
+            """,
+            (token_id, action_id, action_type, target_id, params_hash, operator, issued_str, expires_str),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "APPROVAL_TOKEN_ISSUED",
+                target_id,
+                f"Issued single-use token {token_id} for Action #{action_id} ({action_type} {target_id}) by {operator}, expires {expires_str} UTC.",
+                "HUMAN_OPERATOR",
+                "ALLOWED",
+            ),
+        )
+
+    return {
+        "status": "ISSUED",
+        "token_id": token_id,
+        "action_id": action_id,
+        "action_type": action_type,
+        "target": target_id,
+        "params_hash": params_hash,
+        "operator": operator,
+        "issued_at": issued_str,
+        "expires_at": expires_str,
+        "used_at": None,
+    }
+
+
+def _execute_bound_action_in_tx(
+    conn,
+    token_row,
+    action_type: str,
+    target_id: str,
+    proposed_value: float,
+    now_utc: datetime,
+    db_path: Optional[str] = None,
+) -> dict:
+    """Validate single-use token and execute physical mutation + mark used_at in ONE atomic transaction."""
+    token_id = token_row["token_id"]
+    action_id = int(token_row["action_id"])
+    approver = token_row["operator"]
+    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    expected_hash = compute_action_params_hash(action_type, target_id, proposed_value)
+    expires_dt = _parse_utc_timestamp(token_row["expires_at"])
+    is_expired = bool(expires_dt is not None and now_utc > expires_dt)
+    is_used = token_row["used_at"] is not None
+
+    # 1. Exact binding check (action_type, target, params_hash)
+    if (
+        token_row["action_type"] != action_type
+        or token_row["target"] != target_id
+        or token_row["params_hash"] != expected_hash
+    ):
+        extra_notes = []
+        if is_expired:
+            extra_notes.append(f"also expired at {token_row['expires_at']} UTC")
+        if is_used:
+            extra_notes.append(f"already used at {token_row['used_at']} UTC")
+        suffix = f" ({'; '.join(extra_notes)})" if extra_notes else ""
+        reason = (
+            f"REJECTED_APPROVAL_MISMATCH: Token {token_id} is bound to {token_row['action_type']} {token_row['target']} "
+            f"(hash={token_row['params_hash'][:12]}...), cannot be used for {action_type} {target_id}{suffix}."
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            ("APPROVAL_TOKEN_REJECTED", target_id, reason, "CODE_GUARD", "REJECTED_APPROVAL_MISMATCH"),
+        )
+        return {
+            "status": "REJECTED_APPROVAL_MISMATCH",
+            "token_id": token_id,
+            "target_id": target_id,
+            "bound_target": token_row["target"],
+            "also_expired": is_expired,
+            "also_used": is_used,
+            "reason": reason,
+        }
+
+    # 2. Single-use check (already consumed)
+    if is_used:
+        exp_note = f" (also expired at {token_row['expires_at']} UTC)" if is_expired else ""
+        reason = (
+            f"REJECTED_APPROVAL_ALREADY_USED: Single-use token {token_id} for {action_type} {target_id} "
+            f"was already consumed at {token_row['used_at']} UTC{exp_note}."
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            ("APPROVAL_TOKEN_REJECTED", target_id, reason, "CODE_GUARD", "REJECTED_APPROVAL_ALREADY_USED"),
+        )
+        return {
+            "status": "REJECTED_APPROVAL_ALREADY_USED",
+            "token_id": token_id,
+            "target_id": target_id,
+            "used_at": token_row["used_at"],
+            "also_expired": is_expired,
+            "reason": reason,
+        }
+
+    # 3. Expiration TTL check
+    if is_expired:
+        reason = (
+            f"REJECTED_APPROVAL_EXPIRED: Token {token_id} for {action_type} {target_id} "
+            f"expired at {token_row['expires_at']} UTC (TTL {APPROVAL_TOKEN_TTL_MINUTES} min)."
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            ("APPROVAL_TOKEN_REJECTED", target_id, reason, "CODE_GUARD", "REJECTED_APPROVAL_EXPIRED"),
+        )
+        return {
+            "status": "REJECTED_APPROVAL_EXPIRED",
+            "token_id": token_id,
+            "target_id": target_id,
+            "expires_at": token_row["expires_at"],
+            "reason": reason,
+        }
+
+    # 4. JIT Safety Re-Check against dynamic floor
+    eff_floor = get_active_emergency_floor(db_path=db_path, at_time=now_utc, conn=conn)
+    if action_type == "SET_PLANT_OUTPUT":
+        res_row = conn.execute("SELECT volume_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
+        latest_vol = float(res_row["volume_ml"]) if res_row else 240.0
+        demand_rows = conn.execute(
+            "SELECT demand_mld FROM demand_forecast WHERE hour >= 14 AND hour < 20 ORDER BY hour ASC;"
+        ).fetchall()
+        demand_list = [float(r["demand_mld"]) for r in demand_rows] or [351.0] * 6
+
+        recheck_sim = simulate_reservoir_trajectory(
+            current_volume_ml=latest_vol,
+            plant_inflow_mld=proposed_value,
+            demand_forecast_mld=demand_list,
+            min_floor_percent=eff_floor["effective_floor_ratio"],
+        )
+
+        if not recheck_sim["is_safe"]:
+            conn.execute(
+                """
+                UPDATE pending_actions
+                SET status = 'CANCELLED_BY_SAFETY_RECHECK', executed_at = ?, approver = ?
+                WHERE id = ?;
+                """,
+                (now_str, approver, action_id),
+            )
+            conn.execute(
+                "UPDATE approval_tokens SET used_at = ? WHERE token_id = ?;",
+                (now_str, token_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                (
+                    "APPROVAL_CANCELLED_BY_SAFETY",
+                    target_id,
+                    f"Action {action_id} (token {token_id}) cancelled upon approval: {recheck_sim['reason']}",
+                    "CODE_GUARD",
+                    "BLOCKED",
+                ),
+            )
+            return {
+                "status": "CANCELLED_BY_SAFETY_RECHECK",
+                "token_id": token_id,
+                "reason": recheck_sim["reason"],
+                "min_projected_percent": recheck_sim["min_level_percent"],
+            }
+
+    # 5. Execute physical mutation + consume token (set used_at) in the SAME ACID transaction
+    if action_type == "CLOSE_VALVE":
+        conn.execute(
+            "UPDATE valves SET status = 'CLOSED', last_updated = ? WHERE valve_id = ?;",
+            (now_str, target_id),
+        )
+    elif action_type == "OPEN_VALVE":
+        conn.execute(
+            "UPDATE valves SET status = 'OPEN', last_updated = ? WHERE valve_id = ?;",
+            (now_str, target_id),
+        )
+    elif action_type == "SET_PLANT_OUTPUT":
+        conn.execute(
+            "UPDATE plant_setpoints SET production_mld = ?, last_updated = ? WHERE plant_id = ?;",
+            (proposed_value, now_str, target_id),
+        )
+    elif action_type == "ISOLATE_AND_FLUSH":
+        res_row = conn.execute("SELECT volume_ml, capacity_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
+        latest_vol = float(res_row["volume_ml"]) if res_row else 240.0
+        if latest_vol < eff_floor["effective_floor_ml"]:
+            reason = (
+                f"Reservoir volume ({latest_vol:.1f} ML) is below safety floor "
+                f"({eff_floor['effective_floor_ml']:.1f} ML / {eff_floor['effective_floor_percent']:.1f}%); "
+                f"cannot initiate flush for {target_id}."
+            )
+            conn.execute(
+                """
+                UPDATE pending_actions
+                SET status = 'CANCELLED_BY_SAFETY_RECHECK', executed_at = ?, approver = ?
+                WHERE id = ?;
+                """,
+                (now_str, approver, action_id),
+            )
+            conn.execute("UPDATE approval_tokens SET used_at = ? WHERE token_id = ?;", (now_str, token_id))
+            conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                ("APPROVAL_CANCELLED_BY_SAFETY", target_id, reason, "CODE_GUARD", "BLOCKED"),
+            )
+            return {"status": "CANCELLED_BY_SAFETY_RECHECK", "token_id": token_id, "reason": reason}
+
+        sec_name = target_id_to_sector_name(target_id)
+        conn.execute(
+            "UPDATE valves SET status = 'CLOSED', last_updated = ? WHERE sector = ?;",
+            (now_str, sec_name),
+        )
+
+    conn.execute(
+        """
+        UPDATE pending_actions
+        SET status = 'APPROVED', executed_at = ?, approver = ?
+        WHERE id = ?;
+        """,
+        (now_str, approver, action_id),
+    )
+    conn.execute(
+        "UPDATE approval_tokens SET used_at = ? WHERE token_id = ?;",
+        (now_str, token_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO audit_log (event_type, target_id, details, actor, status)
+        VALUES (?, ?, ?, ?, ?);
+        """,
+        (
+            "ACTION_EXECUTED",
+            target_id,
+            f"Action {action_id} ({action_type} -> {proposed_value}) APPROVED via single-use token {token_id} and executed by {approver}.",
+            "HUMAN_OPERATOR",
+            "APPROVED",
+        ),
+    )
+
+    return {
+        "status": "EXECUTED",
+        "action_id": action_id,
+        "action_type": action_type,
+        "target_id": target_id,
+        "new_value": proposed_value,
+        "approver": approver,
+        "token_id": token_id,
+        "token_issued_at": token_row["issued_at"],
+        "token_expires_at": token_row["expires_at"],
+        "token_used_at": now_str,
+        "params_hash": token_row["params_hash"],
+    }
+
+
+def execute_action_with_approval_token(
+    token_id: str,
+    action_type: str,
+    target_id: str,
+    proposed_value: float,
+    at_time: Optional[datetime] = None,
+    db_path: Optional[str] = None,
+) -> dict:
+    """
+    Attempt to execute an actuator change by presenting an approval token.
+    Enforces: token exists, matches action_type/target/params_hash, not already used, not expired.
+    Marks used_at and commits the mutation in the same transaction on success.
+    """
+    now_utc = _parse_utc_timestamp(at_time) or datetime.now(timezone.utc)
+    with transaction_scope(db_path) as conn:
+        token_row = conn.execute(
+            "SELECT * FROM approval_tokens WHERE token_id = ?;",
+            (token_id,),
+        ).fetchone()
+        if not token_row:
+            reason = f"REJECTED_APPROVAL_MISMATCH: Approval token '{token_id}' does not exist."
+            conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                ("APPROVAL_TOKEN_REJECTED", target_id, reason, "CODE_GUARD", "REJECTED_APPROVAL_MISMATCH"),
+            )
+            return {
+                "status": "REJECTED_APPROVAL_MISMATCH",
+                "token_id": token_id,
+                "target_id": target_id,
+                "reason": reason,
+            }
+        return _execute_bound_action_in_tx(
+            conn=conn,
+            token_row=token_row,
+            action_type=action_type,
+            target_id=target_id,
+            proposed_value=proposed_value,
+            now_utc=now_utc,
+            db_path=db_path,
+        )
 
 
 def get_active_emergency_floor(
@@ -500,158 +860,39 @@ def execute_human_approval(
     action_id: int,
     approver: str = "ControlRoom_Operator",
     db_path: Optional[str] = None,
+    approved_at: Optional[datetime] = None,
 ) -> dict:
     """
-    Execute human operator approval with mandatory just-in-time safety re-check.
-
-    Re-runs the 35% reservoir floor and water quality checks with latest telemetry.
-    If conditions deteriorated, cancels with 'CANCELLED_BY_SAFETY_RECHECK' and DOES NOT commit.
-    If re-check passes, commits the actuator change in a single ACID transaction.
+    Execute human operator approval by issuing a single-use approval token bound to
+    the exact PENDING action, running the just-in-time safety re-check, and consuming
+    the token (used_at) in the same ACID transaction as the physical mutation.
     """
-    with transaction_scope(db_path) as conn:
-        action_row = conn.execute(
-            "SELECT * FROM pending_actions WHERE id = ? AND status = 'PENDING';",
-            (action_id,),
-        ).fetchone()
+    now_utc = _parse_utc_timestamp(approved_at) or datetime.now(timezone.utc)
+    issued = issue_approval_token(
+        action_id=action_id,
+        operator=approver,
+        issued_at=now_utc,
+        db_path=db_path,
+    )
+    if issued.get("status") != "ISSUED":
+        return issued
 
-        if not action_row:
-            return {
-                "status": "ERROR_NOT_FOUND",
-                "message": f"Pending action with ID {action_id} not found or already processed.",
-            }
+    conn_val = get_db_connection(db_path)
+    try:
+        row = conn_val.execute("SELECT action_type, target_id, proposed_value FROM pending_actions WHERE id = ?;", (action_id,)).fetchone()
+    finally:
+        conn_val.close()
+    if not row:
+        return {"status": "ERROR_NOT_FOUND", "message": f"Pending action {action_id} not found."}
 
-        action_type = action_row["action_type"]
-        target_id = action_row["target_id"]
-        proposed_value = float(action_row["proposed_value"])
-
-        # JIT Safety Re-Check: If setting plant output, re-verify dynamic reservoir floor
-        eff_floor = get_active_emergency_floor(db_path=db_path, conn=conn)
-        if action_type == "SET_PLANT_OUTPUT":
-            res_row = conn.execute("SELECT volume_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
-            latest_vol = float(res_row["volume_ml"]) if res_row else 240.0
-            demand_rows = conn.execute(
-                "SELECT demand_mld FROM demand_forecast WHERE hour >= 14 AND hour < 20 ORDER BY hour ASC;"
-            ).fetchall()
-            demand_list = [float(r["demand_mld"]) for r in demand_rows] or [351.0] * 6
-
-            recheck_sim = simulate_reservoir_trajectory(
-                current_volume_ml=latest_vol,
-                plant_inflow_mld=proposed_value,
-                demand_forecast_mld=demand_list,
-                min_floor_percent=eff_floor["effective_floor_ratio"],
-            )
-
-            if not recheck_sim["is_safe"]:
-                conn.execute(
-                    """
-                    UPDATE pending_actions
-                    SET status = 'CANCELLED_BY_SAFETY_RECHECK', executed_at = CURRENT_TIMESTAMP, approver = ?
-                    WHERE id = ?;
-                    """,
-                    (approver, action_id),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
-                    VALUES (?, ?, ?, ?, ?);
-                    """,
-                    (
-                        "APPROVAL_CANCELLED_BY_SAFETY",
-                        target_id,
-                        f"Action {action_id} cancelled upon approval: {recheck_sim['reason']}",
-                        "CODE_GUARD",
-                        "BLOCKED",
-                    ),
-                )
-                return {
-                    "status": "CANCELLED_BY_SAFETY_RECHECK",
-                    "reason": recheck_sim["reason"],
-                    "min_projected_percent": recheck_sim["min_level_percent"],
-                }
-
-        # Execute physical mutation atomically
-        if action_type == "CLOSE_VALVE":
-            conn.execute(
-                "UPDATE valves SET status = 'CLOSED', last_updated = CURRENT_TIMESTAMP WHERE valve_id = ?;",
-                (target_id,),
-            )
-        elif action_type == "OPEN_VALVE":
-            conn.execute(
-                "UPDATE valves SET status = 'OPEN', last_updated = CURRENT_TIMESTAMP WHERE valve_id = ?;",
-                (target_id,),
-            )
-        elif action_type == "SET_PLANT_OUTPUT":
-            conn.execute(
-                "UPDATE plant_setpoints SET production_mld = ?, last_updated = CURRENT_TIMESTAMP WHERE plant_id = ?;",
-                (proposed_value, target_id),
-            )
-        elif action_type == "ISOLATE_AND_FLUSH":
-            # Safety re-check: verify reservoir is above mandatory floor before flushing sector
-            res_row = conn.execute("SELECT volume_ml, capacity_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
-            latest_vol = float(res_row["volume_ml"]) if res_row else 240.0
-            cap_ml = float(res_row["capacity_ml"]) if res_row else RESERVOIR_TOTAL_CAPACITY_ML
-            if latest_vol < eff_floor["effective_floor_ml"]:
-                reason = (
-                    f"Reservoir volume ({latest_vol:.1f} ML) is below safety floor "
-                    f"({eff_floor['effective_floor_ml']:.1f} ML / {eff_floor['effective_floor_percent']:.1f}%); "
-                    f"cannot initiate flush for {target_id}."
-                )
-                conn.execute(
-                    """
-                    UPDATE pending_actions
-                    SET status = 'CANCELLED_BY_SAFETY_RECHECK', executed_at = CURRENT_TIMESTAMP, approver = ?
-                    WHERE id = ?;
-                    """,
-                    (approver, action_id),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
-                    VALUES (?, ?, ?, ?, ?);
-                    """,
-                    ("APPROVAL_CANCELLED_BY_SAFETY", target_id, reason, "CODE_GUARD", "BLOCKED"),
-                )
-                return {"status": "CANCELLED_BY_SAFETY_RECHECK", "reason": reason}
-
-            sec_name = target_id_to_sector_name(target_id)
-            conn.execute(
-                "UPDATE valves SET status = 'CLOSED', last_updated = CURRENT_TIMESTAMP WHERE sector = ?;",
-                (sec_name,),
-            )
-
-        # Update action status to APPROVED
-        conn.execute(
-            """
-            UPDATE pending_actions
-            SET status = 'APPROVED', executed_at = CURRENT_TIMESTAMP, approver = ?
-            WHERE id = ?;
-            """,
-            (approver, action_id),
-        )
-
-        # Audit log commit
-        conn.execute(
-            """
-            INSERT INTO audit_log (event_type, target_id, details, actor, status)
-            VALUES (?, ?, ?, ?, ?);
-            """,
-            (
-                "ACTION_EXECUTED",
-                target_id,
-                f"Action {action_id} ({action_type} -> {proposed_value}) APPROVED and executed by {approver}.",
-                "HUMAN_OPERATOR",
-                "APPROVED",
-            ),
-        )
-
-    return {
-        "status": "EXECUTED",
-        "action_id": action_id,
-        "action_type": action_type,
-        "target_id": target_id,
-        "new_value": proposed_value,
-        "approver": approver,
-    }
+    return execute_action_with_approval_token(
+        token_id=issued["token_id"],
+        action_type=row["action_type"],
+        target_id=row["target_id"],
+        proposed_value=float(row["proposed_value"]),
+        at_time=now_utc,
+        db_path=db_path,
+    )
 
 
 def execute_human_rejection(

@@ -25,6 +25,7 @@ def seed_database(db_path: str | None = None) -> None:
     with transaction_scope(db_path) as conn:
         # Clear existing data
         for table in (
+            "approval_tokens",
             "field_tickets",
             "emergency_commitments",
             "sector_water_quality",

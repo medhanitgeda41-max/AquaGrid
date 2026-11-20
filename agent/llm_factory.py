@@ -129,6 +129,25 @@ def generate_offline_mock_response(system_prompt: str, user_prompt: str) -> dict
             },
         }
 
+    elif scenario_id == "U-5.4":
+        return {
+            "operator_brief": (
+                "APPROVAL REUSE BLOCKED: Single-use token issued at 14:05 for CLOSE_VALVE V-17 executed V-17 once and was consumed. "
+                "At 14:40, replaying that token for V-18 was refused (REJECTED_APPROVAL_MISMATCH, also expired) and replaying for V-17 "
+                "was refused (REJECTED_APPROVAL_ALREADY_USED). V-18 remains OPEN."
+            ),
+            "maintenance_advisory": (
+                "Audit the attempted token replay events in the Audit Log; issue a fresh operator approval if V-18 actuation is genuinely needed."
+            ),
+            "proposed_schedule": "00:00-24:00 at 100 MLD (hold baseline — no unauthorized valve actions).",
+            "action_proposal": {
+                "action_type": "NONE",
+                "target_id": "NONE",
+                "proposed_value": 0.0,
+                "rationale": "Single-use token replay refused by gateway; no additional action staged.",
+            },
+        }
+
     elif scenario_id == 1 or ("leak" in user_lower and "p-17" in user_lower):
         return {
             "operator_brief": (

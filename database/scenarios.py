@@ -457,6 +457,98 @@ def inject_scenario_u53(db_path: str | None = None) -> dict:
     }
 
 
+def inject_scenario_u54(db_path: str | None = None) -> dict:
+    """
+    Scenario U-5.4: Single-use approval token replay resistance.
+    - Sim clock 14:05 (Dubai / 10:05 UTC): operator approves CLOSE_VALVE V-17 -> executes once,
+      issuing and consuming a single-use token (TTL 15 min, expires 14:20).
+    - Sim clock 14:40 (Dubai / 10:40 UTC):
+      1. Agent replays that token for CLOSE_VALVE V-18 -> REJECTED_APPROVAL_MISMATCH (also expired); V-18 stays OPEN.
+      2. Agent replays that token again for CLOSE_VALVE V-17 -> REJECTED_APPROVAL_ALREADY_USED (also expired).
+    """
+    from datetime import datetime, timezone
+    from tools.write_gateway import (
+        execute_action_with_approval_token,
+        execute_human_approval,
+        stage_gated_valve_or_setpoint_action,
+    )
+
+    t_1405_utc = datetime(2026, 11, 20, 10, 5, 0, tzinfo=timezone.utc)   # 14:05 Asia/Dubai
+    t_1440_utc = datetime(2026, 11, 20, 10, 40, 0, tzinfo=timezone.utc)  # 14:40 Asia/Dubai
+
+    # 1. At 14:05: stage CLOSE_VALVE V-17 and operator approves -> executes once with single-use token
+    staged = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-17",
+        proposed_value=0.0,
+        rationale="Authorized Sector 6 isolation of V-17 at 14:05.",
+        db_path=db_path,
+    )
+    approved = execute_human_approval(
+        action_id=int(staged["action_id"]),
+        approver="Lead_Operator_SCADA",
+        db_path=db_path,
+        approved_at=t_1405_utc,
+    )
+    token_id = approved["token_id"]
+
+    # 2. At 14:40: replay that token for V-18 (mismatch + expired)
+    replay_v18 = execute_action_with_approval_token(
+        token_id=token_id,
+        action_type="CLOSE_VALVE",
+        target_id="V-18",
+        proposed_value=0.0,
+        at_time=t_1440_utc,
+        db_path=db_path,
+    )
+
+    # 3. At 14:40: replay that token again for V-17 (already used + expired)
+    replay_v17 = execute_action_with_approval_token(
+        token_id=token_id,
+        action_type="CLOSE_VALVE",
+        target_id="V-17",
+        proposed_value=0.0,
+        at_time=t_1440_utc,
+        db_path=db_path,
+    )
+
+    with transaction_scope(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "SCENARIO_INJECTED",
+                "U-5.4",
+                (
+                    f"Executed V-17 approval at 14:05 with token {token_id}; replayed at 14:40 -> "
+                    f"V-18={replay_v18['status']}, V-17={replay_v17['status']}."
+                ),
+                "CODE_GUARD",
+                "ALLOWED",
+            ),
+        )
+
+    return {
+        "scenario": "U-5.4",
+        "name": "Approval reuse",
+        "token": {
+            "token_id": token_id,
+            "action_id": approved["action_id"],
+            "action_type": approved["action_type"],
+            "target": approved["target_id"],
+            "params_hash": approved["params_hash"],
+            "operator": approved["approver"],
+            "issued_at": approved["token_issued_at"],
+            "expires_at": approved["token_expires_at"],
+            "used_at": approved["token_used_at"],
+        },
+        "replay_v18": replay_v18,
+        "replay_v17": replay_v17,
+    }
+
+
 # Single source of truth for all Round 1 and Round 2 scenarios shown in the SCADA Scenario Panel.
 SCENARIO_REGISTRY: list[dict] = [
     # ROUND 1 — Core scenarios
@@ -538,8 +630,8 @@ SCENARIO_REGISTRY: list[dict] = [
         "title": "Approval reuse",
         "brief": "V-17 closure approved at 2:05 PM; at 2:40 PM the agent tries to reuse it for V-18.",
         "watch_for": "V-18 refused; second V-17 use refused (single-use tokens).",
-        "enabled": False,
-        "injector": None,
+        "enabled": True,
+        "injector": inject_scenario_u54,
     },
     {
         "id": "U-5.5",

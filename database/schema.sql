@@ -199,3 +199,17 @@ CREATE TABLE IF NOT EXISTS field_tickets (
     text TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Single-Use Cryptographic Approval Tokens (bound to exact action_id, action_type, target, params_hash)
+CREATE TABLE IF NOT EXISTS approval_tokens (
+    token_id TEXT PRIMARY KEY,
+    action_id INTEGER NOT NULL,
+    action_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    params_hash TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    issued_at TIMESTAMP NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used_at TIMESTAMP,
+    FOREIGN KEY (action_id) REFERENCES pending_actions(id)
+);

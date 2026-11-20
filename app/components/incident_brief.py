@@ -298,5 +298,45 @@ def render_incident_brief() -> None:
                 unsafe_allow_html=True,
             )
 
+    # 5c. Single-Use Approval Token & Replay Refusals (U-5.4)
+    u54_token = scenario_info.get("token")
+    if u54_token:
+        replay_v18 = scenario_info.get("replay_v18") or {}
+        replay_v17 = scenario_info.get("replay_v17") or {}
+        conn_v = get_db_connection()
+        try:
+            v17_st = conn_v.execute("SELECT status FROM valves WHERE valve_id = 'V-17';").fetchone()["status"]
+            v18_st = conn_v.execute("SELECT status FROM valves WHERE valve_id = 'V-18';").fetchone()["status"]
+        finally:
+            conn_v.close()
+
+        section_header("Single-Use Approval Token & Replay Refusals", ["CODE", "HUMAN"])
+        st.markdown(
+            f"""
+            <div class="scada-card-ok">
+                <div><strong>Issued Token (14:05):</strong> <span class="ag-mono">{html.escape(str(u54_token['token_id']))}</span>
+                    | Action #{u54_token['action_id']} (<span class="ag-mono">{html.escape(str(u54_token['action_type']))} {html.escape(str(u54_token['target']))}</span>)
+                </div>
+                <div style="margin-top:0.25rem; font-size:0.84rem;" class="ag-mono">
+                    operator={html.escape(str(u54_token['operator']))} |
+                    issued_at={html.escape(format_dubai_time(u54_token['issued_at']))} |
+                    expires_at={html.escape(format_dubai_time(u54_token['expires_at']))} |
+                    used_at={html.escape(format_dubai_time(u54_token['used_at']))} |
+                    params_hash={html.escape(str(u54_token['params_hash'])[:16])}...
+                </div>
+                <div style="margin-top:0.3rem;">
+                    <strong>Live Valves:</strong> V-17 {status_badge(v17_st)} &nbsp;&nbsp; V-18 {status_badge(v18_st)}
+                </div>
+            </div>
+            <div class="scada-card-alert">
+                <div><strong>Replay #1 (14:40 — target V-18):</strong> {status_badge(replay_v18.get('status', 'REJECTED_APPROVAL_MISMATCH'))}</div>
+                <div style="margin-top:0.2rem; font-size:0.84rem; color:#FCA5A5;">{html.escape(str(replay_v18.get('reason', '')))}</div>
+                <div style="margin-top:0.45rem;"><strong>Replay #2 (14:40 — target V-17):</strong> {status_badge(replay_v17.get('status', 'REJECTED_APPROVAL_ALREADY_USED'))}</div>
+                <div style="margin-top:0.2rem; font-size:0.84rem; color:#FCA5A5;">{html.escape(str(replay_v17.get('reason', '')))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     # 6. Final Valve V-12 Status
     _render_final_valve_v12_status()
