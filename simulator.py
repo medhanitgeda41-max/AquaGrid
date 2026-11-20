@@ -77,6 +77,10 @@ def realistic_daily_demand_mld(dt_local: datetime) -> float:
     return round(max(42.0, min(115.0, val)), 2)
 
 
+# Single process-wide lock created once and shared by the simulator and UI components.
+STEP_LOCK = threading.Lock()
+
+
 class LiveScadaSimulator:
     """Thread-safe real-time (2-minute) & optional accelerated SCADA simulator."""
 
@@ -109,7 +113,7 @@ class LiveScadaSimulator:
         self._rng = random.Random(seed)
 
         self._lock = threading.Lock()
-        self.step_lock = threading.Lock()
+        self.step_lock = STEP_LOCK
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._tick_count: int = 0
@@ -220,11 +224,11 @@ class LiveScadaSimulator:
 
     def step(self, force_fault: Optional[str] = None, now_override: Optional[datetime] = None) -> dict:
         """
-        Execute one SCADA batch tick (serialized with step_lock so concurrent scenarios never contend on SQLite).
+        Execute one SCADA batch tick (serialized with STEP_LOCK so concurrent scenarios never contend on SQLite).
         """
         lock = getattr(self, "step_lock", None)
         if lock is None:
-            lock = threading.Lock()
+            lock = STEP_LOCK
             self.step_lock = lock
         with lock:
             return self._step_impl(force_fault=force_fault, now_override=now_override)
@@ -676,20 +680,20 @@ def _is_stale_simulator(sim: Optional[object]) -> bool:
     return False
 
 
-def simulator_step_lock(sim: Optional[object]):
-    """Return sim.step_lock when sim is running, else a no-op context manager.
+def simulator_step_lock(sim: Optional[object] = None):
+    """Return sim.step_lock (backed by STEP_LOCK) when sim is running, else a no-op context manager.
 
-    If a running simulator object is stale and lacks step_lock, attaches a threading.Lock safely.
+    If a running simulator object is stale and lacks step_lock, attaches STEP_LOCK safely.
     """
     if sim is None or not getattr(sim, "is_running", False):
         return nullcontext()
     lock = getattr(sim, "step_lock", None)
     if lock is None:
-        lock = threading.Lock()
+        lock = STEP_LOCK
         try:
             setattr(sim, "step_lock", lock)
         except Exception:
-            return nullcontext()
+            return STEP_LOCK
     return lock
 
 

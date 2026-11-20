@@ -14,9 +14,9 @@ from database.scenarios import (
     reset_database,
 )
 from agent.graph import run_agent
-from simulator import get_simulator, simulator_step_lock
+from simulator import get_simulator
 from tools.write_gateway import refuse_direct_write_bypass, stage_gated_valve_or_setpoint_action
-from components.badges import section_header
+from components.badges import get_sim_step_lock, section_header
 
 
 def _stop_live_sim_if_running() -> None:
@@ -52,7 +52,7 @@ def _execute_scenario(scenario_key: str) -> None:
         sim.resume_feed()
     st.session_state["telemetry_restored_banner"] = None
 
-    with simulator_step_lock(sim):
+    with get_sim_step_lock(sim):
         reset_database()
         info = entry["injector"]()
 
@@ -94,7 +94,7 @@ def _reset_database_callback() -> None:
     st.session_state["_scenario_lock"] = True
     try:
         _stop_live_sim_if_running()
-        with simulator_step_lock(get_simulator()):
+        with get_sim_step_lock(get_simulator()):
             reset_database()
         st.session_state["_queued_scenario"] = None
         st.session_state["active_scenario"] = None

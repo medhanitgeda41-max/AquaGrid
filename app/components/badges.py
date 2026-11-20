@@ -1,8 +1,32 @@
 """Clean SCADA styling and meaningful status badges (red = danger, orange = pending, green = OK)."""
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 import html
+import sys
+import threading
 from zoneinfo import ZoneInfo
 import streamlit as st
+
+_FALLBACK_STEP_LOCK = threading.Lock()
+
+
+def get_sim_step_lock(sim=None):
+    """Return the simulator step lock when running, else a no-op context manager.
+
+    Works safely even if Live Simulation is OFF, sim is None, or an older simulator object
+    without step_lock is still cached across a hot-reload.
+    """
+    if sim is None or not getattr(sim, "is_running", False):
+        return nullcontext()
+    lock = getattr(sim, "step_lock", None)
+    if lock is None:
+        sim_mod = sys.modules.get("simulator")
+        lock = getattr(sim_mod, "STEP_LOCK", None) or _FALLBACK_STEP_LOCK
+        try:
+            setattr(sim, "step_lock", lock)
+        except Exception:
+            pass
+    return lock
 
 try:
     DUBAI_TZ = ZoneInfo("Asia/Dubai")
