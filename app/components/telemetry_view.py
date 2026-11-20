@@ -140,7 +140,14 @@ def _build_reservoir_chart(
         )
     )
 
-    floor_df = pd.DataFrame({"floor_y": [35.0], "label": ["35% MANDATORY SAFETY FLOOR (175 ML)"]})
+    eff_floor_pct = float(res.get("safety_floor_percent", 35.0))
+    eff_floor_ml = float(res.get("safety_floor_volume_ml", 175.0))
+    floor_label = (
+        f"{eff_floor_pct:.1f}% EMERGENCY SAFETY FLOOR ({eff_floor_ml:.0f} ML)"
+        if res.get("has_active_emergency")
+        else f"{eff_floor_pct:.1f}% MANDATORY SAFETY FLOOR ({eff_floor_ml:.0f} ML)"
+    )
+    floor_df = pd.DataFrame({"floor_y": [eff_floor_pct], "label": [floor_label]})
     floor_rule = (
         alt.Chart(floor_df)
         .mark_rule(color="#FF3B3B", strokeDash=[6, 4], strokeWidth=2.8)

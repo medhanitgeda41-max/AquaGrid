@@ -536,9 +536,10 @@ class LiveScadaSimulator:
             )
         for wq_alert in sector_wq_eval.get("alerts", []):
             raised_alerts.append(wq_alert)
-        if new_level_pct < RESERVOIR_FLOOR_PERCENT * 100.0:
+        eff_floor_pct = float(feeds_check.get("reservoir", {}).get("safety_floor_percent", RESERVOIR_FLOOR_PERCENT * 100.0))
+        if new_level_pct < eff_floor_pct:
             raised_alerts.append(
-                f"RESERVOIR FLOOR BREACH: RES-01 at {new_level_pct:.1f}% (< 35.0% mandatory floor)"
+                f"RESERVOIR FLOOR BREACH: RES-01 at {new_level_pct:.1f}% (< {eff_floor_pct:.1f}% mandatory floor)"
             )
 
         # 8. Run AI analyzer right after the new batch (if enabled); errors never stop CODE guards!

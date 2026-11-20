@@ -78,7 +78,33 @@ def generate_offline_mock_response(system_prompt: str, user_prompt: str) -> dict
             },
         }
 
-    if scenario_id == 1 or ("leak" in user_lower and "p-17" in user_lower):
+    elif scenario_id == "U-5.2" or ("civil defence" in user_lower and "has_active_emergency\":true" in user_lower):
+        return {
+            "operator_brief": (
+                "EMERGENCY FIRE RESERVE ACTIVE (SECTOR 6): Civil Defence requested 2,000 m³ (2.0 ML) over 3 hours, "
+                "raising the mandatory reservoir floor from 35.0% (175.0 ML) to 35.4% (177.0 ML). "
+                "The earlier 56.0 MLD peak-tariff cut (min 35.2%) was cancelled by safety re-check; replanning to 65.0 MLD (min 35.65%)."
+            ),
+            "maintenance_advisory": (
+                "Maintain elevated Sector 6 hydrant supply pressure for Civil Defence operations until the 3-hour emergency window closes."
+            ),
+            "proposed_schedule": (
+                "00:00-06:00 at 115 MLD (off-peak $0.09/kWh), 06:00-14:00 at 105 MLD (mid-peak $0.20/kWh), "
+                "14:00-18:00 at 65 MLD (peak $0.48/kWh; replanned above 35.4% Civil Defence emergency floor), "
+                "18:00-24:00 at 105 MLD (recharge reserve)."
+            ),
+            "action_proposal": {
+                "action_type": "SET_PLANT_OUTPUT",
+                "target_id": "DESAL-01",
+                "proposed_value": 65.0,
+                "rationale": (
+                    "Replan against raised 35.4% emergency floor (35.0% base + 0.4% Civil Defence Sector 6 reserve): "
+                    "65.0 MLD holds projected reservoir minimum at 35.65% (>= 35.4%)."
+                ),
+            },
+        }
+
+    elif scenario_id == 1 or ("leak" in user_lower and "p-17" in user_lower):
         return {
             "operator_brief": (
                 "DIAGNOSTIC ADVISORY: Sector 4 Junction J-14 exhibits a verified pipe leak signature "

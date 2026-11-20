@@ -94,10 +94,14 @@ def _render_live_sim_feed() -> None:
     for wq_alert in wq_compliance.get("alerts", []):
         st.error(wq_alert)
 
-    if res_pct < RESERVOIR_FLOOR_PERCENT * 100.0:
+    eff_floor_pct = float(res.get("safety_floor_percent", RESERVOIR_FLOOR_PERCENT * 100.0))
+    if res.get("has_active_emergency"):
+        st.warning(f"**{res.get('floor_banner', '')}**")
+
+    if res_pct < eff_floor_pct:
         st.error(
             f"**RESERVOIR ALERT:** Strategic Reservoir RES-01 dropped to **{res_pct:.2f}% ({res_vol:.1f} ML)** — "
-            f"below the mandatory **35.0% safety floor**!"
+            f"below the mandatory **{eff_floor_pct:.1f}% safety floor**!"
         )
 
     if leaks:

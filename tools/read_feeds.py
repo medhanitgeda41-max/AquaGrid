@@ -8,7 +8,7 @@ from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
 from guards.injection_filter import sanitize_text, QUARANTINED_ALERT_PLACEHOLDER
-from guards.safety_floors import evaluate_quality_and_bloom_derating
+from guards.safety_floors import compute_effective_reservoir_floor, evaluate_quality_and_bloom_derating
 from guards.water_quality import evaluate_sector_chlorine
 
 
@@ -245,6 +245,18 @@ def read_tariff_and_quality_feeds(
         ]
 
         sector_wq_compliance = evaluate_sector_chlorine(sector_water_quality)
+        eff_floor = compute_effective_reservoir_floor(
+            commitments=emergency_commitments,
+            total_capacity_ml=float(res_row["capacity_ml"]),
+        )
+        reservoir_status["safety_floor_percent"] = eff_floor["effective_floor_percent"]
+        reservoir_status["safety_floor_volume_ml"] = eff_floor["effective_floor_ml"]
+        reservoir_status["base_floor_percent"] = eff_floor["base_floor_percent"]
+        reservoir_status["emergency_floor_percent"] = eff_floor["emergency_percent"]
+        reservoir_status["emergency_volume_ml"] = eff_floor["emergency_volume_ml"]
+        reservoir_status["has_active_emergency"] = eff_floor["has_active_emergency"]
+        reservoir_status["floor_banner"] = eff_floor["banner"]
+        reservoir_status["active_emergency_commitments"] = eff_floor["active_commitments"]
 
         result = {
             "current_hour": current_hour,
@@ -256,6 +268,7 @@ def read_tariff_and_quality_feeds(
             "hourly_demand_24h": hourly_demand_24h,
             "current_plant_output_mld": current_plant_output_mld,
             "reservoir": reservoir_status,
+            "effective_floor": eff_floor,
             "sanitized_alerts": sanitized_alerts,
             "sector_water_quality": sector_water_quality,
             "sector_water_quality_compliance": sector_wq_compliance,

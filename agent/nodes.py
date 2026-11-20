@@ -85,6 +85,7 @@ def node_reason(state: AgentState) -> dict:
         for d in state.get("tariff_data", {}).get("demand_forecast", [])
         if "demand_mld" in d
     ]
+    eff_floor_ratio = float(res_status.get("safety_floor_percent", 35.0)) / 100.0
     schedule_validation = validate_production_schedule(
         proposed_schedule=proposed_schedule,
         current_volume_ml=float(res_status.get("current_volume_ml", 240.0)),
@@ -93,6 +94,7 @@ def node_reason(state: AgentState) -> dict:
         bloom_severity=str(wq.get("bloom_severity", "NONE")),
         turbidity_ntu=float(wq.get("intake_turbidity_ntu", 1.2)),
         chlorine_ppm=float(wq.get("intake_chlorine_ppm", 1.8)),
+        min_floor_percent=eff_floor_ratio,
         current_hour=state.get("current_hour", 14),
         current_plant_output_mld=float(state.get("tariff_data", {}).get("current_plant_output_mld", 100.0)),
         excluded_sectors=state.get("excluded_sectors", []),

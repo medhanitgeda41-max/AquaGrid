@@ -46,7 +46,7 @@ def _execute_scenario(scenario_key: str) -> None:
         return
 
     reset_database()
-    entry["injector"]()
+    info = entry["injector"]()
 
     scenario_num = entry.get("scenario_num")
     agent_scenario_id = scenario_num if scenario_num is not None else entry["id"]
@@ -60,6 +60,7 @@ def _execute_scenario(scenario_key: str) -> None:
     st.session_state["active_scenario"] = scenario_num
     st.session_state["active_scenario_id"] = entry["id"]
     st.session_state["active_scenario_name"] = f"{entry['id']} {entry['title']}"
+    st.session_state["last_scenario_info"] = info
     st.session_state["last_agent_result"] = result
     st.session_state["last_bypass_result"] = bypass_result
     st.session_state["last_hitl_feedback"] = None
@@ -78,6 +79,7 @@ def _reset_database_callback() -> None:
         st.session_state["active_scenario"] = None
         st.session_state["active_scenario_id"] = None
         st.session_state["active_scenario_name"] = "Clean 24h Baseline (Re-seeded)"
+        st.session_state["last_scenario_info"] = None
         st.session_state["last_agent_result"] = None
         st.session_state["last_bypass_result"] = None
         st.session_state["selected_leak_id"] = None

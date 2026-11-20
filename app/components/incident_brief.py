@@ -51,6 +51,33 @@ def render_incident_brief() -> None:
         for alert_msg in wq_comp["alerts"]:
             st.error(f"**{alert_msg}** — Removed from tariff-driven scheduling: {excl}")
 
+    # 0b. Dynamic Emergency Reserve Floor & Old vs. New Plan (U-5.2)
+    res_st = result.get("reservoir_status") or {}
+    scenario_info = st.session_state.get("last_scenario_info") or {}
+    if res_st.get("has_active_emergency"):
+        section_header("Dynamic Emergency Reserve Floor", ["CODE"])
+        st.warning(f"**{res_st.get('floor_banner', '')}**")
+        old_plan = scenario_info.get("old_plan")
+        gw_new = result.get("gateway_response") or {}
+        if old_plan:
+            st.markdown(
+                f"""
+                <div class="scada-card-pending">
+                    <div><strong>Old Plan (before Civil Defence commitment):</strong>
+                        <span class="ag-mono">SET_PLANT_OUTPUT DESAL-01 &rarr; {old_plan.get('proposed_mld')} MLD</span>
+                        | Min projected reservoir: <span class="ag-mono">{old_plan.get('min_projected_percent')}%</span>
+                        {status_badge(old_plan.get('recheck_status', 'CANCELLED_BY_SAFETY_RECHECK'))}
+                    </div>
+                    <div style="margin-top:0.35rem;"><strong>New Plan (replanned for {res_st.get('safety_floor_percent', 35.4):.1f}% floor):</strong>
+                        <span class="ag-mono">{html.escape(str(gw_new.get('action_type', 'SET_PLANT_OUTPUT')))} {html.escape(str(gw_new.get('target_id', 'DESAL-01')))} &rarr; {gw_new.get('proposed_value', 65.0)} MLD</span>
+                        | Min projected reservoir: <span class="ag-mono">{gw_new.get('min_projected_percent')}%</span>
+                        {status_badge(gw_new.get('status', 'STAGED_PENDING_APPROVAL'))}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
     # 1. Operator Brief & Maintenance Advisory / Work Orders
     b_col, m_col = st.columns(2)
     with b_col:

@@ -64,6 +64,9 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     res = feeds_data.get("reservoir", {})
     res_pct = float(res.get("current_level_percent", 48.0))
     res_vol = float(res.get("current_volume_ml", 240.0))
+    eff_floor_pct = float(res.get("safety_floor_percent", 35.0))
+    floor_banner = res.get("floor_banner", f"Reservoir floor: {eff_floor_pct:.1f}%")
+    has_emergency = bool(res.get("has_active_emergency", False))
     plant_mld = float(plant["production_mld"]) if plant else 100.0
     plant_max = float(plant["max_capacity_mld"]) if plant else 120.0
     plant_status = plant["status"] if plant else "ONLINE"
@@ -105,8 +108,8 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     c2.metric(
         "Reservoir RES-01",
         f"{res_pct:.1f}%",
-        delta=f"{res_vol:.0f} ML (Floor 35%)",
-        delta_color="normal" if res_pct >= 35.0 else "inverse",
+        delta=f"{res_vol:.0f} ML (Floor {eff_floor_pct:.1f}%)",
+        delta_color="normal" if res_pct >= eff_floor_pct else "inverse",
     )
     c3.metric(
         "DESAL-01 Output",
@@ -134,6 +137,9 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     wq_compliance = feeds_data.get("sector_water_quality_compliance", {})
     for wq_alert in wq_compliance.get("alerts", []):
         st.error(wq_alert)
+
+    if has_emergency:
+        st.warning(f"**{floor_banner}**")
 
     return {
         "telemetry_data": telemetry_data,

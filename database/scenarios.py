@@ -329,6 +329,90 @@ def inject_scenario_u51(db_path: str | None = None) -> dict:
     }
 
 
+def inject_scenario_u52(db_path: str | None = None) -> dict:
+    """
+    Scenario U-5.2: Fire in Sector 6 — Civil Defence emergency reserve (2,000 m³ over 3h).
+    1. Configures 48% starting reservoir (240 ML) and 6h peak demand (312 MLD) at 14:00.
+    2. Stages an initial peak-tariff cut (56.0 MLD -> min projected 35.20% >= 35.0% floor).
+    3. Adds Civil Defence commitment (Sector 6, 2,000 m³ = 2.0 ML, now -> now+3h), raising
+       the dynamic floor to 35.0% + 0.4% = 35.4% (177.0 ML).
+    4. Automatically re-validates all PENDING actions -> old 56.0 MLD plan (35.20% < 35.4%)
+       is CANCELLED_BY_SAFETY_RECHECK so the agent replans against the 35.4% floor.
+    """
+    from datetime import datetime, timedelta, timezone
+    from tools.write_gateway import add_emergency_commitment, stage_gated_valve_or_setpoint_action
+
+    with transaction_scope(db_path) as conn:
+        conn.execute("UPDATE reservoirs SET level_percent = 48.0, volume_ml = 240.0 WHERE id = 'RES-01';")
+        conn.execute("UPDATE tariffs SET rate_per_kwh = 0.48, is_peak = 1 WHERE hour = 14;")
+        for h in range(14, 20):
+            conn.execute("UPDATE demand_forecast SET demand_mld = 312.0 WHERE hour = ?;", (h,))
+
+    # Step 1: Stage initial peak-tariff production cut (56.0 MLD -> min projected 35.20%, VALID at 35.0% floor)
+    old_plan_staged = stage_gated_valve_or_setpoint_action(
+        action_type="SET_PLANT_OUTPUT",
+        target_id="DESAL-01",
+        proposed_value=56.0,
+        rationale="Initial 14:00 peak-tariff cut ($0.48/kWh) holding reservoir at 35.2% (>= 35.0% floor).",
+        db_path=db_path,
+    )
+
+    # Step 2: Add Civil Defence emergency commitment (now -> now + 3 hours) and re-validate PENDING actions
+    now_utc = datetime.now(timezone.utc)
+    start_str = (now_utc - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end_str = (now_utc + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    commitment_result = add_emergency_commitment(
+        sector="Sector 6",
+        volume_m3=2000.0,
+        start_time=start_str,
+        end_time=end_str,
+        source="Civil Defence",
+        db_path=db_path,
+        at_time=now_utc,
+    )
+
+    floor_banner = commitment_result["effective_floor"]["banner"]
+    with transaction_scope(db_path) as conn:
+        alert_txt = (
+            f"CIVIL DEFENCE FIRE EMERGENCY (Sector 6): 2,000 m³ reserve protected over 3 hours. "
+            f"{floor_banner}. Re-validate and replan peak-tariff schedule."
+        )
+        conn.execute(
+            """
+            INSERT INTO quality_alerts (severity, location, raw_text, sanitized_text, is_injection)
+            VALUES ('CRITICAL', 'Sector 6', ?, ?, 0);
+            """,
+            (alert_txt, alert_txt),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "SCENARIO_INJECTED",
+                "U-5.2",
+                f"Staged 56.0 MLD (min 35.2%), added Sector 6 Civil Defence 2,000 m³ commitment ({floor_banner}), re-validated PENDING queue.",
+                "CODE_GUARD",
+                "ALLOWED",
+            ),
+        )
+
+    return {
+        "scenario": "U-5.2",
+        "name": "Fire in Sector 6",
+        "description": floor_banner,
+        "old_plan": {
+            "action_id": old_plan_staged.get("action_id"),
+            "proposed_mld": 56.0,
+            "min_projected_percent": old_plan_staged.get("min_projected_percent"),
+            "initial_status": old_plan_staged.get("status"),
+            "recheck_status": "CANCELLED_BY_SAFETY_RECHECK" if commitment_result["revalidation"]["cancelled"] else "PENDING",
+        },
+        "commitment": commitment_result,
+    }
+
+
 # Single source of truth for all Round 1 and Round 2 scenarios shown in the SCADA Scenario Panel.
 SCENARIO_REGISTRY: list[dict] = [
     # ROUND 1 — Core scenarios
@@ -390,8 +474,8 @@ SCENARIO_REGISTRY: list[dict] = [
         "title": "Fire in Sector 6",
         "brief": "Civil Defence requests 2,000 m³ over 3 hours, protected on top of the 35% reserve.",
         "watch_for": "floor rises to 35% + emergency volume; planned peak-tariff cut re-checked and replanned.",
-        "enabled": False,
-        "injector": None,
+        "enabled": True,
+        "injector": inject_scenario_u52,
     },
     {
         "id": "U-5.3",

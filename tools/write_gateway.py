@@ -6,6 +6,7 @@ Enforces strict architectural perimeter:
 - Physical mutations MUST be staged as 'PENDING' for human approval.
 - Just-in-time safety re-check upon human 'Approve' before any database commit.
 """
+from datetime import datetime
 from typing import Optional
 from config.constants import (
     ALLOWED_ACTION_TYPES,
@@ -17,8 +18,175 @@ from config.constants import (
     RESERVOIR_FLOOR_PERCENT,
 )
 from database.connection import get_db_connection, transaction_scope
-from guards.safety_floors import simulate_reservoir_trajectory, evaluate_quality_and_bloom_derating
+from guards.safety_floors import (
+    compute_effective_reservoir_floor,
+    simulate_reservoir_trajectory,
+    evaluate_quality_and_bloom_derating,
+)
 from guards.water_quality import evaluate_sector_chlorine, target_id_to_sector_name
+
+
+def get_active_emergency_floor(
+    db_path: Optional[str] = None,
+    at_time: Optional[datetime] = None,
+    conn=None,
+) -> dict:
+    """Query active emergency_commitments and compute the effective dynamic reservoir floor."""
+    own_conn = conn is None
+    db_conn = get_db_connection(db_path) if own_conn else conn
+    try:
+        rows = db_conn.execute(
+            "SELECT id, sector, volume_m3, start_time, end_time, source, created_at FROM emergency_commitments ORDER BY id ASC;"
+        ).fetchall()
+        res_row = db_conn.execute("SELECT capacity_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
+        cap_ml = float(res_row["capacity_ml"]) if res_row else RESERVOIR_TOTAL_CAPACITY_ML
+    finally:
+        if own_conn:
+            db_conn.close()
+    return compute_effective_reservoir_floor(
+        commitments=[dict(r) for r in rows],
+        total_capacity_ml=cap_ml,
+        base_floor_percent=RESERVOIR_FLOOR_PERCENT,
+        at_time=at_time,
+    )
+
+
+def revalidate_pending_actions_against_floor(
+    db_path: Optional[str] = None,
+    at_time: Optional[datetime] = None,
+) -> dict:
+    """
+    Re-validate all PENDING setpoint/flush actions against the latest dynamic reservoir floor.
+    Any PENDING action that breaches the new floor is marked CANCELLED_BY_SAFETY_RECHECK
+    and logged in audit_log.
+    """
+    cancelled: list[dict] = []
+    kept: list[dict] = []
+
+    with transaction_scope(db_path) as conn:
+        eff = get_active_emergency_floor(db_path=db_path, at_time=at_time, conn=conn)
+        res_row = conn.execute("SELECT volume_ml, capacity_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
+        current_vol = float(res_row["volume_ml"]) if res_row else 240.0
+        cap_ml = float(res_row["capacity_ml"]) if res_row else RESERVOIR_TOTAL_CAPACITY_ML
+
+        demand_rows = conn.execute(
+            "SELECT demand_mld FROM demand_forecast WHERE hour >= 14 AND hour < 20 ORDER BY hour ASC;"
+        ).fetchall()
+        demand_list = [float(r["demand_mld"]) for r in demand_rows]
+        if not demand_list or len(demand_list) < 6:
+            demand_list = [351.0] * 6
+
+        pending_rows = conn.execute(
+            "SELECT * FROM pending_actions WHERE status = 'PENDING' ORDER BY id ASC;"
+        ).fetchall()
+
+        for row in pending_rows:
+            action_id = int(row["id"])
+            action_type = row["action_type"]
+            target_id = row["target_id"]
+            proposed_val = float(row["proposed_value"])
+
+            if action_type == "SET_PLANT_OUTPUT":
+                sim = simulate_reservoir_trajectory(
+                    current_volume_ml=current_vol,
+                    plant_inflow_mld=proposed_val,
+                    demand_forecast_mld=demand_list,
+                    total_capacity_ml=cap_ml,
+                    min_floor_percent=eff["effective_floor_ratio"],
+                )
+                if not sim["is_safe"]:
+                    reason = (
+                        f"Re-validation after emergency floor update ({eff['banner']}): {sim['reason']}"
+                    )
+                    conn.execute(
+                        """
+                        UPDATE pending_actions
+                        SET status = 'CANCELLED_BY_SAFETY_RECHECK',
+                            executed_at = CURRENT_TIMESTAMP,
+                            approver = 'CODE_GUARD_RECHECK'
+                        WHERE id = ?;
+                        """,
+                        (action_id,),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                        VALUES (?, ?, ?, ?, ?);
+                        """,
+                        (
+                            "PENDING_CANCELLED_BY_EMERGENCY_FLOOR",
+                            target_id,
+                            f"Action #{action_id} ({action_type} -> {proposed_val} MLD) CANCELLED_BY_SAFETY_RECHECK: {reason}",
+                            "CODE_GUARD",
+                            "CANCELLED_BY_SAFETY_RECHECK",
+                        ),
+                    )
+                    cancelled.append({
+                        "action_id": action_id,
+                        "action_type": action_type,
+                        "target_id": target_id,
+                        "proposed_value": proposed_val,
+                        "min_projected_percent": sim["min_level_percent"],
+                        "floor_percent": eff["effective_floor_percent"],
+                        "status": "CANCELLED_BY_SAFETY_RECHECK",
+                        "reason": reason,
+                    })
+                    continue
+            kept.append({"action_id": action_id, "action_type": action_type, "target_id": target_id})
+
+    return {
+        "effective_floor": eff,
+        "checked_count": len(cancelled) + len(kept),
+        "cancelled": cancelled,
+        "kept": kept,
+    }
+
+
+def add_emergency_commitment(
+    sector: str,
+    volume_m3: float,
+    start_time: str,
+    end_time: str,
+    source: str = "Civil Defence",
+    db_path: Optional[str] = None,
+    at_time: Optional[datetime] = None,
+) -> dict:
+    """
+    Insert an emergency reserve commitment, log it in audit_log, and immediately
+    re-validate all PENDING actions against the raised dynamic reservoir floor.
+    """
+    with transaction_scope(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO emergency_commitments (sector, volume_m3, start_time, end_time, source)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (sector, float(volume_m3), start_time, end_time, source),
+        )
+        commitment_id = cur.lastrowid
+        conn.execute(
+            """
+            INSERT INTO audit_log (event_type, target_id, details, actor, status)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (
+                "EMERGENCY_COMMITMENT_ADDED",
+                sector,
+                f"{source} requested {float(volume_m3):,.0f} m³ ({float(volume_m3)/1000.0:.1f} ML) for {sector} ({start_time} to {end_time}).",
+                "CODE_GUARD",
+                "ALLOWED",
+            ),
+        )
+
+    reval = revalidate_pending_actions_against_floor(db_path=db_path, at_time=at_time)
+    return {
+        "commitment_id": commitment_id,
+        "sector": sector,
+        "volume_m3": float(volume_m3),
+        "source": source,
+        "effective_floor": reval["effective_floor"],
+        "revalidation": reval,
+    }
 
 
 def stage_gated_valve_or_setpoint_action(
@@ -71,6 +239,7 @@ def stage_gated_valve_or_setpoint_action(
 
     conn = get_db_connection(db_path)
     sim_min_projected_percent: Optional[float] = None
+    effective_floor_pct_for_resp: float = RESERVOIR_FLOOR_PERCENT * 100.0
     try:
         # 1b. Duplicate PENDING guard: reject if a PENDING action already exists for same target_id & action_type
         existing_pending = conn.execute(
@@ -167,17 +336,19 @@ def stage_gated_valve_or_setpoint_action(
             if not demand_list or len(demand_list) < 6:
                 demand_list = [351.0] * 6
 
-            # Simulate trajectory
+            # Simulate trajectory against dynamic floor (35% + active emergency commitments)
+            eff_floor = get_active_emergency_floor(db_path=db_path, conn=conn)
             sim_result = simulate_reservoir_trajectory(
                 current_volume_ml=current_vol,
                 plant_inflow_mld=proposed_value,
                 demand_forecast_mld=demand_list,
                 total_capacity_ml=RESERVOIR_TOTAL_CAPACITY_ML,
-                min_floor_percent=RESERVOIR_FLOOR_PERCENT,
+                min_floor_percent=eff_floor["effective_floor_ratio"],
             )
             sim_min_projected_percent = sim_result["min_level_percent"]
+            effective_floor_pct_for_resp = eff_floor["effective_floor_percent"]
 
-            # If simulation violates the 35% floor, abort immediately
+            # If simulation violates the dynamic floor, abort immediately
             if not sim_result["is_safe"]:
                 with transaction_scope(db_path) as audit_conn:
                     audit_conn.execute(
@@ -188,7 +359,7 @@ def stage_gated_valve_or_setpoint_action(
                         (
                             "SAFETY_FLOOR_BREACH",
                             target_id,
-                            f"Proposed output {proposed_value} MLD blocked: {sim_result['reason']}",
+                            f"Proposed output {proposed_value} MLD blocked ({eff_floor['banner']}): {sim_result['reason']}",
                             "CODE_GUARD",
                             "BLOCKED",
                         ),
@@ -197,7 +368,8 @@ def stage_gated_valve_or_setpoint_action(
                     "status": "REJECTED_BY_SAFETY_GUARD",
                     "reason": sim_result["reason"],
                     "min_projected_percent": sim_result["min_level_percent"],
-                    "floor_threshold_percent": 35.0,
+                    "floor_threshold_percent": eff_floor["effective_floor_percent"],
+                    "floor_banner": eff_floor["banner"],
                     "breach_hour_offset": sim_result["breach_hour"],
                 }
 
@@ -274,7 +446,7 @@ def stage_gated_valve_or_setpoint_action(
     }
     if sim_min_projected_percent is not None:
         response["min_projected_percent"] = sim_min_projected_percent
-        response["floor_threshold_percent"] = 35.0
+        response["floor_threshold_percent"] = effective_floor_pct_for_resp
     return response
 
 
@@ -306,7 +478,8 @@ def execute_human_approval(
         target_id = action_row["target_id"]
         proposed_value = float(action_row["proposed_value"])
 
-        # JIT Safety Re-Check: If setting plant output, re-verify reservoir floor
+        # JIT Safety Re-Check: If setting plant output, re-verify dynamic reservoir floor
+        eff_floor = get_active_emergency_floor(db_path=db_path, conn=conn)
         if action_type == "SET_PLANT_OUTPUT":
             res_row = conn.execute("SELECT volume_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
             latest_vol = float(res_row["volume_ml"]) if res_row else 240.0
@@ -319,6 +492,7 @@ def execute_human_approval(
                 current_volume_ml=latest_vol,
                 plant_inflow_mld=proposed_value,
                 demand_forecast_mld=demand_list,
+                min_floor_percent=eff_floor["effective_floor_ratio"],
             )
 
             if not recheck_sim["is_safe"]:
@@ -370,10 +544,11 @@ def execute_human_approval(
             res_row = conn.execute("SELECT volume_ml, capacity_ml FROM reservoirs WHERE id = 'RES-01';").fetchone()
             latest_vol = float(res_row["volume_ml"]) if res_row else 240.0
             cap_ml = float(res_row["capacity_ml"]) if res_row else RESERVOIR_TOTAL_CAPACITY_ML
-            if latest_vol < cap_ml * RESERVOIR_FLOOR_PERCENT:
+            if latest_vol < eff_floor["effective_floor_ml"]:
                 reason = (
                     f"Reservoir volume ({latest_vol:.1f} ML) is below safety floor "
-                    f"({cap_ml * RESERVOIR_FLOOR_PERCENT:.1f} ML); cannot initiate flush for {target_id}."
+                    f"({eff_floor['effective_floor_ml']:.1f} ML / {eff_floor['effective_floor_percent']:.1f}%); "
+                    f"cannot initiate flush for {target_id}."
                 )
                 conn.execute(
                     """

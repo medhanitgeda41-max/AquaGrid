@@ -7,7 +7,8 @@ Enforces non-negotiable physical constraints:
 
 These safety floors deterministically override tariff cost optimization.
 """
-from typing import Sequence
+from datetime import datetime, timezone
+from typing import Optional, Sequence
 from config.constants import (
     RESERVOIR_FLOOR_PERCENT,
     RESERVOIR_TOTAL_CAPACITY_ML,
@@ -17,6 +18,93 @@ from config.constants import (
     CHLORINE_MAX_PPM,
     DESAL_MAX_CAPACITY_MLD,
 )
+from config.region_config import get_region_tz
+
+
+def _parse_utc_timestamp(ts: object) -> Optional[datetime]:
+    """Parse SQLite / ISO timestamp string or datetime into a UTC-aware datetime."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    raw = str(ts).strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def compute_effective_reservoir_floor(
+    commitments: Sequence[dict],
+    total_capacity_ml: float = RESERVOIR_TOTAL_CAPACITY_ML,
+    base_floor_percent: float = RESERVOIR_FLOOR_PERCENT,
+    at_time: Optional[datetime] = None,
+) -> dict:
+    """
+    Pure-Python dynamic reservoir safety floor calculation:
+        floor_ML = (base_floor_percent * total_capacity_ml) + sum(active emergency commitments in ML)
+
+    A commitment counts ONLY when start_time <= at_time <= end_time.
+    Example (500 ML tank + 2,000 m³ Civil Defence fire request = 2.0 ML):
+        175.0 ML (35.0%) + 2.0 ML (0.4%) = 177.0 ML (35.4%).
+    """
+    now_utc = _parse_utc_timestamp(at_time) or datetime.now(timezone.utc)
+    base_ml = float(total_capacity_ml) * float(base_floor_percent)
+    base_pct = round(float(base_floor_percent) * 100.0, 2)
+
+    active: list[dict] = []
+    total_emergency_m3 = 0.0
+    for c in commitments or []:
+        start_dt = _parse_utc_timestamp(c.get("start_time"))
+        end_dt = _parse_utc_timestamp(c.get("end_time"))
+        if start_dt is not None and end_dt is not None:
+            if not (start_dt <= now_utc <= end_dt):
+                continue
+        vol_m3 = max(0.0, float(c.get("volume_m3", 0.0)))
+        total_emergency_m3 += vol_m3
+        active.append(dict(c))
+
+    emergency_ml = total_emergency_m3 / 1000.0  # 1,000 m³ = 1.0 ML
+    emergency_pct = (emergency_ml / float(total_capacity_ml)) * 100.0 if total_capacity_ml > 0 else 0.0
+    effective_ml = base_ml + emergency_ml
+    effective_ratio = effective_ml / float(total_capacity_ml) if total_capacity_ml > 0 else base_floor_percent
+    effective_pct = effective_ratio * 100.0
+
+    if active:
+        dubai_tz = get_region_tz()
+        parts = []
+        for c in active:
+            end_dt = _parse_utc_timestamp(c.get("end_time"))
+            until_str = end_dt.astimezone(dubai_tz).strftime("%H:%M") if end_dt else str(c.get("end_time", ""))
+            parts.append(f"{c.get('source', 'Emergency')}, {c.get('sector', '')}, until {until_str}")
+        banner = (
+            f"Reservoir floor: {base_pct:.1f}% + {emergency_pct:.1f}% emergency = "
+            f"{effective_pct:.1f}% ({'; '.join(parts)})"
+        )
+    else:
+        banner = f"Reservoir floor: {base_pct:.1f}%"
+
+    return {
+        "base_floor_percent": round(base_pct, 2),
+        "base_floor_ml": round(base_ml, 2),
+        "emergency_volume_m3": round(total_emergency_m3, 1),
+        "emergency_volume_ml": round(emergency_ml, 3),
+        "emergency_percent": round(emergency_pct, 2),
+        "effective_floor_ml": round(effective_ml, 2),
+        "effective_floor_percent": round(effective_pct, 2),
+        "effective_floor_ratio": round(effective_ratio, 6),
+        "active_commitments": active,
+        "has_active_emergency": len(active) > 0,
+        "banner": banner,
+    }
 
 
 def simulate_reservoir_trajectory(

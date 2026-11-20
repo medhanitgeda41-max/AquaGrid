@@ -96,8 +96,10 @@ def compute_grid_suggestions(
     active_leaks: list[dict],
     recurring_segments: list[dict],
     now_utc_str: str,
+    res: dict | None = None,
 ) -> list[dict]:
     """Build Grid-wide AI Suggestions (tariff shifting, reservoir watch, recurring problem segments)."""
+    res = res or {}
     suggestions: list[dict] = []
 
     # 1. Tariff-aware desalination scheduling suggestion
@@ -136,17 +138,19 @@ def compute_grid_suggestions(
             "based_on": f"Mid-peak tariff ${current_tariff:.2f}/kWh, Demand={demand_mld:.1f} MLD, DESAL-01={plant_output_mld:.1f} MLD",
         })
 
-    # 2. Reservoir level watch
-    margin = reservoir_pct - (RESERVOIR_FLOOR_PERCENT * 100.0)
+    # 2. Reservoir level watch (uses dynamic effective floor including active emergency commitments)
+    eff_floor_pct = float(res.get("safety_floor_percent", RESERVOIR_FLOOR_PERCENT * 100.0))
+    eff_floor_ml = float(res.get("safety_floor_volume_ml", 175.0))
+    margin = reservoir_pct - eff_floor_pct
     if margin < 5.0:
         res_msg = (
             f"URGENT RESERVOIR WATCH: RES-01 is at {reservoir_pct:.2f}% ({reservoir_vol_ml:.1f} ML), "
-            f"only +{margin:.2f}% above the mandatory 35.0% floor. Do NOT throttle DESAL-01; prioritize high-loss leak isolation."
+            f"only +{margin:.2f}% above the mandatory {eff_floor_pct:.1f}% floor ({eff_floor_ml:.1f} ML). Do NOT throttle DESAL-01; prioritize high-loss leak isolation."
         )
         res_conf = 0.97
     else:
         res_msg = (
-            f"RES-01 is healthy at {reservoir_pct:.2f}% ({reservoir_vol_ml:.1f} ML, +{margin:.2f}% above 35.0% floor). "
+            f"RES-01 is healthy at {reservoir_pct:.2f}% ({reservoir_vol_ml:.1f} ML, +{margin:.2f}% above {eff_floor_pct:.1f}% floor). "
             f"Net balance is {plant_output_mld - demand_mld:+.1f} MLD; continue 2-minute monitoring."
         )
         res_conf = 0.94
@@ -155,7 +159,7 @@ def compute_grid_suggestions(
         "suggestion": res_msg,
         "confidence": res_conf,
         "generated_at_utc": now_utc_str,
-        "based_on": f"RES-01={reservoir_pct:.2f}% ({reservoir_vol_ml:.1f} ML) vs 35.0% (175.0 ML) floor",
+        "based_on": f"RES-01={reservoir_pct:.2f}% ({reservoir_vol_ml:.1f} ML) vs {eff_floor_pct:.1f}% ({eff_floor_ml:.1f} ML) floor",
     })
 
     # 3. Recurring problem segments / high-loss focus
@@ -308,6 +312,7 @@ def run_live_ai_analysis(
         active_leaks=active_leaks,
         recurring_segments=recurring_segments,
         now_utc_str=now_utc_str,
+        res=res,
     )
 
     # 4. Optional LLM cognitive enrichment (gracefully catches failures/timeouts while CODE keeps running)
