@@ -77,8 +77,16 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
         with st.chat_message(role, avatar=avatar):
             if kind == "alert":
                 alert_code = msg.get("alert_code", "ALERT")
+                alert_title = msg.get("alert_title") or "ALERT"
+                raw_body = msg.get("alert_body") or msg.get("content", "")
+                # Strip any stray markdown asterisks/backticks so raw syntax never appears in HTML alert cards
+                clean_body = str(raw_body).replace("**", "").replace("`", "")
                 st.markdown(
-                    f'<div class="scada-card-alert">{status_badge(alert_code)} {msg.get("content", "")}</div>',
+                    f'<div class="scada-card-alert">'
+                    f'{status_badge(alert_code)} '
+                    f'<strong>{html.escape(str(alert_title))}:</strong> '
+                    f'{html.escape(clean_body)}'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
             else:
@@ -98,8 +106,10 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
                 tools_called = msg.get("tools_called") or []
                 code_checks = msg.get("code_checks") or []
                 staged = msg.get("staged_action")
+                providers_tried = msg.get("providers_tried") or []
+                error_detail = msg.get("error_detail") or ""
 
-                if tools_called or code_checks or staged or show_tech:
+                if tools_called or code_checks or staged or error_detail or providers_tried or show_tech:
                     with st.expander("How I got this", expanded=show_tech):
                         if tools_called:
                             st.markdown("**Tools called:**")
@@ -122,6 +132,13 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
                                 f"{staged.get('action_type', '')} {staged.get('target_id', '')} "
                                 f"({staged.get('reason') or staged.get('details') or staged.get('message') or ''})"
                             )
+                        if show_tech and error_detail:
+                            st.error(f"**Technical Error:** `{error_detail}`")
+                        if show_tech and providers_tried:
+                            st.markdown("**Providers tried:**")
+                            for pt in providers_tried:
+                                err_suffix = f" — {pt['error']}" if pt.get("error") else ""
+                                st.markdown(f"- `{pt.get('provider')}`: `{pt.get('status')}`{err_suffix}")
                         st.caption(f"Provider: {provider} · LLM_MODE: {settings.LLM_MODE}")
 
     # Chat input bar at bottom

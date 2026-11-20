@@ -79,6 +79,110 @@ def evaluate_telemetry_freshness(
     }
 
 
+def get_feed_monitoring_state(
+    db_path: Optional[str] = None,
+    conn=None,
+) -> dict:
+    """Determine whether live freshness enforcement should be active.
+
+    TELEMETRY_LOSS is enforced ONLY when:
+    - Live Simulation is currently running (and batches could stop arriving), OR
+    - The feed was explicitly stopped ('Stop telemetry feed' / sim.pause_feed()), OR
+    - An explicit telemetry outage (TELEMETRY_LOSS_DETECTED without subsequent TELEMETRY_RESTORED) is logged.
+    When Live Simulation is OFF and nobody stopped the feed, freshness is paused (no false TELEMETRY_LOSS).
+    """
+    sim_running = False
+    feed_stopped = False
+    try:
+        from simulator import get_simulator
+
+        sim = get_simulator()
+        if sim is not None:
+            sim_running = bool(getattr(sim, "is_running", False))
+            feed_stopped = bool(getattr(sim, "is_feed_paused", False))
+    except Exception:
+        pass
+
+    explicit_outage = False
+    own_conn = conn is None
+    db_conn = get_db_connection(db_path) if own_conn else conn
+    try:
+        row = db_conn.execute(
+            """
+            SELECT event_type
+            FROM audit_log
+            WHERE event_type IN ('TELEMETRY_LOSS_DETECTED', 'TELEMETRY_RESTORED')
+            ORDER BY id DESC
+            LIMIT 1;
+            """
+        ).fetchone()
+        if row and row["event_type"] == "TELEMETRY_LOSS_DETECTED":
+            explicit_outage = True
+    except Exception:
+        explicit_outage = False
+    finally:
+        if own_conn:
+            db_conn.close()
+
+    return {
+        "sim_running": sim_running,
+        "feed_stopped": feed_stopped,
+        "explicit_outage": explicit_outage,
+        "enforce_freshness": bool(sim_running or feed_stopped or explicit_outage),
+    }
+
+
+def evaluate_db_freshness_report(
+    readings: Sequence[dict],
+    db_path: Optional[str] = None,
+    conn=None,
+    max_age_seconds: int = TELEMETRY_MAX_AGE_SECONDS,
+    now_utc: Optional[datetime] = None,
+) -> dict:
+    """Evaluate telemetry freshness respecting Live Simulation ON/OFF and explicit feed-stop state."""
+    base = evaluate_telemetry_freshness(
+        readings=readings,
+        max_age_seconds=max_age_seconds,
+        now_utc=now_utc,
+    )
+    state = get_feed_monitoring_state(db_path=db_path, conn=conn)
+
+    if state["feed_stopped"]:
+        if not base["is_telemetry_loss"]:
+            base["is_telemetry_loss"] = True
+            base["status"] = "TELEMETRY_LOSS"
+            base["banner"] = (
+                f"TELEMETRY LOSS — feed stopped (last data {base['last_data_local']}). "
+                f"Holding last safe state."
+            )
+        base["live_paused"] = False
+        return base
+
+    if not state["enforce_freshness"]:
+        base["is_telemetry_loss"] = False
+        base["status"] = "FRESH"
+        base["stale_count"] = 0
+        base["stale_sensor_ids"] = []
+        base["live_paused"] = True
+        base["banner"] = "Live simulation paused"
+        return base
+
+    base["live_paused"] = False
+    return base
+
+
+def refresh_baseline_timestamps(db_path: Optional[str] = None) -> None:
+    """Refresh stored timestamps to now() on app startup unless an explicit telemetry outage is active."""
+    state = get_feed_monitoring_state(db_path=db_path)
+    if state["feed_stopped"] or state["explicit_outage"]:
+        return
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with transaction_scope(db_path) as conn:
+        conn.execute("UPDATE telemetry SET timestamp = ?;", (now_str,))
+        conn.execute("UPDATE reservoirs SET updated_at = ?;", (now_str,))
+        conn.execute("UPDATE sector_water_quality SET timestamp = ?;", (now_str,))
+
+
 def check_db_telemetry_freshness(
     db_path: Optional[str] = None,
     current_hour: Optional[int] = None,
@@ -103,15 +207,16 @@ def check_db_telemetry_freshness(
                 GROUP BY sensor_id;
                 """
             ).fetchall()
+        return evaluate_db_freshness_report(
+            readings=[dict(r) for r in rows],
+            db_path=db_path,
+            conn=db_conn,
+            max_age_seconds=max_age_seconds,
+            now_utc=now_utc,
+        )
     finally:
         if own_conn:
             db_conn.close()
-
-    return evaluate_telemetry_freshness(
-        readings=[dict(r) for r in rows],
-        max_age_seconds=max_age_seconds,
-        now_utc=now_utc,
-    )
 
 
 def fast_forward_telemetry_age(

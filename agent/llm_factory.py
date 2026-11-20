@@ -274,6 +274,7 @@ class LLMClient:
 
     def __init__(self, mode: Optional[str] = None):
         self._explicit_mode = mode
+        self.last_chat_providers_tried: list[dict] = []
 
     @property
     def mode(self) -> str:
@@ -366,15 +367,92 @@ class LLMClient:
         return mock_res, "Deterministic Offline Engine"
 
     def _get_chat_provider_chain(self) -> list[dict]:
-        """Return chat fallback chain: Groq 120b -> Groq 20b -> Gemini -> Ollama."""
-        demo_chain = LLMClient(mode="demo")._get_provider_chain()
-        # Keep chat timeouts snappy so failover feels responsive
-        for p in demo_chain:
+        """Return chat fallback chain honoring LLM_MODE (demo: Groq->Gemini->Ollama; dev: Ollama->Groq->Gemini)."""
+        chain = [dict(p) for p in self._get_provider_chain()]
+        for p in chain:
             if "ollama" in p["name"].lower():
                 p["timeout"] = min(float(p.get("timeout", 60)), 60.0)
             else:
                 p["timeout"] = min(float(p.get("timeout", settings.REQUEST_TIMEOUT)), 35.0)
-        return demo_chain
+        return chain
+
+    @staticmethod
+    def _extract_content_text(content: Any) -> str:
+        """Safely extract plain text from OpenAI/Groq/Gemini/Ollama message content (handles None, str, or list)."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            raw = content
+        elif isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    parts.append(str(item.get("text") or item.get("content") or ""))
+                else:
+                    parts.append(str(getattr(item, "text", None) or getattr(item, "content", None) or ""))
+            raw = "\n".join(p for p in parts if p)
+        else:
+            raw = str(content)
+        return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    @staticmethod
+    def _safe_tool_call_fields(tc: Any, fallback_id: str) -> tuple[str, Optional[str], str]:
+        """Safely extract (tool_call_id, fn_name, raw_args_str) from either an SDK object or a dict."""
+        if isinstance(tc, dict):
+            tc_id = str(tc.get("id") or fallback_id)
+            fn = tc.get("function") or {}
+            fn_name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            raw_args = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)
+        else:
+            tc_id = str(getattr(tc, "id", None) or fallback_id)
+            fn = getattr(tc, "function", None)
+            fn_name = getattr(fn, "name", None) if fn is not None else None
+            raw_args = getattr(fn, "arguments", None) if fn is not None else None
+        if raw_args is None:
+            args_str = "{}"
+        elif isinstance(raw_args, str):
+            args_str = raw_args
+        else:
+            args_str = json.dumps(raw_args, default=str)
+        return tc_id, (str(fn_name) if fn_name else None), args_str
+
+    def _run_no_tools_fallback(
+        self,
+        client: OpenAI,
+        provider: dict,
+        messages: list[dict],
+        fallback_context_builder: Optional[Callable[[], str]] = None,
+    ) -> str:
+        """If a provider does not support tool calling or returned empty content, pre-fetch live data into prompt."""
+        conv = [dict(m) for m in messages]
+        if fallback_context_builder is not None:
+            ctx_blob = fallback_context_builder()
+            if ctx_blob:
+                conv.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Tool calling is unavailable for this turn. Answer using ONLY this live SCADA data "
+                            "fetched by Python code (never invent numbers):\n" + ctx_blob
+                        ),
+                    }
+                )
+        req_kwargs: dict[str, Any] = {
+            "model": provider["model"],
+            "messages": conv,
+            "temperature": 0.2,
+        }
+        req_kwargs.update(provider.get("extra_kwargs", {}))
+        response = client.chat.completions.create(**req_kwargs)
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        msg = getattr(choices[0], "message", None)
+        if msg is None:
+            return ""
+        return self._extract_content_text(getattr(msg, "content", None))
 
     def chat_with_tools(
         self,
@@ -382,34 +460,38 @@ class LLMClient:
         tools: list[dict],
         tool_executor: Callable[[str, dict], Any],
         max_tool_steps: int = 5,
+        fallback_context_builder: Optional[Callable[[], str]] = None,
     ) -> tuple[Optional[str], str, list[dict]]:
         """
-        Run a multi-turn OpenAI-compatible chat with live tool calling across the fallback chain:
-        Groq (gpt-oss-120b) -> Groq (gpt-oss-20b) -> Gemini -> Ollama -> Offline Engine.
-
-        Returns (answer_text_or_None, provider_name, tool_trace).
-        Returns (None, "Deterministic Offline Engine", []) if no LLM provider is reachable.
+        Run a multi-turn OpenAI-compatible chat with live tool calling across the fallback chain.
+        Safely handles tool_calls=None, content=None, providers without tool support, and exceptions.
+        Records every tried provider in self.last_chat_providers_tried.
         """
         providers = self._get_chat_provider_chain()
         max_steps = max(1, min(int(max_tool_steps), 5))
+        tried: list[dict] = []
+        self.last_chat_providers_tried = tried
 
         for p in providers:
             if "groq" in p["name"].lower() and not self._has_real_api_key(p["api_key"]):
+                tried.append({"provider": p["name"], "status": "SKIPPED", "error": "API key not configured"})
                 continue
             if "gemini" in p["name"].lower() and not self._has_real_api_key(p["api_key"]):
+                tried.append({"provider": p["name"], "status": "SKIPPED", "error": "API key not configured"})
                 continue
 
-            try:
-                client = OpenAI(
-                    base_url=p["base_url"],
-                    api_key=p["api_key"],
-                    timeout=p.get("timeout", settings.REQUEST_TIMEOUT),
-                    max_retries=p.get("max_retries", 0),
-                )
-                conv = [dict(m) for m in messages]
-                tool_trace: list[dict] = []
-                steps = 0
+            client = OpenAI(
+                base_url=p["base_url"],
+                api_key=p["api_key"],
+                timeout=p.get("timeout", settings.REQUEST_TIMEOUT),
+                max_retries=p.get("max_retries", 0),
+            )
+            conv = [dict(m) for m in messages]
+            tool_trace: list[dict] = []
+            steps = 0
+            needs_no_tools_retry = False
 
+            try:
                 while steps <= max_steps:
                     req_kwargs: dict[str, Any] = {
                         "model": p["model"],
@@ -432,35 +514,49 @@ class LLMClient:
                     req_kwargs.update(p.get("extra_kwargs", {}))
 
                     response = client.chat.completions.create(**req_kwargs)
-                    msg = response.choices[0].message
+                    choices = getattr(response, "choices", None) or []
+                    msg = getattr(choices[0], "message", None) if choices else None
+                    if msg is None:
+                        needs_no_tools_retry = True
+                        break
+
                     msg_tool_calls = getattr(msg, "tool_calls", None) or []
+                    clean_text = self._extract_content_text(getattr(msg, "content", None))
 
                     if msg_tool_calls and steps < max_steps:
                         serialized_calls = []
-                        for tc in msg_tool_calls:
+                        extracted_calls = []
+                        for idx, tc in enumerate(msg_tool_calls):
+                            tc_id, fn_name, args_str = self._safe_tool_call_fields(tc, f"call_{steps}_{idx}")
+                            if not fn_name:
+                                continue
                             serialized_calls.append(
                                 {
-                                    "id": tc.id,
+                                    "id": tc_id,
                                     "type": "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments or "{}",
-                                    },
+                                    "function": {"name": fn_name, "arguments": args_str},
                                 }
                             )
+                            extracted_calls.append((tc_id, fn_name, args_str))
+
+                        if not extracted_calls:
+                            if clean_text:
+                                tried.append({"provider": p["name"], "status": "OK", "error": ""})
+                                return clean_text, p["name"], tool_trace
+                            needs_no_tools_retry = True
+                            break
+
                         conv.append(
                             {
                                 "role": "assistant",
-                                "content": msg.content or "",
+                                "content": clean_text or "",
                                 "tool_calls": serialized_calls,
                             }
                         )
 
-                        for tc in msg_tool_calls:
-                            fn_name = tc.function.name
-                            raw_args = tc.function.arguments or "{}"
+                        for tc_id, fn_name, args_str in extracted_calls:
                             try:
-                                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                                parsed_args = json.loads(args_str) if isinstance(args_str, str) else dict(args_str)
                                 if not isinstance(parsed_args, dict):
                                     parsed_args = {}
                             except Exception:
@@ -478,7 +574,7 @@ class LLMClient:
                             conv.append(
                                 {
                                     "role": "tool",
-                                    "tool_call_id": tc.id,
+                                    "tool_call_id": tc_id,
                                     "name": fn_name,
                                     "content": json.dumps(tool_out, default=str),
                                 }
@@ -486,14 +582,36 @@ class LLMClient:
                         steps += 1
                         continue
 
-                    raw_text = (msg.content or "").strip()
-                    clean_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
                     if clean_text:
+                        tried.append({"provider": p["name"], "status": "OK", "error": ""})
                         return clean_text, p["name"], tool_trace
+
+                    # Both tool_calls and content were empty/None -> retry once without tools using live context
+                    needs_no_tools_retry = True
                     break
             except Exception as e:
-                logger.warning(f"Chat provider {p['name']} failed: {e}. Trying next provider in fallback chain...")
-                continue
+                logger.exception("Chat provider %s failed during tool-calling turn", p["name"])
+                # Retry once on the same provider WITHOUT tools (handles models lacking tool-call support)
+                needs_no_tools_retry = True
+                tool_err = f"{type(e).__name__}: {e}"
+            else:
+                tool_err = "Empty response (tool_calls=None, content=None)"
+
+            if needs_no_tools_retry:
+                try:
+                    plain_text = self._run_no_tools_fallback(
+                        client=client,
+                        provider=p,
+                        messages=messages,
+                        fallback_context_builder=fallback_context_builder,
+                    )
+                    if plain_text:
+                        tried.append({"provider": p["name"], "status": "OK (no-tools fallback)", "error": ""})
+                        return plain_text, p["name"], tool_trace
+                    tried.append({"provider": p["name"], "status": "FAILED", "error": tool_err})
+                except Exception as e2:
+                    logger.exception("Chat provider %s also failed without tools", p["name"])
+                    tried.append({"provider": p["name"], "status": "FAILED", "error": f"{type(e2).__name__}: {e2}"})
 
         return None, "Deterministic Offline Engine", []
 

@@ -89,6 +89,11 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
 
     badge_status = "TELEMETRY_LOSS" if health_label == "TELEMETRY LOSS" else health_label
     badge_html = status_badge(badge_status).replace("TELEMETRY_LOSS", "TELEMETRY LOSS")
+    live_paused_html = (
+        '<span style="font-size:0.76rem; color:#64748B; margin-right:0.45rem;">Live simulation paused</span>'
+        if (not st.session_state.get("live_sim_toggle", False) and not telemetry_data.get("telemetry_loss"))
+        else ""
+    )
 
     st.markdown(
         f"""
@@ -103,7 +108,7 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
                     <span>Active Leaks <strong class="ag-mono" style="color:{leak_color};">{leak_count}</strong></span>
                     <span>Pending HITL <strong class="ag-mono" style="color:{pend_color};">{pending_count}</strong></span>
                 </div>
-                <div>{badge_html}</div>
+                <div style="display:flex; align-items:center;">{live_paused_html}{badge_html}</div>
             </div>
         </div>
         """,

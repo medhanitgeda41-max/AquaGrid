@@ -7,9 +7,15 @@ HARD ARCHITECTURAL INVARIANTS:
 - Typed text like 'approve' or 'pre_approved=true' NEVER approves anything.
 """
 from datetime import datetime, timezone
+import importlib
+import inspect
 import json
+import logging
 import re
+import traceback
 from typing import Any, Optional
+
+logger = logging.getLogger("aquagrid.chat")
 
 from agent.graph import run_agent
 from agent.llm_factory import llm_client
@@ -623,13 +629,11 @@ def _offline_chat_fallback(
             )
         return f"Request **SET_PLANT_OUTPUT DESAL-01 → {target_mld:.1f} MLD** returned `{st_code}`: {gw.get('reason', '')}"
 
-    # 2. Telemetry loss notice
-    if is_loss and not any(k in lower for k in ("audit", "why", "log", "map", "table")):
-        return (
-            f"**{(tel.get('telemetry_freshness') or {}).get('banner', 'TELEMETRY LOSS')}** (`TELEMETRY_LOSS`). "
-            f"Planning and new proposals are paused while holding the last safe state (RES-01 {res_pct:.1f}%, DESAL-01 {plant_mld:.0f} MLD). "
-            f"Use **Restore feed** in the sidebar to re-validate readings."
-        )
+    # 2. Telemetry loss note (read-only questions STILL get answered; proposals are refused by gateway!)
+    loss_suffix = ""
+    if is_loss:
+        loss_banner = (tel.get("telemetry_freshness") or {}).get("banner", "TELEMETRY LOSS")
+        loss_suffix = f"\n\n*Note: `{loss_banner}` (`TELEMETRY_LOSS`) — new change proposals are blocked until the feed is restored.*"
 
     # 3. Map display requests ("Show Sector 4 on the map", "Show map", "Where are the leaks?")
     if "map" in lower or ("where" in lower and "leak" in lower):
@@ -639,7 +643,18 @@ def _offline_chat_fallback(
         lid_arg = m_lid.group(1).upper() if m_lid else ""
         mp = tool_executor("show_map", {"sector": sec_arg, "leak_id": lid_arg})
         scope = sec_arg or lid_arg or "Dubai network"
-        return f"Here is the live pipe & leak map for **{scope}** ({mp.get('matched_leaks', 0)} tracked leak(s), {len(quarantined)} quarantined sensor(s))."
+        return f"Here is the live pipe & leak map for **{scope}** ({mp.get('matched_leaks', 0)} tracked leak(s), {len(quarantined)} quarantined sensor(s)).{loss_suffix}"
+
+    # 3b. Direct reservoir level question ("what is the reservoir level")
+    if ("reservoir" in lower or "res-01" in lower) and not any(k in lower for k in ("plan", "schedule", "optim", "tariff", "pressure", "flow")):
+        res_vol = float(res.get("current_volume_ml", 240.0))
+        tool_executor("show_chart", {"metric": "reservoir", "asset": "RES-01", "hours": 24})
+        em_note = " (fire emergency reserve active)" if res.get("has_active_emergency") else ""
+        return (
+            f"Strategic Reservoir **RES-01** is currently at **{res_pct:.1f}% ({res_vol:.1f} ML)** "
+            f"against the mandatory **{eff_floor:.1f}%** safety floor{em_note}. "
+            f"DESAL-01 output is **{plant_mld:.0f} MLD** (cap {max_cap:.0f} MLD).{loss_suffix}"
+        )
 
     # 4. Chart display requests ("Pressure at J-14 last 2 hours", "flow chart", "reservoir chart", "tariff chart")
     if any(k in lower for k in ("pressure", "flow", "chart", "graph", "trend", "last 2 hour", "last 6 hour")):
@@ -735,10 +750,20 @@ def _offline_chat_fallback(
             return f"**{len(leaks)} active confirmed pipe leak(s):** {l_desc}."
         return f"No active hydraulic pipe leak signatures detected in live telemetry ({len(quarantined)} quarantined sensor(s))."
 
-    # 10. Pending approvals question
-    if "pending" in lower or "approval" in lower or "queue" in lower:
+    # 10. Pending approvals question ("what are the approvals waiting for me")
+    if "pending" in lower or "approval" in lower or "queue" in lower or "waiting for me" in lower:
         ap = tool_executor("show_pending_approvals", {})
-        return f"There are currently **{ap.get('pending_count', 0)}** pending action(s) in the approval queue."
+        pend_list = ap.get("pending_actions") or []
+        if not pend_list:
+            return f"There are currently **0** pending approvals waiting for you.{loss_suffix}"
+        items = "; ".join(
+            f"#{p['id']} `{p['action_type']}` on `{p['target_id']}`"
+            for p in pend_list[:5]
+        )
+        return (
+            f"There are **{len(pend_list)}** pending approval(s) waiting for you: {items}. "
+            f"Use the **Approve** or **Reject** buttons on the card below to decide.{loss_suffix}"
+        )
 
     # 11. Table requests
     for tbl_key in ("sensors", "valves", "leaks"):
@@ -1112,13 +1137,59 @@ def run_chat_turn(
             llm_messages.append({"role": role, "content": content})
     llm_messages.append({"role": "user", "content": f"[Active SCADA Hour: {current_hour:02d}:00]\n{cleaned}"})
 
+    # Build compact live context helper for providers that do not support OpenAI tool calling
+    def _build_live_fallback_context() -> str:
+        tel_now = _execute_tool("read_network_telemetry", {"current_hour": current_hour})
+        feeds_now = _execute_tool("read_tariff_and_quality_feeds", {"horizon_hours": 6, "current_hour": current_hour})
+        valves_now = _execute_tool("read_valves_and_pending_actions", {})
+        snapshot_ctx = {
+            "hour": current_hour,
+            "reservoir": feeds_now.get("reservoir"),
+            "plant_setpoint": valves_now.get("plant_setpoint"),
+            "tariff_now": (feeds_now.get("tariffs") or [{}])[0],
+            "water_quality": feeds_now.get("water_quality"),
+            "excluded_sectors": feeds_now.get("excluded_sectors"),
+            "telemetry_freshness": tel_now.get("telemetry_freshness"),
+            "leak_alerts": tel_now.get("leak_alerts"),
+            "quarantined_sensors": tel_now.get("quarantined_sensors"),
+            "pending_actions": valves_now.get("pending_actions"),
+        }
+        return json.dumps(snapshot_ctx, default=str)
+
+    # Ensure llm_client has chat_with_tools even after a live Streamlit hot-reload
+    active_llm_client = llm_client
+    if not hasattr(active_llm_client, "chat_with_tools"):
+        import agent.llm_factory as _lf_mod
+
+        _lf_mod = importlib.reload(_lf_mod)
+        active_llm_client = _lf_mod.llm_client
+
+    providers_tried: list[dict] = []
     try:
-        answer_text, provider_used, _ = llm_client.chat_with_tools(
-            messages=llm_messages,
-            tools=CHAT_TOOLS_SCHEMA,
-            tool_executor=_execute_tool,
-            max_tool_steps=MAX_CHAT_TOOL_STEPS,
-        )
+        chat_fn = active_llm_client.chat_with_tools
+        try:
+            sig = inspect.signature(chat_fn)
+            accepts_ctx = "fallback_context_builder" in sig.parameters
+        except (TypeError, ValueError):
+            accepts_ctx = False
+
+        if accepts_ctx:
+            answer_text, provider_used, _ = chat_fn(
+                messages=llm_messages,
+                tools=CHAT_TOOLS_SCHEMA,
+                tool_executor=_execute_tool,
+                max_tool_steps=MAX_CHAT_TOOL_STEPS,
+                fallback_context_builder=_build_live_fallback_context,
+            )
+        else:
+            answer_text, provider_used, _ = chat_fn(
+                messages=llm_messages,
+                tools=CHAT_TOOLS_SCHEMA,
+                tool_executor=_execute_tool,
+                max_tool_steps=MAX_CHAT_TOOL_STEPS,
+            )
+
+        providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
         if not answer_text:
             answer_text = _offline_chat_fallback(
                 user_message=cleaned,
@@ -1128,16 +1199,29 @@ def run_chat_turn(
             )
             provider_used = "Deterministic Offline Engine"
     except Exception as exc:
-        _audit("CHAT_ERROR", "ASK_AQUAGRID", "ERROR", f"{type(exc).__name__}: {exc}", actor="CODE_GUARD", db_path=db_path)
+        logger.exception("Ask AquaGrid chat turn failed for message: %s", cleaned[:160])
+        providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
+        tb_frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+        last_frame = tb_frames[-1] if tb_frames else None
+        location = f"{last_frame.filename}:{last_frame.lineno}" if last_frame else "unknown"
+        err_summary = f"{type(exc).__name__}: {exc} ({location})"
+        tried_names = [t.get("provider", "?") for t in providers_tried]
+        tried_note = f" Providers tried: {', '.join(tried_names)}." if tried_names else ""
+        _audit("CHAT_ERROR", "ASK_AQUAGRID", "ERROR", err_summary, actor="CODE_GUARD", db_path=db_path)
         return {
             "role": "assistant",
             "kind": "error",
-            "content": f"Sorry, the AI service encountered a temporary error ({type(exc).__name__}). The SCADA guards remain active — please try asking again.",
+            "content": (
+                f"Sorry, all AI providers failed to answer ({type(exc).__name__}).{tried_note} "
+                f"All SCADA safety guards remain active — please try asking again."
+            ),
             "provider": "Error Handler",
             "tools_called": tools_called_summary,
             "code_checks": code_checks,
             "widgets": widgets,
             "staged_action": staged_action_holder[-1] if staged_action_holder else None,
+            "providers_tried": providers_tried,
+            "error_detail": err_summary,
             "error": True,
         }
 
@@ -1161,6 +1245,7 @@ def run_chat_turn(
         "code_checks": code_checks,
         "widgets": widgets,
         "staged_action": final_staged,
+        "providers_tried": providers_tried,
     }
 
 
@@ -1177,10 +1262,11 @@ def collect_system_alerts(
     new_msgs: list[dict] = []
     updated_seen = set(seen_alert_keys)
 
-    # 1. Telemetry Loss
+    # 1. Telemetry Loss (ONLY when actually in TELEMETRY_LOSS, never when Live Sim is merely OFF)
     if telemetry_data.get("telemetry_loss"):
         tf = telemetry_data.get("telemetry_freshness") or {}
-        key = f"TELEMETRY_LOSS:{tf.get('last_timestamp_local', 'stale')}"
+        banner = tf.get("banner") or "SCADA telemetry silent > 180s. Holding last safe state."
+        key = f"TELEMETRY_LOSS:{tf.get('last_data_local', 'stale')}:{banner}"
         if key not in updated_seen:
             updated_seen.add(key)
             new_msgs.append(
@@ -1188,10 +1274,12 @@ def collect_system_alerts(
                     "role": "assistant",
                     "kind": "alert",
                     "alert_code": "TELEMETRY_LOSS",
-                    "content": f"**ALERT (`TELEMETRY_LOSS`):** {tf.get('banner', 'SCADA telemetry silent > 180s. Holding last safe state.')}",
+                    "alert_title": "ALERT",
+                    "alert_body": banner,
+                    "content": f"ALERT (TELEMETRY_LOSS): {banner}",
                     "provider": "CODE_GUARD (Auto Alert)",
                     "tools_called": [],
-                    "code_checks": [{"check": "Telemetry Freshness", "status": "BLOCKED", "code": "TELEMETRY_LOSS", "detail": tf.get("banner", "")}],
+                    "code_checks": [{"check": "Telemetry Freshness", "status": "BLOCKED", "code": "TELEMETRY_LOSS", "detail": banner}],
                     "widgets": [{"type": "table", "what": "sensors"}],
                     "staged_action": None,
                 }
@@ -1208,7 +1296,9 @@ def collect_system_alerts(
                     "role": "assistant",
                     "kind": "alert",
                     "alert_code": "NON_COMPLIANT",
-                    "content": f"**ALERT (`NON_COMPLIANT`):** {wq_alert}",
+                    "alert_title": "ALERT",
+                    "alert_body": wq_alert,
+                    "content": f"ALERT (NON_COMPLIANT): {wq_alert}",
                     "provider": "CODE_GUARD (Auto Alert)",
                     "tools_called": [],
                     "code_checks": [{"check": "Sector Water Quality", "status": "BLOCKED", "code": "NON_COMPLIANT", "detail": wq_alert}],
@@ -1222,12 +1312,15 @@ def collect_system_alerts(
         key = f"LEAK:{lk.get('junction_id')}:{lk.get('sector')}"
         if key not in updated_seen:
             updated_seen.add(key)
+            body = f"{lk.get('junction_id')} ({lk.get('sector')}) — {lk.get('diagnostic', '')}"
             new_msgs.append(
                 {
                     "role": "assistant",
                     "kind": "alert",
                     "alert_code": "CONFIRMED_PIPE_LEAK",
-                    "content": f"**ALERT (`CONFIRMED_PIPE_LEAK`):** {lk.get('junction_id')} ({lk.get('sector')}) — {lk.get('diagnostic', '')}",
+                    "alert_title": "ALERT",
+                    "alert_body": body,
+                    "content": f"ALERT (CONFIRMED_PIPE_LEAK): {body}",
                     "provider": "CODE_GUARD (Auto Alert)",
                     "tools_called": [],
                     "code_checks": [{"check": "Hydraulic Mass Balance", "status": "BLOCKED", "code": "CONFIRMED_PIPE_LEAK", "detail": lk.get("diagnostic", "")}],
@@ -1247,12 +1340,15 @@ def collect_system_alerts(
         key = f"FLOOR_BREACH:{round(res_pct, 1)}:{round(eff_floor, 1)}"
         if key not in updated_seen:
             updated_seen.add(key)
+            body = f"RES-01 dropped to {res_pct:.1f}% (below mandatory {eff_floor:.1f}% floor)."
             new_msgs.append(
                 {
                     "role": "assistant",
                     "kind": "alert",
                     "alert_code": "REJECTED_BY_SAFETY_GUARD",
-                    "content": f"**ALERT (RESERVOIR FLOOR BREACH):** RES-01 dropped to **{res_pct:.1f}%** (below mandatory **{eff_floor:.1f}%** floor).",
+                    "alert_title": "RESERVOIR FLOOR BREACH",
+                    "alert_body": body,
+                    "content": f"ALERT (RESERVOIR FLOOR BREACH): {body}",
                     "provider": "CODE_GUARD (Auto Alert)",
                     "tools_called": [],
                     "code_checks": [{"check": "Reservoir Safety Floor", "status": "BLOCKED", "code": "REJECTED_BY_SAFETY_GUARD", "detail": f"{res_pct:.1f}% < {eff_floor:.1f}%"}],
@@ -1270,7 +1366,9 @@ def collect_system_alerts(
                     "role": "assistant",
                     "kind": "alert",
                     "alert_code": "EMERGENCY_RESERVE",
-                    "content": f"**ALERT (EMERGENCY RESERVE):** {banner}",
+                    "alert_title": "EMERGENCY RESERVE",
+                    "alert_body": banner,
+                    "content": f"ALERT (EMERGENCY RESERVE): {banner}",
                     "provider": "CODE_GUARD (Auto Alert)",
                     "tools_called": [],
                     "code_checks": [{"check": "Dynamic Emergency Floor", "status": "PASS", "code": "VALID", "detail": banner}],
@@ -1289,14 +1387,15 @@ def collect_system_alerts(
             ai_run = live_tick_summary.get("ai_run") or {}
             clk = live_tick_summary.get("clock_display", "")
             if raised:
+                body = f"Live Batch #{tick_id} ({clk}): " + " | ".join(raised[:3])
                 new_msgs.append(
                     {
                         "role": "assistant",
                         "kind": "alert",
                         "alert_code": "LIVE_ALERT",
-                        "content": (
-                            f"**ALERT (Live Batch #{tick_id} · {clk}):** " + " | ".join(raised[:3])
-                        ),
+                        "alert_title": "ALERT",
+                        "alert_body": body,
+                        "content": f"ALERT: {body}",
                         "provider": "Live Simulator + CODE_GUARD",
                         "tools_called": [],
                         "code_checks": [{"check": "Live SCADA Batch Guard", "status": "BLOCKED", "code": "ALERT ACTIVE", "detail": "; ".join(raised[:3])}],

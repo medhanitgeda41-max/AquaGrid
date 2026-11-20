@@ -139,6 +139,8 @@ def render_sidebar() -> None:
         else:
             if sim is not None and getattr(sim, "is_running", False):
                 sim.stop()
+            if not getattr(sim, "is_feed_paused", False):
+                st.caption("Live simulation paused")
 
         st.divider()
 

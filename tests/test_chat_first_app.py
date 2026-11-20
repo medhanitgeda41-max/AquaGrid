@@ -198,3 +198,176 @@ def test_every_scenario_runs_from_sidebar_and_typed_text(mock_query):
     assert u51_msg["kind"] == "scenario"
     assert any(w["type"] == "scenario_result" and w["scenario_id"] == "U-5.1" for w in u51_msg["widgets"])
     assert any(w["type"] == "approvals" for w in u51_msg["widgets"])
+
+
+def test_llm_chat_with_tools_handles_text_tools_none_content_and_provider_failover():
+    """LLMClient.chat_with_tools handles normal text, tool calls, tool_calls=None & content=None, and failing providers."""
+    from types import SimpleNamespace
+    from agent.llm_factory import LLMClient
+
+    def _mk_resp(content=None, tool_calls=None):
+        msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    fake_providers = [
+        {"name": "ProviderA", "base_url": "http://a", "api_key": "k-a", "model": "m-a", "timeout": 5.0, "max_retries": 0},
+        {"name": "ProviderB", "base_url": "http://b", "api_key": "k-b", "model": "m-b", "timeout": 5.0, "max_retries": 0},
+    ]
+
+    client_obj = LLMClient(mode="demo")
+    with patch.object(client_obj, "_get_chat_provider_chain", return_value=fake_providers):
+        # 1. Normal text answer
+        mock_oa_1 = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: _mk_resp(content="RES-01 is 48.0%."))))
+        with patch("agent.llm_factory.OpenAI", return_value=mock_oa_1):
+            text, prov, trace = client_obj.chat_with_tools([{"role": "user", "content": "status"}], [], lambda n, a: {})
+            assert text == "RES-01 is 48.0%."
+            assert prov == "ProviderA"
+            assert trace == []
+
+        # 2. Answer with tool calls -> executes tool then returns final text
+        call_seq = {"n": 0}
+        tc = SimpleNamespace(id="tc_1", function=SimpleNamespace(name="read_network_telemetry", arguments='{"current_hour": 14}'))
+
+        def _create_tool_then_text(**kw):
+            call_seq["n"] += 1
+            if call_seq["n"] == 1:
+                return _mk_resp(content=None, tool_calls=[tc])
+            return _mk_resp(content="Checked telemetry: 0 leaks.", tool_calls=None)
+
+        mock_oa_2 = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_create_tool_then_text)))
+        executed = []
+        with patch("agent.llm_factory.OpenAI", return_value=mock_oa_2):
+            text, prov, trace = client_obj.chat_with_tools(
+                [{"role": "user", "content": "leaks?"}],
+                [{"type": "function", "function": {"name": "read_network_telemetry"}}],
+                lambda n, a: (executed.append((n, a)) or {"leak_alerts": []}),
+            )
+            assert text == "Checked telemetry: 0 leaks."
+            assert prov == "ProviderA"
+            assert len(executed) == 1 and executed[0][0] == "read_network_telemetry"
+            assert len(trace) == 1
+
+        # 3. ProviderA returns tool_calls=None and content=None -> falls back cleanly without AttributeError to ProviderB
+        def _openai_factory(**kw):
+            if kw.get("base_url") == "http://a":
+                return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **ckw: _mk_resp(content=None, tool_calls=None))))
+            return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **ckw: _mk_resp(content="Answered by ProviderB"))))
+
+        with patch("agent.llm_factory.OpenAI", side_effect=_openai_factory):
+            text, prov, _ = client_obj.chat_with_tools(
+                [{"role": "user", "content": "status"}],
+                [],
+                lambda n, a: {},
+                fallback_context_builder=lambda: '{"reservoir": 48.0}',
+            )
+            assert text == "Answered by ProviderB"
+            assert prov == "ProviderB"
+
+        # 4. ProviderA raises an error -> ProviderB answers seamlessly
+        def _openai_failover(**kw):
+            if kw.get("base_url") == "http://a":
+                def _boom(**ckw):
+                    raise RuntimeError("ProviderA down")
+                return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_boom)))
+            return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **ckw: _mk_resp(content="Fallback ProviderB OK"))))
+
+        with patch("agent.llm_factory.OpenAI", side_effect=_openai_failover):
+            text, prov, _ = client_obj.chat_with_tools(
+                [{"role": "user", "content": "status"}],
+                [],
+                lambda n, a: {},
+            )
+            assert text == "Fallback ProviderB OK"
+            assert prov == "ProviderB"
+            assert any(t["provider"] == "ProviderA" and t["status"] == "FAILED" for t in client_obj.last_chat_providers_tried)
+
+
+def test_live_sim_off_never_raises_telemetry_loss_and_feed_stopped_does():
+    """Old timestamps with Live Sim OFF produce no TELEMETRY_LOSS; stopping feed raises TELEMETRY_LOSS while chat still answers questions."""
+    from datetime import datetime, timedelta, timezone
+    from guards.telemetry_freshness import check_db_telemetry_freshness
+
+    # Make stored timestamps 113 minutes old while Live Sim is OFF and feed NOT stopped
+    old_ts = (datetime.now(timezone.utc) - timedelta(minutes=113)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE telemetry SET timestamp = ?;", (old_ts,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    sim = get_simulator()
+    sim.stop()
+    sim.resume_feed()
+
+    fr_off = check_db_telemetry_freshness()
+    assert fr_off["is_telemetry_loss"] is False
+    assert fr_off["banner"] == "Live simulation paused"
+
+    tel_off = read_network_telemetry(current_hour=14, log_audit=False)
+    assert tel_off["telemetry_loss"] is False
+
+    # Stopping the feed MUST raise TELEMETRY_LOSS
+    sim.pause_feed()
+    try:
+        fr_stopped = check_db_telemetry_freshness()
+        assert fr_stopped["is_telemetry_loss"] is True
+        assert fr_stopped["status"] == "TELEMETRY_LOSS"
+
+        # During real telemetry loss: chat still answers read-only questions, but refuses proposals!
+        with patch("agent.chat_assistant.llm_client.chat_with_tools", return_value=(None, "Deterministic Offline Engine", [])):
+            q_ans = run_chat_turn("what are the approvals waiting for me", history=[])
+            assert "pending approval" in q_ans["content"].lower()
+            assert q_ans.get("error") is not True
+
+            prop_ans = run_chat_turn("close V-12", history=[])
+            assert prop_ans["staged_action"]["status"] == "REJECTED_STALE_TELEMETRY"
+            assert "REJECTED_STALE_TELEMETRY" in prop_ans["content"]
+    finally:
+        sim.resume_feed()
+
+
+@pytest.mark.parametrize("llm_mode", ["dev", "demo"])
+def test_end_to_end_chat_questions_in_dev_and_demo_mode(llm_mode):
+    """End-to-end in both dev and demo mode: approvals, reservoir level, Sector 4 map, and 'close V-12' (STAGED only)."""
+    from config.settings import settings
+
+    with (
+        patch.object(settings, "LLM_MODE", llm_mode),
+        patch("agent.chat_assistant.llm_client.chat_with_tools", return_value=(None, "Deterministic Offline Engine", [])),
+    ):
+        r1 = run_chat_turn("what are the approvals waiting for me", history=[])
+        assert r1.get("error") is not True
+        assert "0" in r1["content"] and "approval" in r1["content"].lower()
+        assert any(w["type"] == "approvals" for w in r1["widgets"])
+
+        r2 = run_chat_turn("what is the reservoir level", history=[])
+        assert r2.get("error") is not True
+        assert "48.0%" in r2["content"]
+        assert any(w["type"] == "chart" and w["metric"] == "reservoir" for w in r2["widgets"])
+
+        r3 = run_chat_turn("show Sector 4 on the map", history=[])
+        assert r3.get("error") is not True
+        assert "Sector 4" in r3["content"]
+        assert any(w["type"] == "map" and w["sector"] == "Sector 4" for w in r3["widgets"])
+
+        r4 = run_chat_turn("close V-12", history=[])
+        assert r4.get("error") is not True
+        assert r4["staged_action"]["status"] == "STAGED_PENDING_APPROVAL"
+        assert any(w["type"] == "approvals" for w in r4["widgets"])
+
+        conn = get_db_connection()
+        try:
+            assert conn.execute("SELECT status FROM valves WHERE valve_id = 'V-12';").fetchone()["status"] == "OPEN"
+        finally:
+            conn.close()
+
+        # Verify alert formatting has no raw markdown asterisks or backticks in alert_body
+        inject_scenario_1()
+        tel = read_network_telemetry(current_hour=14, log_audit=False)
+        feeds = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=14, log_audit=False)
+        alert_msgs, _ = collect_system_alerts(tel, feeds, set())
+        assert alert_msgs
+        for am in alert_msgs:
+            assert "**" not in am.get("alert_body", "")
+            assert "`" not in am.get("alert_body", "")

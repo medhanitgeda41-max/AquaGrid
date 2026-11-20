@@ -26,7 +26,10 @@ def _ensure_module_attr(module_name: str, required_attr: str) -> None:
 # Guard against stale sys.modules across live Streamlit hot-reloads
 _ensure_module_attr("simulator", "simulator_step_lock")
 _ensure_module_attr("simulator", "STEP_LOCK")
-_ensure_module_attr("agent.llm_factory", "LLMClient")
+_ensure_module_attr("guards.telemetry_freshness", "refresh_baseline_timestamps")
+_lf_cached = sys.modules.get("agent.llm_factory")
+if _lf_cached is not None and not hasattr(getattr(_lf_cached, "llm_client", None), "chat_with_tools"):
+    importlib.reload(_lf_cached)
 _ensure_module_attr("agent.chat_assistant", "collect_system_alerts")
 _ensure_module_attr("components.badges", "get_sim_step_lock")
 _ensure_module_attr("components.chat_widgets", "render_chat_widget")
@@ -40,6 +43,7 @@ from config.constants import DEFAULT_SCADA_HOUR
 from config.region_config import now_local
 from database.connection import get_db_connection, init_db
 from database.seed_data import seed_database
+from guards.telemetry_freshness import refresh_baseline_timestamps
 from simulator import get_simulator
 from components.badges import inject_scada_css
 from components.header import render_header
@@ -48,7 +52,7 @@ from components.ai_prompt_panel import render_ask_aquagrid_chat
 
 
 def _ensure_database_initialized() -> None:
-    """Initialize and seed SQLite database on first launch if empty or missing new tables/valves."""
+    """Initialize and seed SQLite database on first launch, and keep baseline timestamps fresh on startup."""
     init_db()
     conn = get_db_connection()
     try:
@@ -60,6 +64,9 @@ def _ensure_database_initialized() -> None:
         conn.close()
     if res_count == 0 or pipe_count == 0 or valve_count < 20 or wq_count == 0:
         seed_database()
+    elif not st.session_state.get("_startup_ts_refreshed"):
+        refresh_baseline_timestamps()
+    st.session_state["_startup_ts_refreshed"] = True
 
 
 def main() -> None:

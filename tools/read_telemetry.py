@@ -8,7 +8,7 @@ from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
 from guards.injection_filter import inspect_untrusted_text
-from guards.telemetry_freshness import evaluate_telemetry_freshness
+from guards.telemetry_freshness import evaluate_db_freshness_report
 from guards.sensor_checks import (
     check_flatline,
     check_drift,
@@ -257,7 +257,11 @@ def read_network_telemetry(
                 "created_at": r["created_at"],
             })
         all_readings_for_freshness = verified_telemetry + quarantined_sensors
-        freshness_report = evaluate_telemetry_freshness(all_readings_for_freshness)
+        freshness_report = evaluate_db_freshness_report(
+            all_readings_for_freshness,
+            db_path=db_path,
+            conn=conn,
+        )
         stale_set = set(freshness_report["stale_sensor_ids"])
         for item in verified_telemetry:
             item["freshness"] = "STALE" if item["sensor_id"] in stale_set else "FRESH"

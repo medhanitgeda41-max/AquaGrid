@@ -60,8 +60,23 @@ def format_dubai_time(ts: str | None) -> str:
 
 SCADA_CSS = """
 <style>
+    /* Hide Streamlit header toolbar, main menu, and footer while keeping sidebar toggle (») working */
+    header, #MainMenu, footer {
+        visibility: hidden;
+    }
+    header [data-testid="stExpandSidebarButton"],
+    header [data-testid="collapsedControl"],
+    [data-testid="stExpandSidebarButton"],
+    [data-testid="collapsedControl"] {
+        visibility: visible !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stToolbar"],
+    [data-testid="stDecoration"] {
+        display: none !important;
+    }
     .block-container {
-        padding-top: 1.25rem;
+        padding-top: 2.25rem !important;
         padding-bottom: 2.5rem;
         max-width: 1320px;
     }
