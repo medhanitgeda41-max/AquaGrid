@@ -32,15 +32,17 @@ from components.audit_log_view import render_audit_log
 
 
 def _ensure_database_initialized() -> None:
-    """Initialize and seed SQLite database on first launch if empty or missing new geospatial tables."""
+    """Initialize and seed SQLite database on first launch if empty or missing new tables/valves."""
     init_db()
     conn = get_db_connection()
     try:
         res_count = conn.execute("SELECT COUNT(*) AS cnt FROM reservoirs;").fetchone()["cnt"]
         pipe_count = conn.execute("SELECT COUNT(*) AS cnt FROM pipe_segments;").fetchone()["cnt"]
+        valve_count = conn.execute("SELECT COUNT(*) AS cnt FROM valves;").fetchone()["cnt"]
+        wq_count = conn.execute("SELECT COUNT(*) AS cnt FROM sector_water_quality;").fetchone()["cnt"]
     finally:
         conn.close()
-    if res_count == 0 or pipe_count == 0:
+    if res_count == 0 or pipe_count == 0 or valve_count < 20 or wq_count == 0:
         seed_database()
 
 

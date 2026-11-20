@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS plant_setpoints (
 CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     action_type TEXT NOT NULL, -- 'CLOSE_VALVE', 'OPEN_VALVE', 'SET_PLANT_OUTPUT'
-    target_id TEXT NOT NULL,   -- 'V-01'..'V-12', 'DESAL-01'
+    target_id TEXT NOT NULL,   -- 'V-01'..'V-20', 'DESAL-01'
     proposed_value REAL NOT NULL,
     current_value REAL NOT NULL,
     rationale TEXT NOT NULL,
@@ -169,4 +169,31 @@ CREATE TABLE IF NOT EXISTS ai_run_log (
     suggestions_json TEXT NOT NULL,
     grid_suggestions_json TEXT NOT NULL DEFAULT '[]',
     error_message TEXT
+);
+
+-- Per-Sector Water Quality Readings (Chlorine residual mg/L with timestamp)
+CREATE TABLE IF NOT EXISTS sector_water_quality (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sector TEXT NOT NULL,
+    chlorine_mg_l REAL NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Emergency Reserve Commitments (e.g. Civil Defence fire-fighting water allocations)
+CREATE TABLE IF NOT EXISTS emergency_commitments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sector TEXT NOT NULL,
+    volume_m3 REAL NOT NULL,
+    start_time TIMESTAMP NOT NULL,
+    end_time TIMESTAMP NOT NULL,
+    source TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Field Work Tickets (Untrusted external text ingested by read tools)
+CREATE TABLE IF NOT EXISTS field_tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sector TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

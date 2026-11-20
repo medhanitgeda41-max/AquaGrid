@@ -76,7 +76,7 @@ def read_network_telemetry(
             # Fetch recent history (up to last 4 hours) for flatline evaluation
             history_rows = conn.execute(
                 """
-                SELECT hour, value, status
+                SELECT hour, value, status, timestamp
                 FROM telemetry
                 WHERE sensor_id = ? AND hour <= ?
                 ORDER BY hour DESC
@@ -90,6 +90,7 @@ def read_network_telemetry(
 
             current_row = history_rows[0]
             current_val = float(current_row["value"])
+            current_ts = current_row["timestamp"]
             history_vals = [float(r["value"]) for r in history_rows]
 
             quarantine_reasons = []
@@ -117,6 +118,7 @@ def read_network_telemetry(
                     "sector": sec,
                     "last_reading": current_val,
                     "unit": unit,
+                    "timestamp": current_ts,
                     "status": "QUARANTINED",
                     "reasons": quarantine_reasons,
                 })
@@ -128,6 +130,7 @@ def read_network_telemetry(
                     "sector": sec,
                     "value": current_val,
                     "unit": unit,
+                    "timestamp": current_ts,
                     "nominal_range": f"{nom_min} - {nom_max}",
                     "status": "NORMAL",
                 })
@@ -185,15 +188,84 @@ def read_network_telemetry(
                         ),
                     })
 
+        # 5. Fetch latest per-sector chlorine residual readings (with timestamps)
+        if sector_id:
+            wq_rows = conn.execute(
+                """
+                SELECT sector, chlorine_mg_l, timestamp
+                FROM sector_water_quality
+                WHERE id IN (
+                    SELECT MAX(id) FROM sector_water_quality WHERE sector = ? GROUP BY sector
+                )
+                ORDER BY sector ASC;
+                """,
+                (sector_id,),
+            ).fetchall()
+            ticket_rows = conn.execute(
+                """
+                SELECT id, sector, text, created_at
+                FROM field_tickets
+                WHERE sector = ?
+                ORDER BY id DESC
+                LIMIT 20;
+                """,
+                (sector_id,),
+            ).fetchall()
+        else:
+            wq_rows = conn.execute(
+                """
+                SELECT sector, chlorine_mg_l, timestamp
+                FROM sector_water_quality
+                WHERE id IN (SELECT MAX(id) FROM sector_water_quality GROUP BY sector)
+                ORDER BY sector ASC;
+                """
+            ).fetchall()
+            ticket_rows = conn.execute(
+                """
+                SELECT id, sector, text, created_at
+                FROM field_tickets
+                ORDER BY id DESC
+                LIMIT 20;
+                """
+            ).fetchall()
+
+        sector_water_quality = [
+            {
+                "sector": r["sector"],
+                "chlorine_mg_l": float(r["chlorine_mg_l"]),
+                "unit": "mg/L",
+                "timestamp": r["timestamp"],
+            }
+            for r in wq_rows
+        ]
+        field_tickets = [
+            {
+                "id": r["id"],
+                "sector": r["sector"],
+                "text": r["text"],
+                "created_at": r["created_at"],
+            }
+            for r in ticket_rows
+        ]
+        all_timestamps = [
+            item["timestamp"]
+            for item in (verified_telemetry + quarantined_sensors)
+            if item.get("timestamp")
+        ]
+        latest_telemetry_ts = max(all_timestamps) if all_timestamps else None
+
         result = {
             "sector_filter": sector_id or "ALL",
             "evaluation_hour": latest_hour,
+            "latest_telemetry_timestamp": latest_telemetry_ts,
             "total_sensors_evaluated": len(sensors),
             "verified_sensor_count": len(verified_telemetry),
             "quarantined_sensor_count": len(quarantined_sensors),
             "verified_telemetry": verified_telemetry,
             "quarantined_sensors": quarantined_sensors,
             "leak_alerts": leak_alerts,
+            "sector_water_quality": sector_water_quality,
+            "field_tickets": field_tickets,
         }
     finally:
         conn.close()

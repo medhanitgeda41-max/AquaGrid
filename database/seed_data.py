@@ -9,6 +9,7 @@ from config.constants import (
     DESAL_MAX_CAPACITY_MLD,
     PEAK_TARIFF_START_HOUR,
     PEAK_TARIFF_END_HOUR,
+    KNOWN_SECTORS,
     KNOWN_VALVES,
 )
 from config.region_config import REGION_CONFIG
@@ -24,6 +25,9 @@ def seed_database(db_path: str | None = None) -> None:
     with transaction_scope(db_path) as conn:
         # Clear existing data
         for table in (
+            "field_tickets",
+            "emergency_commitments",
+            "sector_water_quality",
             "ai_run_log",
             "scada_history",
             "leaks",
@@ -40,6 +44,9 @@ def seed_database(db_path: str | None = None) -> None:
             "reservoirs",
         ):
             conn.execute(f"DELETE FROM {table};")
+
+        now_utc = datetime.now(timezone.utc)
+        now_utc_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
 
         # 1. Strategic Reservoir (Starts at 48% at 14:00 = 240.0 ML)
         start_level_percent = 48.0
@@ -126,25 +133,58 @@ def seed_database(db_path: str | None = None) -> None:
                 else:
                     val = 50.0
 
-                telemetry_records.append((h, s_id, j_id, sector, round(val, 2), unit, "NORMAL"))
+                telemetry_records.append((now_utc_str, h, s_id, j_id, sector, round(val, 2), unit, "NORMAL"))
 
         conn.executemany(
             """
-            INSERT INTO telemetry (hour, sensor_id, junction_id, sector, value, unit, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO telemetry (timestamp, hour, sensor_id, junction_id, sector, value, unit, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
             """,
             telemetry_records,
         )
 
-        # 6. Network Isolation Valves (V-01 through V-12, all OPEN)
+        # 6. Network Isolation Valves (V-01 through V-20 across Sectors 1-6, all OPEN)
+        # V-01..V-03 -> Sector 1, V-04..V-06 -> Sector 2, V-07..V-09 -> Sector 3,
+        # V-10..V-12 -> Sector 4, V-13..V-16 -> Sector 5, V-17..V-20 -> Sector 6
         valves_to_insert = []
         for i, v_name in enumerate(KNOWN_VALVES, 1):
-            sector = f"Sector {(i - 1) // 3 + 1}"
+            if i <= 12:
+                sector = f"Sector {(i - 1) // 3 + 1}"
+            elif i <= 16:
+                sector = "Sector 5"
+            else:
+                sector = "Sector 6"
             valves_to_insert.append((v_name, sector, "OPEN"))
 
         conn.executemany(
             "INSERT INTO valves (valve_id, sector, status) VALUES (?, ?, ?);",
             valves_to_insert,
+        )
+
+        # 6b. Per-Sector Water Quality Baseline (Chlorine residual ~0.5 mg/L with timestamp)
+        sector_wq_rows = [
+            (sec, round(0.50 + random.uniform(-0.03, 0.04), 3), now_utc_str)
+            for sec in KNOWN_SECTORS
+        ]
+        conn.executemany(
+            """
+            INSERT INTO sector_water_quality (sector, chlorine_mg_l, timestamp)
+            VALUES (?, ?, ?);
+            """,
+            sector_wq_rows,
+        )
+
+        # 6c. Baseline Routine Field Ticket (untrusted external text table)
+        conn.execute(
+            """
+            INSERT INTO field_tickets (sector, text, created_at)
+            VALUES (?, ?, ?);
+            """,
+            (
+                "Sector 1",
+                "Routine meter inspection completed in Sector 1; junction pressures nominal.",
+                now_utc_str,
+            ),
         )
 
         # 7. Desalination Plant Setpoint (DESAL-01 at 100.0 MLD)

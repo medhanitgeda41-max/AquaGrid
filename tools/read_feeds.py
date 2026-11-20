@@ -186,6 +186,63 @@ def read_tariff_and_quality_feeds(
             bloom_severity=highest_bloom_severity,
         )
 
+        # 6. Fetch Latest Per-Sector Chlorine Residual, Emergency Commitments, and Field Tickets
+        sector_wq_rows = conn.execute(
+            """
+            SELECT sector, chlorine_mg_l, timestamp
+            FROM sector_water_quality
+            WHERE id IN (SELECT MAX(id) FROM sector_water_quality GROUP BY sector)
+            ORDER BY sector ASC;
+            """
+        ).fetchall()
+        sector_water_quality = [
+            {
+                "sector": r["sector"],
+                "chlorine_mg_l": float(r["chlorine_mg_l"]),
+                "unit": "mg/L",
+                "timestamp": r["timestamp"],
+            }
+            for r in sector_wq_rows
+        ]
+
+        commitment_rows = conn.execute(
+            """
+            SELECT id, sector, volume_m3, start_time, end_time, source, created_at
+            FROM emergency_commitments
+            ORDER BY id DESC;
+            """
+        ).fetchall()
+        emergency_commitments = [
+            {
+                "id": r["id"],
+                "sector": r["sector"],
+                "volume_m3": float(r["volume_m3"]),
+                "start_time": r["start_time"],
+                "end_time": r["end_time"],
+                "source": r["source"],
+                "created_at": r["created_at"],
+            }
+            for r in commitment_rows
+        ]
+
+        ticket_rows = conn.execute(
+            """
+            SELECT id, sector, text, created_at
+            FROM field_tickets
+            ORDER BY id DESC
+            LIMIT 20;
+            """
+        ).fetchall()
+        field_tickets = [
+            {
+                "id": r["id"],
+                "sector": r["sector"],
+                "text": r["text"],
+                "created_at": r["created_at"],
+            }
+            for r in ticket_rows
+        ]
+
         result = {
             "current_hour": current_hour,
             "horizon_hours": horizon_hours,
@@ -197,6 +254,9 @@ def read_tariff_and_quality_feeds(
             "current_plant_output_mld": current_plant_output_mld,
             "reservoir": reservoir_status,
             "sanitized_alerts": sanitized_alerts,
+            "sector_water_quality": sector_water_quality,
+            "emergency_commitments": emergency_commitments,
+            "field_tickets": field_tickets,
             "water_quality": {
                 "intake_turbidity_ntu": curr_turbidity,
                 "intake_chlorine_ppm": curr_chlorine,

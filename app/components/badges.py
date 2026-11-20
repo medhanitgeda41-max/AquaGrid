@@ -179,6 +179,56 @@ SCADA_CSS = """
         word-wrap: break-word;
         overflow-wrap: anywhere;
     }
+    .scada-round-hdr {
+        font-size: 0.86rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        color: #93C5FD;
+        margin: 0.55rem 0 0.4rem 0;
+        padding-bottom: 0.2rem;
+        border-bottom: 1px solid #243757;
+    }
+    .scada-id-badge {
+        display: inline-block;
+        padding: 0.12rem 0.48rem;
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 0.74rem;
+        font-weight: 700;
+        background: #0F3459;
+        color: #7CE8FF;
+        border: 1px solid #1E82A8;
+        margin-right: 0.35rem;
+    }
+    .scada-id-badge-r2 {
+        background: #232A3B;
+        color: #CBD5E1;
+        border: 1px solid #475569;
+    }
+    .scada-card-title {
+        font-size: 0.94rem;
+        font-weight: 700;
+        color: #F0F6FC;
+        margin: 0.35rem 0 0.4rem 0;
+        line-height: 1.3;
+        white-space: normal;
+        word-wrap: break-word;
+        overflow-wrap: break-word;
+    }
+    .scada-card-field {
+        font-size: 0.81rem;
+        color: #CBD5E1;
+        line-height: 1.4;
+        margin-bottom: 0.35rem;
+        white-space: normal;
+        word-wrap: break-word;
+    }
+    .scada-card-field strong {
+        color: #93C5FD;
+    }
+    .scada-card-watch strong {
+        color: #6EE7B7;
+    }
 </style>
 """
 

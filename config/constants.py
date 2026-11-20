@@ -14,6 +14,11 @@ DESAL_THROTTLED_OUTPUT_MLD: float = 40.0
 TURBIDITY_MAX_NTU: float = 4.0  # Nephelometric Turbidity Units
 CHLORINE_MIN_PPM: float = 0.5   # Parts per million (free chlorine)
 CHLORINE_MAX_PPM: float = 4.0
+CHLORINE_MIN_MG_L: float = 0.2  # Minimum per-sector free chlorine residual (mg/L)
+
+# Telemetry Freshness & Approval Token Guardrails (Round 2)
+TELEMETRY_MAX_AGE_SECONDS: int = 180
+APPROVAL_TOKEN_TTL_MINUTES: int = 15
 
 # Hydraulic Network Pressure Limits (psi)
 PRESSURE_MIN_PSI: float = 20.0
@@ -37,7 +42,7 @@ ALLOWED_ACTION_TYPES: tuple[str, ...] = (
     "SET_PLANT_OUTPUT",
 )
 
-KNOWN_VALVES: tuple[str, ...] = tuple(f"V-{i:02d}" for i in range(1, 13))
+KNOWN_VALVES: tuple[str, ...] = tuple(f"V-{i:02d}" for i in range(1, 21))
 KNOWN_PLANTS: tuple[str, ...] = ("DESAL-01",)
 KNOWN_TARGET_IDS: tuple[str, ...] = KNOWN_VALVES + KNOWN_PLANTS
 

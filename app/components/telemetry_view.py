@@ -380,7 +380,7 @@ def render_telemetry_view(snapshot: dict) -> None:
 
     st.divider()
 
-    section_header("Live Isolation Valve Matrix (V-01 through V-12)", ["CODE", "HUMAN"])
+    section_header("Live Isolation Valve Matrix (V-01 through V-20)", ["CODE", "HUMAN"])
     conn = get_db_connection()
     try:
         valve_rows = conn.execute(

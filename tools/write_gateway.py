@@ -33,7 +33,7 @@ def stage_gated_valve_or_setpoint_action(
 
     Args:
         action_type: Must be 'CLOSE_VALVE', 'OPEN_VALVE', or 'SET_PLANT_OUTPUT'.
-        target_id: Must be in V-01..V-12 or 'DESAL-01'.
+        target_id: Must be in V-01..V-20 or 'DESAL-01'.
         proposed_value: Proposed actuator value (0.0/1.0 for valves, MLD for plant).
         rationale: Plain English justification.
         db_path: Optional database path override.

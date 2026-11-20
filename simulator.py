@@ -28,6 +28,7 @@ from typing import Optional
 
 from config.constants import (
     DEFAULT_SCADA_HOUR,
+    KNOWN_SECTORS,
     PEAK_TARIFF_END_HOUR,
     PEAK_TARIFF_START_HOUR,
     RESERVOIR_FLOOR_PERCENT,
@@ -114,6 +115,7 @@ class LiveScadaSimulator:
         self._next_update_at: Optional[datetime] = None
         self._last_ai_error: Optional[str] = None
         self._prev_sensor_vals: dict[str, float] = {}
+        self._prev_sector_chlorine: dict[str, float] = {}
 
     @property
     def is_running(self) -> bool:
@@ -194,6 +196,7 @@ class LiveScadaSimulator:
             self._next_update_at = None
             self._last_ai_error = None
             self._prev_sensor_vals.clear()
+            self._prev_sector_chlorine.clear()
 
     def step(self, force_fault: Optional[str] = None, now_override: Optional[datetime] = None) -> dict:
         """
@@ -348,7 +351,23 @@ class LiveScadaSimulator:
             val = round(val, 2)
             self._prev_sensor_vals[s_id] = val
             sensor_readings_map[s_id] = val
-            telemetry_rows.append((sim_hour, s_id, j_id, sec, val, unit, row_status))
+            telemetry_rows.append((utc_ts_str, sim_hour, s_id, j_id, sec, val, unit, row_status))
+
+        # 4b. Smoothly evolve per-sector chlorine residual (normal ~0.5 mg/L with timestamp)
+        sector_chlorine_rows = []
+        sector_chlorine_summary = []
+        for sec in KNOWN_SECTORS:
+            prev_cl = self._prev_sector_chlorine.get(sec, 0.50)
+            cl_val = max(0.42, min(0.58, 0.75 * prev_cl + 0.25 * 0.50 + self._rng.uniform(-0.02, 0.02)))
+            cl_val = round(cl_val, 3)
+            self._prev_sector_chlorine[sec] = cl_val
+            sector_chlorine_rows.append((sec, cl_val, utc_ts_str))
+            sector_chlorine_summary.append({
+                "sector": sec,
+                "chlorine_mg_l": cl_val,
+                "unit": "mg/L",
+                "timestamp": utc_ts_str,
+            })
 
         # 5. Build scada_history rows for tracked pipe segments
         history_rows = []
@@ -396,10 +415,18 @@ class LiveScadaSimulator:
             tx.execute("DELETE FROM telemetry WHERE hour = ?;", (sim_hour,))
             tx.executemany(
                 """
-                INSERT INTO telemetry (hour, sensor_id, junction_id, sector, value, unit, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO telemetry (timestamp, hour, sensor_id, junction_id, sector, value, unit, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 telemetry_rows,
+            )
+
+            tx.executemany(
+                """
+                INSERT INTO sector_water_quality (sector, chlorine_mg_l, timestamp)
+                VALUES (?, ?, ?);
+                """,
+                sector_chlorine_rows,
             )
 
             if history_rows:
@@ -420,10 +447,10 @@ class LiveScadaSimulator:
                     tx.execute(
                         """
                         UPDATE telemetry
-                        SET value = ?, status = 'FLATLINE'
+                        SET value = ?, status = 'FLATLINE', timestamp = ?
                         WHERE sensor_id = ? AND hour = ?;
                         """,
-                        (stuck_value, stuck_sensor_id, rh),
+                        (stuck_value, utc_ts_str, stuck_sensor_id, rh),
                     )
 
             # Snap new leak onto pipe segment polyline and insert into `leaks`
@@ -550,6 +577,7 @@ class LiveScadaSimulator:
             "quarantined_sensors": telemetry_check.get("quarantined_sensors", []),
             "raised_alerts": raised_alerts,
             "water_quality_safe": feeds_check.get("water_quality", {}).get("is_quality_safe", True),
+            "sector_water_quality": sector_chlorine_summary,
             "ai_run": ai_result,
         }
 
