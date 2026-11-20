@@ -434,52 +434,53 @@ def render_leak_map_view(snapshot: dict) -> None:
     latest_pressures = {r["pipe_segment_id"]: float(r["pressure_psi"]) for r in p_rows if r["pressure_psi"] is not None}
     quarantined_ids = {s["sensor_id"] for s in snapshot.get("telemetry_data", {}).get("quarantined_sensors", [])}
 
-    f1, f2, f3, f4 = st.columns(4)
-    with f1:
-        sev_filter = st.multiselect(
-            "Severity",
-            options=["Critical", "High", "Medium", "Low"],
-            default=["Critical", "High", "Medium", "Low"],
-            key="map_filter_severity",
-        )
-    with f2:
-        status_filter = st.multiselect(
-            "Status",
-            options=["Suspected", "Confirmed", "Under Repair", "Resolved", "False Alarm – Sensor Fault"],
-            default=["Suspected", "Confirmed", "Under Repair", "Resolved", "False Alarm – Sensor Fault"],
-            key="map_filter_status",
-        )
-    with f3:
-        all_sectors = sorted({s["sector"] for s in segments})
-        sector_filter = st.multiselect(
-            "Sector",
-            options=all_sectors,
-            default=all_sectors,
-            key="map_filter_sector",
-        )
-    with f4:
-        time_range = st.selectbox(
-            "Time Range",
-            options=["All", "Last 1h", "Last 6h", "Last 24h"],
-            index=0,
-            key="map_filter_time",
-        )
+    with st.expander("Show details — Map Filters & Layers", expanded=False):
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            sev_filter = st.multiselect(
+                "Severity",
+                options=["Critical", "High", "Medium", "Low"],
+                default=["Critical", "High", "Medium", "Low"],
+                key="map_filter_severity",
+            )
+        with f2:
+            status_filter = st.multiselect(
+                "Status",
+                options=["Suspected", "Confirmed", "Under Repair", "Resolved", "False Alarm – Sensor Fault"],
+                default=["Suspected", "Confirmed", "Under Repair", "Resolved", "False Alarm – Sensor Fault"],
+                key="map_filter_status",
+            )
+        with f3:
+            all_sectors = sorted({s["sector"] for s in segments})
+            sector_filter = st.multiselect(
+                "Sector",
+                options=all_sectors,
+                default=all_sectors,
+                key="map_filter_sector",
+            )
+        with f4:
+            time_range = st.selectbox(
+                "Time Range",
+                options=["All", "Last 1h", "Last 6h", "Last 24h"],
+                index=0,
+                key="map_filter_time",
+            )
 
-    l1, l2, l3, l4 = st.columns([1.0, 1.2, 1.0, 1.3])
-    with l1:
-        show_pipes = st.checkbox("Layer: Pipe Network", value=True, key="map_layer_pipes")
-    with l2:
-        show_leaks = st.checkbox("Layer: Leaks & Loss Circles", value=True, key="map_layer_leaks")
-    with l3:
-        show_sensors = st.checkbox("Layer: Sensors", value=True, key="map_layer_sensors")
-    with l4:
-        pipe_color_mode = st.selectbox(
-            "Color Pipes By",
-            options=["Sector", "Pressure Status"],
-            index=0,
-            key="map_pipe_color_mode",
-            label_visibility="collapsed",
-        )
+        l1, l2, l3, l4 = st.columns([1.0, 1.2, 1.0, 1.3])
+        with l1:
+            show_pipes = st.checkbox("Pipe Network", value=True, key="map_layer_pipes")
+        with l2:
+            show_leaks = st.checkbox("Leaks & Loss Circles", value=True, key="map_layer_leaks")
+        with l3:
+            show_sensors = st.checkbox("Sensors", value=True, key="map_layer_sensors")
+        with l4:
+            pipe_color_mode = st.selectbox(
+                "Color Pipes By",
+                options=["Sector", "Pressure Status"],
+                index=0,
+                key="map_pipe_color_mode",
+                label_visibility="collapsed",
+            )
 
     now_utc = datetime.now(timezone.utc)
     cutoff_hours = {"Last 1h": 1, "Last 6h": 6, "Last 24h": 24}.get(time_range)
@@ -544,45 +545,43 @@ def render_leak_map_view(snapshot: dict) -> None:
         else:
             st.info("No leaks match the active filters.")
 
-    st.divider()
+    with st.expander(f"Show details — Leak Locations Table ({len(filtered_leaks)})", expanded=False):
+        if not filtered_leaks:
+            st.info("No leaks match the active filters.")
+            return
 
-    section_header("Leak Locations Registry (Click a row to focus & zoom on map)", ["CODE", "LLM"])
-    if not filtered_leaks:
-        st.info("No leaks match the active filters.")
-        return
+        table_df = pd.DataFrame(
+            [
+                {
+                    "leak_id": lk["leak_id"],
+                    "pipe_segment_id": lk["pipe_segment_id"],
+                    "sector": lk["sector"],
+                    "location_name": lk["location_name"],
+                    "latitude": round(float(lk["latitude"]), 5),
+                    "longitude": round(float(lk["longitude"]), 5),
+                    "detected_at (Asia/Dubai)": format_dubai_time(lk["detected_at"]),
+                    "severity": lk["severity"],
+                    "estimated_loss_m3_per_hour": round(float(lk["estimated_loss_m3_per_hour"]), 1),
+                    "confidence": f"{float(lk['confidence']):.0%}",
+                    "status": lk["status"],
+                    "related_sensor_ids": lk["related_sensor_ids"],
+                    "ai_summary": lk["ai_summary"],
+                }
+                for lk in filtered_leaks
+            ]
+        )
 
-    table_df = pd.DataFrame(
-        [
-            {
-                "leak_id": lk["leak_id"],
-                "pipe_segment_id": lk["pipe_segment_id"],
-                "sector": lk["sector"],
-                "location_name": lk["location_name"],
-                "latitude": round(float(lk["latitude"]), 5),
-                "longitude": round(float(lk["longitude"]), 5),
-                "detected_at (Asia/Dubai)": format_dubai_time(lk["detected_at"]),
-                "severity": lk["severity"],
-                "estimated_loss_m3_per_hour": round(float(lk["estimated_loss_m3_per_hour"]), 1),
-                "confidence": f"{float(lk['confidence']):.0%}",
-                "status": lk["status"],
-                "related_sensor_ids": lk["related_sensor_ids"],
-                "ai_summary": lk["ai_summary"],
-            }
-            for lk in filtered_leaks
-        ]
-    )
-
-    selection = st.dataframe(
-        table_df,
-        width="stretch",
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key="leak_locations_table",
-    )
-    selected_rows = (selection or {}).get("selection", {}).get("rows", [])
-    if selected_rows:
-        chosen_lid = table_df.iloc[selected_rows[0]]["leak_id"]
-        if chosen_lid != st.session_state.get("selected_leak_id"):
-            st.session_state["selected_leak_id"] = chosen_lid
-            st.rerun()
+        selection = st.dataframe(
+            table_df,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="leak_locations_table",
+        )
+        selected_rows = (selection or {}).get("selection", {}).get("rows", [])
+        if selected_rows:
+            chosen_lid = table_df.iloc[selected_rows[0]]["leak_id"]
+            if chosen_lid != st.session_state.get("selected_leak_id"):
+                st.session_state["selected_leak_id"] = chosen_lid
+                st.rerun()

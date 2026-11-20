@@ -1,4 +1,4 @@
-"""SCADA Control Room header: system status, grid health, and live KPIs."""
+"""Clean SCADA header: 5 key operator metrics and active alerts."""
 import html
 import streamlit as st
 from config.constants import DEFAULT_SCADA_HOUR, RESERVOIR_FLOOR_PERCENT
@@ -17,18 +17,24 @@ def _compute_grid_health(telemetry_data: dict, feeds_data: dict, pending_count: 
     injection_count = sum(1 for a in feeds_data.get("sanitized_alerts", []) if a.get("injection_detected"))
     wq = feeds_data.get("water_quality", {})
     bloom_sev = str(wq.get("bloom_severity", "NONE")).upper()
-    res_pct = float(feeds_data.get("reservoir", {}).get("current_level_percent", 48.0))
+    res = feeds_data.get("reservoir", {})
+    res_pct = float(res.get("current_level_percent", 48.0))
+    eff_floor = float(res.get("safety_floor_percent", RESERVOIR_FLOOR_PERCENT * 100.0))
+    non_compliant = len(feeds_data.get("excluded_sectors", []))
 
     score -= leak_count * 20
     score -= quarantined_count * 6
     score -= injection_count * 12
+    score -= non_compliant * 25
+    if telemetry_data.get("telemetry_loss"):
+        score -= 35
     if bloom_sev == "CRITICAL":
         score -= 15
     elif bloom_sev == "MODERATE":
         score -= 10
     elif bloom_sev == "LOW":
         score -= 5
-    if res_pct < RESERVOIR_FLOOR_PERCENT * 100.0:
+    if res_pct < eff_floor:
         score -= 30
     if pending_count > 0:
         score -= 4
@@ -44,7 +50,7 @@ def _compute_grid_health(telemetry_data: dict, feeds_data: dict, pending_count: 
 
 
 def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
-    """Render top SCADA banner and real-time KPI row. Returns live snapshot dict for reuse."""
+    """Render clean banner, 5 operator KPIs, and active alerts. Returns live snapshot dict."""
     conn = get_db_connection()
     try:
         plant = conn.execute("SELECT * FROM plant_setpoints WHERE plant_id = 'DESAL-01';").fetchone()
@@ -58,17 +64,15 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     telemetry_data = read_network_telemetry(current_hour=display_hour)
     feeds_data = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=display_hour)
 
-    health_score, health_label = _compute_grid_health(telemetry_data, feeds_data, pending_count)
-    active_scenario_name = st.session_state.get("active_scenario_name", "Clean 24h Baseline")
+    _, health_label = _compute_grid_health(telemetry_data, feeds_data, pending_count)
+    active_scenario_name = st.session_state.get("active_scenario_name", "Clean Baseline")
 
     res = feeds_data.get("reservoir", {})
     res_pct = float(res.get("current_level_percent", 48.0))
-    res_vol = float(res.get("current_volume_ml", 240.0))
     eff_floor_pct = float(res.get("safety_floor_percent", 35.0))
     floor_banner = res.get("floor_banner", f"Reservoir floor: {eff_floor_pct:.1f}%")
     has_emergency = bool(res.get("has_active_emergency", False))
     plant_mld = float(plant["production_mld"]) if plant else 100.0
-    plant_max = float(plant["max_capacity_mld"]) if plant else 120.0
     plant_status = plant["status"] if plant else "ONLINE"
 
     tariffs = feeds_data.get("tariffs", [])
@@ -76,6 +80,9 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     is_peak = feeds_data.get("is_current_peak_tariff", True)
     v12_status = v12["status"] if v12 else "OPEN"
 
+    leaks = telemetry_data.get("leak_alerts", [])
+    quarantined = telemetry_data.get("quarantined_sensors", [])
+    leak_count = len(leaks)
     dubai_clock_str = now_local().strftime("%H:%M:%S")
 
     st.markdown(
@@ -83,66 +90,75 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
         <div class="scada-banner">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
                 <div>
-                    <div class="scada-title">AQUAGRID SCADA CONTROL ROOM — {html.escape(REGION_CONFIG['region_name'].upper())}</div>
+                    <div class="scada-title">AQUAGRID SCADA CONTROL ROOM</div>
                     <div class="scada-subtitle">
-                        Local Time ({html.escape(REGION_CONFIG['timezone'])}): <strong>{dubai_clock_str}</strong>
-                        &nbsp;|&nbsp; Active View: <strong>{html.escape(active_scenario_name)}</strong>
+                        {html.escape(REGION_CONFIG['region_name'])} · {dubai_clock_str}
+                        &nbsp;|&nbsp; {html.escape(active_scenario_name)}
                     </div>
                 </div>
-                <div style="text-align:right;">
-                    {status_badge(health_label)}
-                </div>
+                <div>{status_badge(health_label)}</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    # 5 Core Operator Values
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric(
-        "Grid Health",
-        f"{health_score}/100",
-        delta=health_label,
-        delta_color="normal" if health_score >= 85 else "inverse",
-    )
-    c2.metric(
-        "Reservoir RES-01",
+        "Reservoir",
         f"{res_pct:.1f}%",
-        delta=f"{res_vol:.0f} ML (Floor {eff_floor_pct:.1f}%)",
+        delta=f"Floor {eff_floor_pct:.1f}%",
         delta_color="normal" if res_pct >= eff_floor_pct else "inverse",
     )
-    c3.metric(
-        "DESAL-01 Output",
-        f"{plant_mld:.1f} MLD",
-        delta=f"{plant_status} / {plant_max:.0f} Max",
+    c2.metric(
+        "Plant Output",
+        f"{plant_mld:.0f} MLD",
+        delta=plant_status,
     )
-    c4.metric(
-        f"Tariff @ {display_hour:02d}:00",
+    c3.metric(
+        "Tariff",
         f"${curr_tariff:.2f}/kWh",
-        delta="PEAK WINDOW" if is_peak else "OFF-PEAK",
+        delta="PEAK" if is_peak else "OFF-PEAK",
         delta_color="inverse" if is_peak else "normal",
     )
-    c5.metric(
-        "Valve V-12",
-        v12_status,
-        delta="Sector 4 Main",
+    c4.metric(
+        "Active Leaks",
+        str(leak_count),
+        delta="Leak" if leak_count > 0 else "None",
+        delta_color="inverse" if leak_count > 0 else "off",
     )
-    c6.metric(
-        "Pending HITL",
+    c5.metric(
+        "Pending Approvals",
         str(pending_count),
-        delta="Action Required" if pending_count > 0 else "Queue Clear",
+        delta="Pending" if pending_count > 0 else "Clear",
         delta_color="inverse" if pending_count > 0 else "off",
     )
 
+    # Active Alerts (shown only when triggered; red = danger, orange = warning)
     if telemetry_data.get("telemetry_loss"):
         st.error(f"**{telemetry_data['telemetry_freshness']['banner']}**")
 
     wq_compliance = feeds_data.get("sector_water_quality_compliance", {})
     for wq_alert in wq_compliance.get("alerts", []):
-        st.error(wq_alert)
+        st.error(f"**{wq_alert}**")
+
+    if res_pct < eff_floor_pct:
+        st.error(f"**RESERVOIR LOW:** RES-01 at {res_pct:.1f}% (below {eff_floor_pct:.1f}% floor).")
 
     if has_emergency:
         st.warning(f"**{floor_banner}**")
+
+    for lk in leaks:
+        st.error(f"**CONFIRMED_PIPE_LEAK — {lk['junction_id']} ({lk['sector']}):** {lk['diagnostic']}")
+
+    if quarantined:
+        q_ids = ", ".join(q["sensor_id"] for q in quarantined)
+        st.warning(f"**QUARANTINED ({len(quarantined)}):** {q_ids}")
+
+    inj_alerts = [a for a in feeds_data.get("sanitized_alerts", []) if a.get("injection_detected")]
+    if inj_alerts:
+        st.error(f"**BLOCKED:** {len(inj_alerts)} prompt injection alert(s) quarantined before reaching AI.")
 
     return {
         "telemetry_data": telemetry_data,

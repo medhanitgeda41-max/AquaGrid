@@ -60,38 +60,36 @@ def render_ai_suggestions_and_run_log() -> None:
     else:
         st.caption("No grid-wide suggestions recorded in the latest run.")
 
-    st.divider()
+    with st.expander(f"Show details — AI Run Log ({len(run_rows)} runs)", expanded=False):
+        log_records = []
+        for r in run_rows:
+            try:
+                findings = json.loads(r["findings_json"] or "[]")
+                findings_txt = "; ".join(
+                    f"{f.get('classification', f.get('type', 'Finding'))}: {f.get('target')} ({float(f.get('confidence', 0)):.0%})"
+                    for f in findings
+                )
+            except json.JSONDecodeError:
+                findings_txt = str(r["findings_json"])
 
-    section_header("AI Run Log (2-Minute Scheduled & Scenario Runs)", ["LLM", "CODE"])
-    log_records = []
-    for r in run_rows:
-        try:
-            findings = json.loads(r["findings_json"] or "[]")
-            findings_txt = "; ".join(
-                f"{f.get('classification', f.get('type', 'Finding'))}: {f.get('target')} ({float(f.get('confidence', 0)):.0%})"
-                for f in findings
-            )
-        except json.JSONDecodeError:
-            findings_txt = str(r["findings_json"])
+            try:
+                suggs = json.loads(r["suggestions_json"] or "[]")
+                suggs_txt = " | ".join(str(x) for x in suggs[:3])
+            except json.JSONDecodeError:
+                suggs_txt = str(r["suggestions_json"])
 
-        try:
-            suggs = json.loads(r["suggestions_json"] or "[]")
-            suggs_txt = " | ".join(str(x) for x in suggs[:3])
-        except json.JSONDecodeError:
-            suggs_txt = str(r["suggestions_json"])
+            rec = {
+                "Run ID": r["run_id"],
+                "Timestamp (Asia/Dubai)": format_dubai_time(r["run_at"]),
+                "Trigger": r["trigger_source"],
+                "Status": r["status"],
+                "Inputs Summary": r["inputs_summary"],
+                "Findings": findings_txt,
+                "Suggestions": suggs_txt,
+                "Error": r["error_message"] or "-",
+            }
+            if show_tech:
+                rec["Provider"] = r["llm_provider"]
+            log_records.append(rec)
 
-        rec = {
-            "Run ID": r["run_id"],
-            "Timestamp (Asia/Dubai)": format_dubai_time(r["run_at"]),
-            "Trigger": r["trigger_source"],
-            "Status": r["status"],
-            "Inputs Summary": r["inputs_summary"],
-            "Findings": findings_txt,
-            "Suggestions": suggs_txt,
-            "Error": r["error_message"] or "-",
-        }
-        if show_tech:
-            rec["Provider"] = r["llm_provider"]
-        log_records.append(rec)
-
-    st.dataframe(pd.DataFrame(log_records), width="stretch", hide_index=True, height=340)
+        st.dataframe(pd.DataFrame(log_records), width="stretch", hide_index=True, height=340)

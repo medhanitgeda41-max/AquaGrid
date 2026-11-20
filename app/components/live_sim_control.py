@@ -1,8 +1,8 @@
-"""Real-Time (2-Minute) & Optional Accelerated Live Simulation Controls + Telemetry Freshness Judge Controls."""
+"""Compact Live Simulation Controls & Live Check Result (extra controls tucked in Show details)."""
 import html
 import streamlit as st
 
-from config.constants import DEFAULT_SCADA_HOUR, RESERVOIR_FLOOR_PERCENT
+from config.constants import DEFAULT_SCADA_HOUR
 from config.region_config import REGION_CONFIG, now_local
 from guards.telemetry_freshness import (
     check_db_telemetry_freshness,
@@ -10,7 +10,6 @@ from guards.telemetry_freshness import (
     restore_telemetry_feed,
 )
 from simulator import get_simulator, realistic_daily_demand_mld, tariff_for_hour
-from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
 
 
@@ -21,12 +20,12 @@ def _format_countdown(seconds: int) -> str:
 
 @st.fragment(run_every=int(REGION_CONFIG["ui_refresh_seconds"]))
 def _render_live_sim_feed() -> None:
-    """Auto-refreshing live monitor showing non-duplicated live values, freshness status, and alerts."""
+    """Auto-refreshing compact live status strip & latest live check result (no duplicate KPIs)."""
     sim = get_simulator()
     dt_now = now_local()
 
     last_dt = sim.last_update_at
-    last_update_str = last_dt.strftime("%H:%M:%S") if last_dt else "Initializing..."
+    last_update_str = last_dt.strftime("%H:%M:%S") if last_dt else "Starting..."
     countdown_str = "PAUSED" if sim.is_feed_paused else _format_countdown(sim.seconds_until_next_update())
 
     summary = sim.last_tick_summary
@@ -35,120 +34,75 @@ def _render_live_sim_feed() -> None:
     is_accel = not sim.real_time_clock
 
     telemetry_check = read_network_telemetry(current_hour=sim_hour, log_audit=False)
-    feeds_check = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=sim_hour, log_audit=False)
     freshness = telemetry_check.get("telemetry_freshness") or check_db_telemetry_freshness(current_hour=sim_hour)
     is_loss = bool(freshness.get("is_telemetry_loss", False))
 
-    res = feeds_check.get("reservoir", {})
-    res_pct = float(res.get("current_level_percent", 48.0))
-    res_vol = float(res.get("current_volume_ml", 240.0))
-    plant_mld = float(feeds_check.get("current_plant_output_mld", 100.0))
-    demand_mld = (
-        float(summary["demand_mld"])
-        if summary
-        else realistic_daily_demand_mld(dt_now)
-    )
-    curr_rate, is_peak, tier_label = tariff_for_hour(sim_hour)
-
-    leaks = telemetry_check.get("leak_alerts", [])
-    quarantined = telemetry_check.get("quarantined_sensors", [])
-    injected_fault = summary.get("injected_fault") if summary else None
+    demand_mld = float(summary["demand_mld"]) if summary else realistic_daily_demand_mld(dt_now)
+    _, _, tier_label = tariff_for_hour(sim_hour)
     ai_err = sim.last_ai_error
+    ai_run = (summary or {}).get("ai_run") or {}
+    raised = (summary or {}).get("raised_alerts") or []
 
-    mode_badge = (
-        '<span class="ag-badge ag-badge-danger">FEED PAUSED</span>'
-        if sim.is_feed_paused
-        else (
-            '<span class="ag-badge ag-badge-warn">DEMO (5s)</span>'
-            if is_accel
-            else '<span class="ag-badge ag-badge-ok">REAL-TIME (2m)</span>'
-        )
-    )
+    if sim.is_feed_paused or is_loss:
+        mode_badge = '<span class="ag-badge ag-badge-danger">FEED PAUSED</span>'
+        card_cls = "scada-card-alert"
+    elif is_accel:
+        mode_badge = '<span class="ag-badge ag-badge-warn">DEMO (5s)</span>'
+        card_cls = "scada-card-ok"
+    else:
+        mode_badge = '<span class="ag-badge ag-badge-ok">REAL-TIME (2m)</span>'
+        card_cls = "scada-card-ok"
+
     loss_inline = (
         f' &nbsp;|&nbsp; <span class="ag-badge ag-badge-danger">{html.escape(freshness["banner"])}</span>'
         if is_loss
         else ""
     )
-    card_cls = "scada-card-alert" if is_loss else "scada-card-ok"
+
+    # Concise 1-line live check result
+    if raised:
+        check_line = f"Live check: {len(raised)} alert(s) — {raised[0]}"
+    elif ai_run.get("run_id"):
+        check_line = (
+            f"Live check OK · Demand {demand_mld:.0f} MLD ({tier_label}) · "
+            f"AI run #{ai_run['run_id']} ({ai_run.get('status', 'OK')})"
+        )
+    else:
+        check_line = f"Live check OK · Demand {demand_mld:.0f} MLD ({tier_label})"
 
     st.markdown(
         f"""
-        <div class="{card_cls}" style="margin-top:0.5rem; padding:0.65rem 1rem;">
+        <div class="{card_cls}" style="margin-top:0.35rem; padding:0.65rem 1rem;">
             <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
                 <div>{mode_badge} <strong>Batch #{tick_num}</strong>{loss_inline}</div>
-                <div class="ag-mono" style="font-size:0.84rem; color:#7CE8FF;">
+                <div class="ag-mono" style="font-size:0.82rem; color:#CBD5E1;">
                     Last update: <strong>{last_update_str}</strong> &nbsp;|&nbsp;
                     Next update in <strong>{countdown_str}</strong>
                 </div>
+            </div>
+            <div style="margin-top:0.3rem; font-size:0.84rem; color:#CBD5E1;">
+                {html.escape(check_line)}
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric(
-        "DESAL-01 vs Demand",
-        f"{plant_mld:.0f} MLD",
-        delta=f"Demand {demand_mld:.1f} MLD | ${curr_rate:.2f} {tier_label}",
-    )
-    m2.metric(
-        "Active Leaks",
-        str(len(leaks)),
-        delta="Alert!" if leaks else "Clear",
-        delta_color="inverse" if leaks else "off",
-    )
-    m3.metric(
-        "Quarantined Sensors",
-        str(len(quarantined)),
-        delta="Fault Detected" if quarantined else "All Healthy",
-        delta_color="inverse" if quarantined else "off",
-    )
-
     if ai_err:
-        st.error(f"**AI Agent Error:** {ai_err}")
-
-    wq_compliance = feeds_check.get("sector_water_quality_compliance", {})
-    for wq_alert in wq_compliance.get("alerts", []):
-        st.error(wq_alert)
-
-    eff_floor_pct = float(res.get("safety_floor_percent", RESERVOIR_FLOOR_PERCENT * 100.0))
-    if res.get("has_active_emergency"):
-        st.warning(f"**{res.get('floor_banner', '')}**")
-
-    if res_pct < eff_floor_pct:
-        st.error(
-            f"**RESERVOIR ALERT:** Strategic Reservoir RES-01 dropped to **{res_pct:.2f}% ({res_vol:.1f} ML)** — "
-            f"below the mandatory **{eff_floor_pct:.1f}% safety floor**!"
-        )
-
-    if leaks:
-        for lk in leaks:
-            st.error(f"**LEAK CONFIRMED — {lk['junction_id']} ({lk['sector']}):** {lk['diagnostic']}")
-
-    if quarantined:
-        for qs in quarantined:
-            st.warning(
-                f"**SENSOR QUARANTINED — {qs['sensor_id']} ({qs['junction_id']}, {qs['sector']}):** "
-                f"{'; '.join(qs['reasons'])}"
-            )
-
-    if injected_fault and not leaks and not quarantined:
-        st.info(f"**LIVE EVENT:** {injected_fault['type']} on {injected_fault['target']}: {injected_fault['details']}")
+        st.error(f"**AI Check Error:** {ai_err}")
 
 
 def render_live_sim_controls() -> bool:
-    """Render Live Simulation ON/OFF, Demo accelerated toggle, fault chance, and telemetry feed judge controls."""
+    """Render compact Live Simulation toggle bar; hide fault slider & feed controls in Show details."""
     sim = get_simulator()
 
-    c_toggle, c_demo, c_prob = st.columns([1.1, 1.2, 1.4])
+    c_toggle, c_demo, c_spacer = st.columns([1.2, 1.3, 2.5])
     with c_toggle:
         live_on = st.toggle(
             "Live Simulation: ON/OFF",
             value=False,
             key="live_sim_toggle",
         )
-
     with c_demo:
         demo_accel = st.toggle(
             "Demo mode (accelerated)",
@@ -157,7 +111,7 @@ def render_live_sim_controls() -> bool:
             disabled=not live_on,
         )
 
-    with c_prob:
+    with st.expander("Show details — Feed & Simulator Controls", expanded=False):
         fault_prob = st.slider(
             "Fault Chance / 2-min Cycle",
             min_value=0.0,
@@ -167,33 +121,31 @@ def render_live_sim_controls() -> bool:
             key="live_sim_fault_prob",
             disabled=not live_on,
         )
+        jc1, jc2, jc3 = st.columns(3)
+        with jc1:
+            if st.button("Stop telemetry feed", key="btn_stop_feed", width="stretch"):
+                sim.pause_feed()
+                st.session_state["telemetry_restored_banner"] = None
+                st.rerun()
+        with jc2:
+            if st.button("Fast-forward 10 minutes", key="btn_ff_10min", width="stretch"):
+                sim.pause_feed()
+                fast_forward_telemetry_age(minutes=10)
+                st.session_state["telemetry_restored_banner"] = None
+                st.rerun()
+        with jc3:
+            if st.button("Restore feed", key="btn_restore_feed", width="stretch"):
+                sim.resume_feed()
+                res_hour = sim.current_hour if live_on else DEFAULT_SCADA_HOUR
+                restored = restore_telemetry_feed(current_hour=res_hour)
+                st.session_state["telemetry_restored_banner"] = restored["message"]
+                st.rerun()
 
     sim.configure_mode(
         demo_accelerated=bool(demo_accel),
         fault_probability=float(fault_prob),
         run_ai_after_batch=True,
     )
-
-    # Judge Controls for U-5.5 Telemetry Feed Outage & Restoration
-    jc1, jc2, jc3 = st.columns(3)
-    with jc1:
-        if st.button("Stop telemetry feed", key="btn_stop_feed", width="stretch"):
-            sim.pause_feed()
-            st.session_state["telemetry_restored_banner"] = None
-            st.rerun()
-    with jc2:
-        if st.button("Fast-forward 10 minutes", key="btn_ff_10min", width="stretch"):
-            sim.pause_feed()
-            fast_forward_telemetry_age(minutes=10)
-            st.session_state["telemetry_restored_banner"] = None
-            st.rerun()
-    with jc3:
-        if st.button("Restore feed", key="btn_restore_feed", width="stretch"):
-            sim.resume_feed()
-            res_hour = sim.current_hour if live_on else DEFAULT_SCADA_HOUR
-            restored = restore_telemetry_feed(current_hour=res_hour)
-            st.session_state["telemetry_restored_banner"] = restored["message"]
-            st.rerun()
 
     restored_msg = st.session_state.get("telemetry_restored_banner")
     if restored_msg:
@@ -206,8 +158,5 @@ def render_live_sim_controls() -> bool:
     else:
         if sim.is_running:
             sim.stop()
-        freshness_off = check_db_telemetry_freshness()
-        if freshness_off["is_telemetry_loss"]:
-            st.error(f"**{freshness_off['banner']}**")
 
     return bool(live_on)

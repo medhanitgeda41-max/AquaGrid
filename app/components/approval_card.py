@@ -1,4 +1,4 @@
-"""Human-in-the-Loop (HITL) Approval Card with Just-in-Time Safety Re-Check."""
+"""Clean Pending Approvals panel with 1-click Approve / Reject and collapsed details."""
 import html
 import pandas as pd
 import streamlit as st
@@ -10,7 +10,7 @@ from components.badges import format_dubai_time, section_header, status_badge
 def _format_actuator_value(action_type: str, value: float) -> str:
     """Format actuator values cleanly for control-room display."""
     if action_type in ("CLOSE_VALVE", "OPEN_VALVE"):
-        return "OPEN (1.0)" if float(value) >= 0.5 else "CLOSED (0.0)"
+        return "OPEN" if float(value) >= 0.5 else "CLOSED"
     if action_type == "ISOLATE_AND_FLUSH":
         return f"{float(value):.2f} mg/L" if float(value) > 0 else "ISOLATE_AND_FLUSH"
     return f"{float(value):.1f} MLD"
@@ -34,11 +34,8 @@ def _render_feedback_banner() -> None:
 
 
 def render_approval_card(key_prefix: str = "main", show_history: bool = True) -> None:
-    """Render all PENDING actions from pending_actions with [Approve] and [Reject] buttons."""
-    section_header(
-        "Human-in-the-Loop (HITL) Approval Queue",
-        ["HUMAN", "CODE"],
-    )
+    """Render PENDING actions with Approve / Reject buttons; hide history & extra inputs in Show details."""
+    section_header("Pending Approvals")
     _render_feedback_banner()
 
     conn = get_db_connection()
@@ -54,20 +51,18 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
 
     if not pending_rows:
         st.markdown(
-            """
-            <div class="scada-card-ok">
-                <strong>No PENDING physical actuator actions.</strong>
-            </div>
-            """,
+            '<div class="scada-card-ok"><strong>No pending approvals.</strong></div>',
             unsafe_allow_html=True,
         )
     else:
-        operator_name = st.text_input(
-            "Control Room Operator Signature",
-            value=st.session_state.get("operator_signature", "Lead_Operator_SCADA"),
-            key=f"{key_prefix}_operator_name",
-        )
-        st.session_state["operator_signature"] = operator_name
+        operator_name = st.session_state.get("operator_signature", "Lead_Operator_SCADA")
+        with st.expander("Show details — Operator Signature", expanded=False):
+            operator_name = st.text_input(
+                "Operator Signature",
+                value=operator_name,
+                key=f"{key_prefix}_operator_name",
+            )
+            st.session_state["operator_signature"] = operator_name
 
         for row in pending_rows:
             action_id = int(row["id"])
@@ -76,7 +71,6 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
             curr_fmt = _format_actuator_value(action_type, float(row["current_value"]))
             prop_fmt = _format_actuator_value(action_type, float(row["proposed_value"]))
             rationale = row["rationale"]
-            created_at = format_dubai_time(row["created_at"])
             prov = row["provenance"] if "provenance" in row.keys() and row["provenance"] else "AGENT_ANALYSIS"
             prov_ref = row["provenance_ref"] if "provenance_ref" in row.keys() and row["provenance_ref"] else ""
             prov_text = f"{prov} ({prov_ref})" if prov_ref else prov
@@ -85,36 +79,21 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
             st.markdown(
                 f"""
                 <div class="scada-card-pending">
-                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
-                        <div>
-                            {status_badge("PENDING")}
-                            <span class="ag-badge {prov_badge_cls}">SOURCE: {html.escape(prov_text)}</span>
-                            <strong>Action #{action_id}:</strong>
-                            <span class="ag-mono">{html.escape(action_type)} &rarr; {html.escape(target_id)}</span>
-                        </div>
-                        <div style="font-size:0.8rem; color:#CBD5E1;">Staged: {html.escape(str(created_at))}</div>
+                    <div>
+                        {status_badge("PENDING")}
+                        <span class="ag-badge {prov_badge_cls}">{html.escape(prov_text)}</span>
+                        <strong>#{action_id}</strong>
+                        <span class="ag-mono">{html.escape(action_type)} {html.escape(target_id)}: {html.escape(curr_fmt)} &rarr; {html.escape(prop_fmt)}</span>
                     </div>
-                    <div style="margin-top:0.5rem; font-size:0.9rem;">
-                        <strong>Proposed Change:</strong>
-                        <span class="ag-mono">{html.escape(curr_fmt)} &rarr; {html.escape(prop_fmt)}</span>
-                    </div>
-                    <div style="margin-top:0.35rem; font-size:0.87rem;">
-                        <strong>Rationale:</strong> {html.escape(str(rationale))}
+                    <div style="margin-top:0.35rem; font-size:0.86rem; color:#CBD5E1;">
+                        {html.escape(str(rationale))}
                     </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-            c_reason, c_approve, c_reject = st.columns([2.4, 1.0, 1.0])
-            with c_reason:
-                reject_reason = st.text_input(
-                    "Rejection reason (optional)",
-                    value="Operator declined physical actuation",
-                    key=f"{key_prefix}_rej_reason_{action_id}",
-                    label_visibility="collapsed",
-                    placeholder="Optional rejection reason...",
-                )
+            c_approve, c_reject, c_spacer = st.columns([1.0, 1.0, 2.5])
             with c_approve:
                 if st.button(
                     f"Approve #{action_id}",
@@ -131,23 +110,17 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                         detail = res.get("details") or res.get("message") or "Executed."
                         st.session_state["last_hitl_feedback"] = {
                             "kind": "success",
-                            "message": (
-                                f"Action #{action_id} ({action_type} {target_id}) EXECUTED "
-                                f"by {res.get('approver')}: {detail}"
-                            ),
+                            "message": f"Action #{action_id} ({action_type} {target_id}) EXECUTED: {detail}",
                         }
                     elif res_status in ("CANCELLED_BY_SAFETY_RECHECK", "CANCELLED_STALE_TELEMETRY"):
                         st.session_state["last_hitl_feedback"] = {
                             "kind": "error",
-                            "message": (
-                                f"Action #{action_id} -> {res_status}. "
-                                f"Reason: {res.get('reason')}"
-                            ),
+                            "message": f"Action #{action_id} -> {res_status}: {res.get('reason')}",
                         }
                     else:
                         st.session_state["last_hitl_feedback"] = {
                             "kind": "warning",
-                            "message": f"Action #{action_id} returned {res_status}: {res.get('message', res.get('reason', ''))}",
+                            "message": f"Action #{action_id} -> {res_status}: {res.get('message', res.get('reason', ''))}",
                         }
                     st.rerun()
             with c_reject:
@@ -158,33 +131,30 @@ def render_approval_card(key_prefix: str = "main", show_history: bool = True) ->
                 ):
                     res = execute_human_rejection(
                         action_id=action_id,
-                        rejection_reason=reject_reason.strip() or "Operator declined action",
+                        rejection_reason="Operator declined physical actuation",
                         approver=operator_name.strip() or "ControlRoom_Operator",
                     )
                     st.session_state["last_hitl_feedback"] = {
                         "kind": "warning",
-                        "message": (
-                            f"Action #{action_id} ({action_type} {target_id}) REJECTED "
-                            f"by {res.get('approver')}. Reason: {res.get('reason')}"
-                        ),
+                        "message": f"Action #{action_id} ({action_type} {target_id}) REJECTED by {res.get('approver')}.",
                     }
                     st.rerun()
 
     if show_history and resolved_rows:
-        st.markdown("#### Recently Resolved Actions")
-        hist_df = pd.DataFrame(
-            [
-                {
-                    "ID": r["id"],
-                    "Action": r["action_type"],
-                    "Target": r["target_id"],
-                    "Current": _format_actuator_value(r["action_type"], float(r["current_value"])),
-                    "Proposed": _format_actuator_value(r["action_type"], float(r["proposed_value"])),
-                    "Status": r["status"],
-                    "Approver": r["approver"] or "-",
-                    "Executed At (Asia/Dubai)": format_dubai_time(r["executed_at"]),
-                }
-                for r in resolved_rows
-            ]
-        )
-        st.dataframe(hist_df, width="stretch", hide_index=True)
+        with st.expander(f"Show details — Resolved Actions ({len(resolved_rows)})", expanded=False):
+            hist_df = pd.DataFrame(
+                [
+                    {
+                        "ID": r["id"],
+                        "Action": r["action_type"],
+                        "Target": r["target_id"],
+                        "Current": _format_actuator_value(r["action_type"], float(r["current_value"])),
+                        "Proposed": _format_actuator_value(r["action_type"], float(r["proposed_value"])),
+                        "Status": r["status"],
+                        "Approver": r["approver"] or "-",
+                        "Time": format_dubai_time(r["executed_at"]),
+                    }
+                    for r in resolved_rows
+                ]
+            )
+            st.dataframe(hist_df, width="stretch", hide_index=True)

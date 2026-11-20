@@ -167,22 +167,18 @@ def _build_reservoir_chart(
 
 
 def render_telemetry_view(snapshot: dict) -> None:
-    """Render Reservoir 35% floor chart, Tariff/Demand view, Sector telemetry, and Valve Grid."""
+    """Render Reservoir safety floor chart up front; tuck extra charts, tables & valves in Show details."""
     telemetry_data = snapshot["telemetry_data"]
     feeds_data = snapshot["feeds_data"]
     plant_mld = snapshot["plant_mld"]
     agent_result = st.session_state.get("last_agent_result")
     active_scenario = st.session_state.get("active_scenario")
 
-    left_col, right_col = st.columns([1.15, 1.05])
+    section_header("Reservoir Level vs. Safety Floor")
+    chart = _build_reservoir_chart(feeds_data, plant_mld, agent_result, active_scenario)
+    st.altair_chart(chart, width="stretch")
 
-    with left_col:
-        section_header("Strategic Reservoir Trajectory vs. 35% Safety Floor", ["CODE"])
-        chart = _build_reservoir_chart(feeds_data, plant_mld, agent_result, active_scenario)
-        st.altair_chart(chart, width="stretch")
-
-    with right_col:
-        section_header("24h Electricity Tariff & Water Demand Forecast", ["CODE"])
+    with st.expander("Show details — 24h Tariff & Demand Charts", expanded=False):
         conn = get_db_connection()
         try:
             td_rows = conn.execute(
@@ -212,201 +208,149 @@ def render_telemetry_view(snapshot: dict) -> None:
             alt.Chart(td_df)
             .mark_bar(cornerRadiusTopLeft=2, cornerRadiusTopRight=2, opacity=0.92)
             .encode(
-                x=alt.X(
-                    "hour_label:N",
-                    sort=None,
-                    title="Hour of Day",
-                    axis=alt.Axis(labelAngle=-45, labelFontSize=10),
-                ),
-                y=alt.Y(
-                    "tariff_rate:Q",
-                    title="Electricity Rate ($/kWh)",
-                    scale=alt.Scale(domain=[0.0, 0.55]),
-                    axis=alt.Axis(format="$.2f", titlePadding=10),
-                ),
+                x=alt.X("hour_label:N", sort=None, title="Hour", axis=alt.Axis(labelAngle=-45, labelFontSize=10)),
+                y=alt.Y("tariff_rate:Q", title="Rate ($/kWh)", scale=alt.Scale(domain=[0.0, 0.55]), axis=alt.Axis(format="$.2f")),
                 color=alt.Color(
                     "tier:N",
-                    scale=alt.Scale(
-                        domain=["PEAK (14:00-18:00, $0.48/kWh)", "Off/Mid-Peak"],
-                        range=["#EF4444", "#38BDF8"],
-                    ),
+                    scale=alt.Scale(domain=["PEAK (14:00-18:00, $0.48/kWh)", "Off/Mid-Peak"], range=["#EF4444", "#64748B"]),
                     legend=alt.Legend(orient="top", title=None),
                 ),
                 tooltip=[
                     alt.Tooltip("hour_label:N", title="Hour"),
                     alt.Tooltip("tariff_rate:Q", title="Rate ($/kWh)", format="$.3f"),
                     alt.Tooltip("demand_mld:Q", title="Demand (MLD)", format=".1f"),
-                    alt.Tooltip("tier:N", title="Tariff Tier"),
+                    alt.Tooltip("tier:N", title="Tier"),
                 ],
             )
-            .properties(height=210, padding={"left": 10, "top": 6, "right": 10, "bottom": 6})
+            .properties(height=210)
         )
 
         max_demand = max(120.0, float(td_df["demand_mld"].max()) * 1.15)
         demand_line = (
             alt.Chart(td_df)
-            .mark_line(color="#A78BFA", strokeWidth=2.5, point=alt.OverlayMarkDef(size=45, color="#C4B5FD"))
+            .mark_line(color="#94A3B8", strokeWidth=2.4, point=alt.OverlayMarkDef(size=40, color="#E2E8F0"))
             .encode(
-                x=alt.X(
-                    "hour_label:N",
-                    sort=None,
-                    title="Hour of Day",
-                    axis=alt.Axis(labelAngle=-45, labelFontSize=10),
-                ),
-                y=alt.Y(
-                    "demand_mld:Q",
-                    title="Demand (MLD)",
-                    scale=alt.Scale(domain=[0.0, max_demand], nice=True),
-                    axis=alt.Axis(titleFontSize=12, labelFontSize=11, titlePadding=10),
-                ),
+                x=alt.X("hour_label:N", sort=None, title="Hour", axis=alt.Axis(labelAngle=-45, labelFontSize=10)),
+                y=alt.Y("demand_mld:Q", title="Demand (MLD)", scale=alt.Scale(domain=[0.0, max_demand], nice=True)),
                 tooltip=[
                     alt.Tooltip("hour_label:N", title="Hour"),
                     alt.Tooltip("demand_mld:Q", title="Demand (MLD)", format=".1f"),
-                    alt.Tooltip("tariff_rate:Q", title="Rate ($/kWh)", format="$.3f"),
                 ],
             )
-            .properties(height=210, padding={"left": 10, "top": 10, "right": 10, "bottom": 6})
+            .properties(height=210)
         )
+        t_col1, t_col2 = st.columns(2)
+        with t_col1:
+            st.altair_chart(tariff_bars, width="stretch")
+        with t_col2:
+            st.altair_chart(demand_line, width="stretch")
 
-        st.altair_chart(tariff_bars, width="stretch")
-        st.altair_chart(demand_line, width="stretch")
+    with st.expander("Show details — Junction Pressures & Sensor Quarantine Table", expanded=False):
+        p_col, d_col = st.columns([1.15, 1.05])
+        with p_col:
+            conn = get_db_connection()
+            try:
+                p_rows = conn.execute(
+                    """
+                    SELECT sensor_id, junction_id, sector, value, status
+                    FROM telemetry
+                    WHERE hour = ? AND sensor_id LIKE 'P-%'
+                    ORDER BY sensor_id ASC;
+                    """,
+                    (DEFAULT_SCADA_HOUR,),
+                ).fetchall()
+            finally:
+                conn.close()
 
-    st.divider()
+            quarantined_ids = {s["sensor_id"] for s in telemetry_data.get("quarantined_sensors", [])}
+            leak_jids = {a["junction_id"] for a in telemetry_data.get("leak_alerts", [])}
+            p_df = pd.DataFrame(
+                [
+                    {
+                        "junction": r["junction_id"],
+                        "sensor": r["sensor_id"],
+                        "sector": r["sector"],
+                        "pressure_psi": float(r["value"]),
+                        "state": (
+                            "CONFIRMED_LEAK"
+                            if r["junction_id"] in leak_jids
+                            else ("QUARANTINED" if r["sensor_id"] in quarantined_ids else "NORMAL")
+                        ),
+                    }
+                    for r in p_rows
+                ]
+            )
+            p_chart = (
+                alt.Chart(p_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("junction:N", sort=None, title="Junction", axis=alt.Axis(labelAngle=-45)),
+                    y=alt.Y("pressure_psi:Q", scale=alt.Scale(domain=[0, 75]), title="Pressure (psi)"),
+                    color=alt.Color(
+                        "state:N",
+                        scale=alt.Scale(domain=["NORMAL", "QUARANTINED", "CONFIRMED_LEAK"], range=["#10B981", "#F59E0B", "#EF4444"]),
+                        legend=alt.Legend(orient="top", title=None),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("junction:N", title="Junction"),
+                        alt.Tooltip("sensor:N", title="Sensor"),
+                        alt.Tooltip("sector:N", title="Sector"),
+                        alt.Tooltip("pressure_psi:Q", title="Pressure (psi)", format=".1f"),
+                        alt.Tooltip("state:N", title="State"),
+                    ],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(p_chart, width="stretch")
 
-    p_col, d_col = st.columns([1.15, 1.05])
+        with d_col:
+            quarantined = telemetry_data.get("quarantined_sensors", [])
+            if quarantined:
+                rows_html = []
+                for q in quarantined:
+                    reason_text = "; ".join(q.get("reasons", []))
+                    rows_html.append(
+                        f"<tr>"
+                        f"<td class='ag-mono' style='white-space:nowrap;'><strong>{html.escape(str(q['sensor_id']))}</strong></td>"
+                        f"<td style='white-space:nowrap;'>{html.escape(str(q['junction_id']))}</td>"
+                        f"<td style='white-space:nowrap;'>{html.escape(str(q['sector']))}</td>"
+                        f"<td class='ag-mono' style='white-space:nowrap;'>{html.escape(str(q['last_reading']))} {html.escape(str(q['unit']))}</td>"
+                        f"<td>{html.escape(reason_text)}</td>"
+                        f"</tr>"
+                    )
+                st.markdown(
+                    f"""
+                    <table class="scada-table">
+                        <thead>
+                            <tr><th>Sensor</th><th>Junction</th><th>Sector</th><th>Reading</th><th>Reason</th></tr>
+                        </thead>
+                        <tbody>{"".join(rows_html)}</tbody>
+                    </table>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.success("All sensors healthy.")
 
-    with p_col:
-        section_header("Network Junction Pressures at 14:00 (Sector 1–4)", ["CODE"])
+    with st.expander("Show details — Isolation Valves (V-01 to V-20)", expanded=False):
         conn = get_db_connection()
         try:
-            p_rows = conn.execute(
-                """
-                SELECT sensor_id, junction_id, sector, value, status
-                FROM telemetry
-                WHERE hour = ? AND sensor_id LIKE 'P-%'
-                ORDER BY sensor_id ASC;
-                """,
-                (DEFAULT_SCADA_HOUR,),
+            valve_rows = conn.execute(
+                "SELECT valve_id, sector, status, last_updated FROM valves ORDER BY valve_id ASC;"
             ).fetchall()
         finally:
             conn.close()
 
-        quarantined_ids = {s["sensor_id"] for s in telemetry_data.get("quarantined_sensors", [])}
-        leak_jids = {a["junction_id"] for a in telemetry_data.get("leak_alerts", [])}
-        p_df = pd.DataFrame(
-            [
-                {
-                    "junction": r["junction_id"],
-                    "sensor": r["sensor_id"],
-                    "sector": r["sector"],
-                    "pressure_psi": float(r["value"]),
-                    "state": (
-                        "CONFIRMED_LEAK"
-                        if r["junction_id"] in leak_jids
-                        else ("QUARANTINED" if r["sensor_id"] in quarantined_ids else "NORMAL")
-                    ),
-                }
-                for r in p_rows
-            ]
-        )
-        p_chart = (
-            alt.Chart(p_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("junction:N", sort=None, title="Junction ID", axis=alt.Axis(labelAngle=-45)),
-                y=alt.Y("pressure_psi:Q", scale=alt.Scale(domain=[0, 75]), title="Pressure (psi)"),
-                color=alt.Color(
-                    "state:N",
-                    scale=alt.Scale(
-                        domain=["NORMAL", "QUARANTINED", "CONFIRMED_LEAK"],
-                        range=["#38BDF8", "#F59E0B", "#EF4444"],
-                    ),
-                    legend=alt.Legend(orient="top", title=None),
-                ),
-                tooltip=[
-                    alt.Tooltip("junction:N", title="Junction"),
-                    alt.Tooltip("sensor:N", title="Sensor"),
-                    alt.Tooltip("sector:N", title="Sector"),
-                    alt.Tooltip("pressure_psi:Q", title="Pressure (psi)", format=".1f"),
-                    alt.Tooltip("state:N", title="State"),
-                ],
-            )
-            .properties(height=280)
-        )
-        st.altair_chart(p_chart, width="stretch")
-
-    with d_col:
-        section_header("Leak & Sensor Quarantine Diagnostics", ["CODE"])
-        leaks = telemetry_data.get("leak_alerts", [])
-        quarantined = telemetry_data.get("quarantined_sensors", [])
-
-        if leaks:
-            for lk in leaks:
-                st.error(
-                    f"**CONFIRMED PIPE LEAK — {lk['junction_id']} ({lk['sector']})**\n\n"
-                    f"{lk['diagnostic']}"
+        cols = st.columns(5)
+        for idx, v in enumerate(valve_rows):
+            with cols[idx % 5]:
+                st.markdown(
+                    f"""
+                    <div class="scada-card" style="text-align:center; padding:0.55rem;">
+                        <div style="font-weight:700; font-size:0.9rem;">{v['valve_id']}</div>
+                        <div style="font-size:0.75rem; color:#94A3B8; margin-bottom:0.3rem;">{v['sector']}</div>
+                        {status_badge(v['status'])}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-        else:
-            st.success("No active hydraulic pipe leak signatures detected.")
-
-        if quarantined:
-            st.warning(f"{len(quarantined)} sensor(s) quarantined:")
-            rows_html = []
-            for q in quarantined:
-                reason_text = "; ".join(q.get("reasons", []))
-                rows_html.append(
-                    f"<tr>"
-                    f"<td class='ag-mono' style='white-space:nowrap;'><strong>{html.escape(str(q['sensor_id']))}</strong></td>"
-                    f"<td style='white-space:nowrap;'>{html.escape(str(q['junction_id']))}</td>"
-                    f"<td style='white-space:nowrap;'>{html.escape(str(q['sector']))}</td>"
-                    f"<td class='ag-mono' style='white-space:nowrap;'>{html.escape(str(q['last_reading']))} {html.escape(str(q['unit']))}</td>"
-                    f"<td style='min-width:220px;'>{html.escape(reason_text)}</td>"
-                    f"</tr>"
-                )
-            st.markdown(
-                f"""
-                <table class="scada-table">
-                    <thead>
-                        <tr>
-                            <th>Sensor</th>
-                            <th>Junction</th>
-                            <th>Sector</th>
-                            <th>Reading</th>
-                            <th>Quarantine Reason</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {"".join(rows_html)}
-                    </tbody>
-                </table>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.info("All 44 sensors healthy.")
-
-    st.divider()
-
-    section_header("Live Isolation Valve Matrix (V-01 through V-20)", ["CODE", "HUMAN"])
-    conn = get_db_connection()
-    try:
-        valve_rows = conn.execute(
-            "SELECT valve_id, sector, status, last_updated FROM valves ORDER BY valve_id ASC;"
-        ).fetchall()
-    finally:
-        conn.close()
-
-    cols = st.columns(6)
-    for idx, v in enumerate(valve_rows):
-        with cols[idx % 6]:
-            highlight = "border: 2px solid #00C2FF;" if v["valve_id"] == "V-12" else ""
-            st.markdown(
-                f"""
-                <div class="scada-card" style="text-align:center; padding:0.6rem; {highlight}">
-                    <div style="font-weight:700; font-size:0.95rem;">{v['valve_id']}</div>
-                    <div style="font-size:0.75rem; color:#9FB3C8; margin-bottom:0.35rem;">{v['sector']}</div>
-                    {status_badge(v['status'])}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )

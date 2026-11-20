@@ -1,4 +1,4 @@
-"""Industrial SCADA styling and actor/status badge helpers (LLM / CODE / HUMAN)."""
+"""Clean SCADA styling and meaningful status badges (red = danger, orange = pending, green = OK)."""
 from datetime import datetime, timedelta, timezone
 import html
 from zoneinfo import ZoneInfo
@@ -37,71 +37,87 @@ def format_dubai_time(ts: str | None) -> str:
 SCADA_CSS = """
 <style>
     .block-container {
-        padding-top: 1.2rem;
-        padding-bottom: 2rem;
-        max-width: 1400px;
+        padding-top: 1.25rem;
+        padding-bottom: 2.5rem;
+        max-width: 1320px;
     }
     .scada-banner {
-        background: linear-gradient(90deg, #0F1C33 0%, #162947 65%, #0D223B 100%);
-        border: 1px solid #264269;
-        border-left: 5px solid #00C2FF;
-        border-radius: 8px;
-        padding: 1rem 1.25rem;
+        background: #111827;
+        border: 1px solid #263144;
+        border-radius: 10px;
+        padding: 0.95rem 1.25rem;
         margin-bottom: 1rem;
     }
     .scada-title {
-        font-size: 1.45rem;
+        font-size: 1.35rem;
         font-weight: 700;
-        letter-spacing: 0.04em;
-        color: #F0F6FC;
+        letter-spacing: 0.03em;
+        color: #F8FAFC;
         margin: 0;
     }
     .scada-subtitle {
-        font-size: 0.88rem;
-        color: #9FB3C8;
+        font-size: 0.85rem;
+        color: #94A3B8;
         margin: 0.2rem 0 0 0;
     }
     .scada-card {
-        background: #111B2E;
-        border: 1px solid #243757;
+        background: #111827;
+        border: 1px solid #263144;
         border-radius: 8px;
-        padding: 0.95rem 1.1rem;
-        margin-bottom: 0.85rem;
+        padding: 0.9rem 1.05rem;
+        margin-bottom: 0.8rem;
     }
     .scada-card-alert {
-        background: #1F1420;
-        border: 1px solid #7C2D3D;
-        border-left: 5px solid #FF4B4B;
+        background: #1F1215;
+        border: 1px solid #7F1D1D;
+        border-left: 4px solid #EF4444;
         border-radius: 8px;
-        padding: 0.95rem 1.1rem;
-        margin-bottom: 0.85rem;
+        padding: 0.9rem 1.05rem;
+        margin-bottom: 0.8rem;
     }
     .scada-card-pending {
-        background: #1D1B12;
-        border: 1px solid #7A5C1B;
-        border-left: 5px solid #F59E0B;
-        border-radius: 8px;
-        padding: 1rem 1.15rem;
-        margin-bottom: 0.9rem;
-    }
-    .scada-card-ok {
-        background: #0F211B;
-        border: 1px solid #1E5A44;
-        border-left: 5px solid #10B981;
+        background: #1E1910;
+        border: 1px solid #784B12;
+        border-left: 4px solid #F59E0B;
         border-radius: 8px;
         padding: 0.95rem 1.1rem;
         margin-bottom: 0.85rem;
+    }
+    .scada-card-ok {
+        background: #0F1F1A;
+        border: 1px solid #14532D;
+        border-left: 4px solid #10B981;
+        border-radius: 8px;
+        padding: 0.9rem 1.05rem;
+        margin-bottom: 0.8rem;
     }
     .scada-section-hdr {
         display: flex;
         align-items: center;
-        gap: 0.5rem;
-        font-size: 0.95rem;
+        gap: 0.45rem;
+        font-size: 0.88rem;
         font-weight: 700;
         letter-spacing: 0.04em;
         text-transform: uppercase;
-        color: #D6E4F0;
-        margin-bottom: 0.45rem;
+        color: #E2E8F0;
+        margin: 0.35rem 0 0.5rem 0;
+    }
+    .scada-step {
+        background: #111827;
+        border: 1px solid #263144;
+        border-radius: 8px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.55rem;
+        font-size: 0.87rem;
+        color: #E2E8F0;
+    }
+    .scada-step-title {
+        font-size: 0.8rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #94A3B8;
+        margin-bottom: 0.3rem;
     }
     .ag-badge {
         display: inline-block;
@@ -109,106 +125,86 @@ SCADA_CSS = """
         border-radius: 999px;
         font-size: 0.72rem;
         font-weight: 700;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.04em;
         text-transform: uppercase;
         vertical-align: middle;
         margin-right: 0.25rem;
     }
-    .ag-badge-llm {
-        background: #3B1D60;
-        color: #E2C6FF;
-        border: 1px solid #7E4AC2;
-    }
-    .ag-badge-code {
-        background: #0E3A4A;
-        color: #7CE8FF;
-        border: 1px solid #1E82A8;
-    }
-    .ag-badge-human {
-        background: #4A320C;
-        color: #FDE68A;
-        border: 1px solid #D97706;
+    .ag-badge-llm, .ag-badge-code, .ag-badge-human, .ag-badge-neutral {
+        background: #1E293B;
+        color: #CBD5E1;
+        border: 1px solid #475569;
     }
     .ag-badge-ok {
-        background: #0F3D2E;
+        background: #064E3B;
         color: #6EE7B7;
         border: 1px solid #10B981;
     }
     .ag-badge-warn {
-        background: #4A320C;
+        background: #451A03;
         color: #FCD34D;
         border: 1px solid #F59E0B;
     }
     .ag-badge-danger {
-        background: #4C151F;
+        background: #450A0A;
         color: #FCA5A5;
         border: 1px solid #EF4444;
     }
-    .ag-badge-neutral {
-        background: #1F2D46;
-        color: #CBD5E1;
-        border: 1px solid #475569;
-    }
     .ag-mono {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 0.84rem;
+        font-size: 0.83rem;
     }
     .scada-table {
         width: 100%;
         border-collapse: collapse;
-        background: #111B2E;
-        border: 1px solid #243757;
+        background: #111827;
+        border: 1px solid #263144;
         border-radius: 8px;
         overflow: hidden;
         font-size: 0.84rem;
     }
     .scada-table th {
-        background: #182742;
+        background: #1E293B;
         color: #CBD5E1;
         text-align: left;
         padding: 0.5rem 0.65rem;
-        border-bottom: 1px solid #2B4166;
+        border-bottom: 1px solid #334155;
         white-space: nowrap;
     }
     .scada-table td {
         padding: 0.5rem 0.65rem;
-        border-bottom: 1px solid #1E2E4A;
-        color: #E6EDF7;
+        border-bottom: 1px solid #1E293B;
+        color: #E2E8F0;
         vertical-align: top;
         white-space: normal;
         word-wrap: break-word;
         overflow-wrap: anywhere;
     }
     .scada-round-hdr {
-        font-size: 0.86rem;
+        font-size: 0.84rem;
         font-weight: 700;
-        letter-spacing: 0.05em;
-        color: #93C5FD;
-        margin: 0.55rem 0 0.4rem 0;
-        padding-bottom: 0.2rem;
-        border-bottom: 1px solid #243757;
+        letter-spacing: 0.04em;
+        color: #CBD5E1;
+        margin: 0.7rem 0 0.45rem 0;
+        padding-bottom: 0.25rem;
+        border-bottom: 1px solid #263144;
     }
-    .scada-id-badge {
+    .scada-id-badge, .scada-id-badge-r2 {
         display: inline-block;
         padding: 0.12rem 0.48rem;
         border-radius: 6px;
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-size: 0.74rem;
         font-weight: 700;
-        background: #0F3459;
-        color: #7CE8FF;
-        border: 1px solid #1E82A8;
+        background: #1E293B;
+        color: #E2E8F0;
+        border: 1px solid #475569;
         margin-right: 0.35rem;
     }
-    .scada-id-badge-r2 {
-        background: #232A3B;
-        color: #CBD5E1;
-        border: 1px solid #475569;
-    }
     .scada-card-title {
-        font-size: 0.94rem;
+        font-size: 0.93rem;
         font-weight: 700;
-        color: #F0F6FC;
+        color: #F8FAFC;
         margin: 0.35rem 0 0.4rem 0;
         line-height: 1.3;
         white-space: normal;
@@ -216,7 +212,7 @@ SCADA_CSS = """
         overflow-wrap: break-word;
     }
     .scada-card-field {
-        font-size: 0.81rem;
+        font-size: 0.8rem;
         color: #CBD5E1;
         line-height: 1.4;
         margin-bottom: 0.35rem;
@@ -224,22 +220,22 @@ SCADA_CSS = """
         word-wrap: break-word;
     }
     .scada-card-field strong {
-        color: #93C5FD;
+        color: #E2E8F0;
     }
     .scada-card-watch strong {
-        color: #6EE7B7;
+        color: #E2E8F0;
     }
 </style>
 """
 
 
 def inject_scada_css() -> None:
-    """Inject industrial dark-mode SCADA styles into Streamlit page."""
+    """Inject clean dark-mode SCADA styles into Streamlit page."""
     st.markdown(SCADA_CSS, unsafe_allow_html=True)
 
 
 def actor_badge(actor: str) -> str:
-    """Return HTML badge showing whether a step was done by LLM, CODE, or HUMAN."""
+    """Return neutral HTML badge showing whether a step was done by LLM, CODE, or HUMAN."""
     norm = (actor or "").strip().upper()
     if norm in ("LLM", "LLM_AGENT"):
         return '<span class="ag-badge ag-badge-llm">LLM</span>'
@@ -251,9 +247,24 @@ def actor_badge(actor: str) -> str:
 
 
 def status_badge(status: str) -> str:
-    """Return color-coded HTML status badge."""
+    """Return meaningful color-coded HTML status badge (green=OK, orange=pending, red=danger)."""
     s = (status or "UNKNOWN").strip().upper()
-    if s in ("VALID", "EXECUTED", "APPROVED", "ALLOWED", "COMPLETED", "OPEN", "ONLINE", "NORMAL", "RESOLVED", "NOMINAL", "COMPLIANT", "FRESH", "TELEMETRY_RESTORED"):
+    if s in (
+        "VALID",
+        "EXECUTED",
+        "APPROVED",
+        "ALLOWED",
+        "COMPLETED",
+        "ADVISORY_ONLY",
+        "OPEN",
+        "ONLINE",
+        "NORMAL",
+        "RESOLVED",
+        "NOMINAL",
+        "COMPLIANT",
+        "FRESH",
+        "TELEMETRY_RESTORED",
+    ):
         cls = "ag-badge-ok"
     elif s in (
         "PENDING",
@@ -268,6 +279,7 @@ def status_badge(status: str) -> str:
         "LOW",
         "ELEVATED WATCH",
         "UNTRUSTED_TEXT",
+        "EMPTY_PROMPT",
     ):
         cls = "ag-badge-warn"
     elif s in (
@@ -304,7 +316,7 @@ def status_badge(status: str) -> str:
 
 
 def section_header(title: str, actors: list[str] | None = None, extra_badge: str = "", show_actors: bool = False) -> None:
-    """Render a consistent SCADA section header (CODE/LLM/HUMAN badges hidden unless technical details are enabled)."""
+    """Render a clean section header (actor tags hidden unless technical details are enabled)."""
     show_tech = bool(show_actors or st.session_state.get("show_tech_details", False))
     badges_html = "".join(actor_badge(a) for a in (actors or [])) if show_tech else ""
     st.markdown(

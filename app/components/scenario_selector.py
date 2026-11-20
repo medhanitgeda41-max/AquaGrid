@@ -102,6 +102,7 @@ def _reset_database_callback() -> None:
         st.session_state["last_agent_result"] = None
         st.session_state["last_bypass_result"] = None
         st.session_state["last_pre_approved_refusal"] = None
+        st.session_state["last_ai_prompt_result"] = None
         st.session_state["telemetry_restored_banner"] = None
         st.session_state["selected_leak_id"] = None
         st.session_state["last_hitl_feedback"] = {
