@@ -7,10 +7,9 @@ from config.constants import DEFAULT_SCADA_HOUR
 from config.region_config import REGION_CONFIG
 from database.scenarios import get_scenarios_by_round, reset_database
 from guards.telemetry_freshness import fast_forward_telemetry_age, restore_telemetry_feed
-from simulator import get_simulator
+from simulator import get_simulator, simulator_step_lock
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
-from components.badges import get_sim_step_lock
 
 
 def _fmt_countdown(seconds: int) -> str:
@@ -56,7 +55,7 @@ def _on_sidebar_reset() -> None:
             sim.stop()
         if hasattr(sim, "reset_clock"):
             sim.reset_clock(DEFAULT_SCADA_HOUR)
-    with get_sim_step_lock(sim):
+    with simulator_step_lock(sim):
         reset_database()
     st.session_state["live_sim_toggle"] = False
     st.session_state["demo_accel_toggle"] = False
@@ -211,7 +210,7 @@ def _render_sidebar_scenario_row(entry: dict) -> None:
             sim = get_simulator()
             if sc_id != "U-5.5" and sim is not None and hasattr(sim, "resume_feed"):
                 sim.resume_feed()
-            with get_sim_step_lock(sim):
+            with simulator_step_lock(sim):
                 msg = run_scenario_for_chat(sc_id, current_hour=DEFAULT_SCADA_HOUR)
             meta = msg.get("scenario_meta") or {}
             st.session_state["active_scenario"] = meta.get("scenario_num")

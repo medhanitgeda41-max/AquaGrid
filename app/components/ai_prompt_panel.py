@@ -5,8 +5,8 @@ import streamlit as st
 from agent.chat_assistant import EXAMPLE_QUESTIONS, run_chat_turn
 from config.constants import DEFAULT_SCADA_HOUR
 from config.settings import settings
-from simulator import get_simulator
-from components.badges import get_sim_step_lock, status_badge
+from simulator import get_simulator, simulator_step_lock
+from components.badges import status_badge
 from components.chat_widgets import render_chat_widget
 
 
@@ -18,7 +18,7 @@ def _handle_user_prompt(prompt_text: str, display_hour: int) -> None:
     messages.append({"role": "user", "content": prompt_text})
 
     sim = get_simulator()
-    with get_sim_step_lock(sim):
+    with simulator_step_lock(sim):
         reply = run_chat_turn(
             user_message=prompt_text,
             history=prior_history,

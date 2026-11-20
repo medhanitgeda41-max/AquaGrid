@@ -3,15 +3,36 @@
 Launch from project root:
     python -m streamlit run app/app.py
 """
+import importlib
 import os
 import sys
 
-# Ensure both app/ (for components.*) and project root (for agent/database/guards/tools/config) are on sys.path
+# Ensure PROJECT_ROOT is first (so 'app.app' stays a package) and APP_DIR is available for 'components.*'
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(APP_DIR)
-for _p in (PROJECT_ROOT, APP_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if APP_DIR not in sys.path:
+    sys.path.append(APP_DIR)
+
+
+def _ensure_module_attr(module_name: str, required_attr: str) -> None:
+    """Reload a cached module if a Streamlit hot-reload left an older version in sys.modules."""
+    mod = sys.modules.get(module_name)
+    if mod is not None and not hasattr(mod, required_attr):
+        importlib.reload(mod)
+
+
+# Guard against stale sys.modules across live Streamlit hot-reloads
+_ensure_module_attr("simulator", "simulator_step_lock")
+_ensure_module_attr("simulator", "STEP_LOCK")
+_ensure_module_attr("agent.llm_factory", "LLMClient")
+_ensure_module_attr("agent.chat_assistant", "collect_system_alerts")
+_ensure_module_attr("components.badges", "get_sim_step_lock")
+_ensure_module_attr("components.chat_widgets", "render_chat_widget")
+_ensure_module_attr("components.header", "render_header")
+_ensure_module_attr("components.sidebar", "render_sidebar")
+_ensure_module_attr("components.ai_prompt_panel", "render_ask_aquagrid_chat")
 
 import streamlit as st
 from agent.chat_assistant import collect_system_alerts
