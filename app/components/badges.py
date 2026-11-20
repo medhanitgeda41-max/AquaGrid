@@ -204,7 +204,7 @@ def status_badge(status: str) -> str:
     s = (status or "UNKNOWN").strip().upper()
     if s in ("VALID", "EXECUTED", "APPROVED", "ALLOWED", "COMPLETED", "OPEN", "ONLINE", "NORMAL"):
         cls = "ag-badge-ok"
-    elif s in ("PENDING", "STAGED_PENDING_APPROVAL", "AWAITING_HUMAN_APPROVAL", "THROTTLED", "REJECTED_DUPLICATE_PENDING"):
+    elif s in ("PENDING", "STAGED_PENDING_APPROVAL", "AWAITING_HUMAN_APPROVAL", "THROTTLED", "REJECTED_DUPLICATE_PENDING", "GAP"):
         cls = "ag-badge-warn"
     elif s in (
         "REJECTED_BY_CODE",

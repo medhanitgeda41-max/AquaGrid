@@ -99,11 +99,15 @@ def read_tariff_and_quality_feeds(
                     "avg_demand_mld": row["avg_demand_mld"],
                 })
 
-        # 2c. Full 24h hourly demand map for deterministic schedule validation
+        # 2c. Full 24h hourly demand map + live plant setpoint for deterministic schedule validation
         all_demand_rows = conn.execute(
             "SELECT hour, demand_mld FROM demand_forecast ORDER BY hour ASC;"
         ).fetchall()
         hourly_demand_24h = {int(r["hour"]): float(r["demand_mld"]) for r in all_demand_rows}
+        plant_row = conn.execute(
+            "SELECT production_mld FROM plant_setpoints WHERE plant_id = 'DESAL-01';"
+        ).fetchone()
+        current_plant_output_mld = float(plant_row["production_mld"]) if plant_row else 100.0
 
         # 3. Fetch Current Reservoir Status
         res_row = conn.execute("SELECT * FROM reservoirs WHERE id = 'RES-01';").fetchone()
@@ -190,6 +194,7 @@ def read_tariff_and_quality_feeds(
             "demand_forecast": demand_forecast,
             "daily_windows": daily_windows,
             "hourly_demand_24h": hourly_demand_24h,
+            "current_plant_output_mld": current_plant_output_mld,
             "reservoir": reservoir_status,
             "sanitized_alerts": sanitized_alerts,
             "water_quality": {

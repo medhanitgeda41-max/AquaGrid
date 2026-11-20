@@ -38,6 +38,7 @@ def node_ingest(state: AgentState) -> dict:
             "tariffs": feeds_data.get("tariffs", []),
             "demand_forecast": feeds_data.get("demand_forecast", []),
             "daily_windows": feeds_data.get("daily_windows", []),
+            "current_plant_output_mld": feeds_data.get("current_plant_output_mld", 100.0),
             "water_quality": feeds_data.get("water_quality", {}),
         },
         "hourly_demand_24h": feeds_data.get("hourly_demand_24h", {}),
@@ -88,6 +89,8 @@ def node_reason(state: AgentState) -> dict:
         bloom_severity=str(wq.get("bloom_severity", "NONE")),
         turbidity_ntu=float(wq.get("intake_turbidity_ntu", 1.2)),
         chlorine_ppm=float(wq.get("intake_chlorine_ppm", 1.8)),
+        current_hour=state.get("current_hour", 14),
+        current_plant_output_mld=float(state.get("tariff_data", {}).get("current_plant_output_mld", 100.0)),
     )
 
     # Record LLM provider & reasoning pass in immutable audit_log

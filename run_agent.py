@@ -79,15 +79,27 @@ def main():
         print(f"SCHEDULE VALIDATION (PURE PYTHON GUARD): {sched_val.get('status')}")
         print("-" * 80)
         print(sched_val.get("summary"))
-        for blk in sched_val.get("blocks", []):
+        if sched_val.get("first_breach_hour"):
+            print(
+                f"  First 35.0% floor breach : {sched_val.get('first_breach_hour')} "
+                f"({sched_val.get('first_breach_percent')}%)"
+            )
+        display_blocks = sched_val.get("chronological_blocks") or sched_val.get("blocks", [])
+        for blk in display_blocks:
             status_tag = blk.get("status")
             win = blk.get("window")
             mld = blk.get("proposed_mld")
+            start_pct = blk.get("start_projected_percent")
             min_pct = blk.get("min_projected_percent")
-            print(f"  [{status_tag}] {win} @ {mld} MLD (min projected reservoir: {min_pct}%)")
+            end_pct = blk.get("end_projected_percent")
+            gap_suffix = f" [{blk.get('gap_note')}]" if blk.get("is_gap") else ""
+            print(
+                f"  [{status_tag}] {win} @ {mld} MLD{gap_suffix} "
+                f"(start: {start_pct}% -> min: {min_pct}% -> end: {end_pct}%)"
+            )
             for r in blk.get("reasons", []):
                 print(f"      -> {r}")
-        if not sched_val.get("blocks"):
+        if not display_blocks:
             for blk in sched_val.get("rejected_blocks", []):
                 for r in blk.get("reasons", []):
                     print(f"  [REJECTED_BY_CODE] {r}")

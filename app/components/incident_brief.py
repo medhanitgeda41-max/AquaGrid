@@ -99,21 +99,35 @@ def render_incident_brief() -> None:
         )
         card_cls = "scada-card-ok" if sv_status == "VALID" else "scada-card-alert"
         lines_html = [f"<div><strong>{html.escape(str(sched_val.get('summary', '')))}</strong></div>"]
-        blocks = sched_val.get("blocks", [])
+        if sched_val.get("first_breach_hour"):
+            lines_html.append(
+                f'<div style="margin-top:0.25rem; color:#FCA5A5;">'
+                f'<strong>First 35.0% Floor Breach:</strong> '
+                f'<span class="ag-mono">{html.escape(str(sched_val.get("first_breach_hour")))} '
+                f'({sched_val.get("first_breach_percent")}%)</span></div>'
+            )
+        blocks = sched_val.get("chronological_blocks") or sched_val.get("blocks", [])
         if blocks:
             for blk in blocks:
                 blk_badge = status_badge(blk.get("status", "UNKNOWN"))
                 win = html.escape(str(blk.get("window")))
                 mld = blk.get("proposed_mld")
+                start_pct = blk.get("start_projected_percent")
                 min_pct = blk.get("min_projected_percent")
+                end_pct = blk.get("end_projected_percent")
                 reasons_html = "".join(
                     f'<div style="color:#FCA5A5; margin-left:1.25rem; font-size:0.84rem;">&rarr; {html.escape(str(r))}</div>'
                     for r in blk.get("reasons", [])
                 )
+                gap_html = (
+                    f' <span style="color:#FDE68A; font-size:0.82rem;">[{html.escape(str(blk.get("gap_note")))}]</span>'
+                    if blk.get("is_gap")
+                    else ""
+                )
                 lines_html.append(
                     f'<div style="margin-top:0.4rem;">{blk_badge} '
-                    f'<span class="ag-mono">{win} @ {mld} MLD</span> '
-                    f'<span style="color:#9FB3C8;">(min projected reservoir: {min_pct}%)</span>'
+                    f'<span class="ag-mono">{win} @ {mld} MLD</span>{gap_html} '
+                    f'<span style="color:#9FB3C8;">(start: {start_pct}% &rarr; min: {min_pct}% &rarr; end: {end_pct}%)</span>'
                     f'{reasons_html}</div>'
                 )
         else:

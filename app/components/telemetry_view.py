@@ -19,28 +19,36 @@ def _build_reservoir_chart(
     agent_result: dict | None,
     active_scenario: int | None,
 ) -> alt.LayerChart:
-    """Build interactive Altair chart of 6h reservoir trajectory with red 35% floor line."""
+    """Build interactive Altair chart of 24h cumulative reservoir trajectory with red 35% floor line."""
     res = feeds_data.get("reservoir", {})
     start_vol = float(res.get("current_volume_ml", 240.0))
     start_pct = float(res.get("current_level_percent", 48.0))
     hourly_24 = feeds_data.get("hourly_demand_24h", {})
-    demands_6h = [float(hourly_24.get(DEFAULT_SCADA_HOUR + i, 90.0)) for i in range(6)]
+    demands_6h = [float(hourly_24.get((DEFAULT_SCADA_HOUR + i) % 24, 90.0)) for i in range(6)]
+    demands_24h = [float(hourly_24.get((DEFAULT_SCADA_HOUR + i) % 24, 90.0)) for i in range(24)]
 
-    series_defs: list[tuple[str, float, str]] = []
+    # Build chronological x-axis labels from 14:00 through 14:00 (+1d)
+    x_labels_24h = [f"{DEFAULT_SCADA_HOUR:02d}:00"] + [
+        f"{(DEFAULT_SCADA_HOUR + off) % 24:02d}:00{' (+1d)' if (DEFAULT_SCADA_HOUR + off) >= 24 else ''}"
+        for off in range(1, 25)
+    ]
+
+    # (label, inflow_mld, hex_color, horizon_demands)
+    series_defs: list[tuple[str, float, str, list[float]]] = []
     seen_vals: set[float] = set()
 
     if active_scenario == 2:
-        # Scenario 2: always highlight both the rejected 15 MLD throttle (below 35%)
-        # and the 60 MLD bloom-safe replan (staying above 35%)
-        series_defs.append(("Rejected 15 MLD Throttle (Breaches 35%)", 15.0, "#F59E0B"))
+        # Scenario 2: always plot the 6h peak rejected 15 MLD throttle (dips below 35%)
+        # and the 6h peak 60 MLD bloom-safe replan (stays above 35%)
+        series_defs.append(("Rejected 15 MLD Throttle (Breaches 35%)", 15.0, "#F59E0B", demands_6h))
         seen_vals.add(15.0)
-        series_defs.append(("60 MLD Bloom-Safe Replan (>= 35%)", 60.0, "#10B981"))
+        series_defs.append(("60 MLD Bloom-Safe Replan (>= 35%)", 60.0, "#10B981", demands_6h))
         seen_vals.add(60.0)
     else:
-        series_defs.append((f"Current Setpoint ({plant_mld:.0f} MLD)", plant_mld, "#00C2FF"))
+        series_defs.append((f"Current Setpoint ({plant_mld:.0f} MLD)", plant_mld, "#00C2FF", demands_24h))
         seen_vals.add(round(plant_mld, 1))
 
-    # Overlay any additional distinct SET_PLANT_OUTPUT attempts from proposal_history
+    # Overlay any additional distinct SET_PLANT_OUTPUT attempts from proposal_history (6h horizon)
     if agent_result:
         for entry in agent_result.get("proposal_history", []):
             prop = entry.get("action_proposal") or {}
@@ -56,23 +64,23 @@ def _build_reservoir_chart(
                 else:
                     label = f"Attempt #{entry.get('attempt')} Staged ({val:.0f} MLD)"
                     color = "#38BDF8"
-                series_defs.append((label, val, color))
+                series_defs.append((label, val, color, demands_6h))
 
     rows = []
     color_domain = []
     color_range = []
-    for label, inflow_mld, hex_color in series_defs:
+    for label, inflow_mld, hex_color, demand_seq in series_defs:
         color_domain.append(label)
         color_range.append(hex_color)
         sim = simulate_reservoir_trajectory(
             current_volume_ml=start_vol,
             plant_inflow_mld=inflow_mld,
-            demand_forecast_mld=demands_6h,
+            demand_forecast_mld=demand_seq,
             total_capacity_ml=RESERVOIR_TOTAL_CAPACITY_ML,
             min_floor_percent=RESERVOIR_FLOOR_PERCENT,
         )
         rows.append({
-            "hour_label": f"{DEFAULT_SCADA_HOUR:02d}:00",
+            "hour_label": x_labels_24h[0],
             "level_pct": round(start_pct, 2),
             "volume_ml": round(start_vol, 1),
             "series": label,
@@ -80,10 +88,26 @@ def _build_reservoir_chart(
         for pt in sim["hourly_levels"]:
             off = int(pt["hour_offset"])
             rows.append({
-                "hour_label": f"{(DEFAULT_SCADA_HOUR + off) % 24:02d}:00",
+                "hour_label": x_labels_24h[off],
                 "level_pct": float(pt["level_percent"]),
                 "volume_ml": float(pt["volume_ml"]),
                 "series": label,
+            })
+
+    # Third line: AI 24h schedule (cumulative) from 14:00 through the next 24 hours
+    sched_val = (agent_result or {}).get("schedule_validation") or {}
+    cum_traj = sched_val.get("cumulative_trajectory") or []
+    if cum_traj:
+        ai_label = "AI 24h schedule (cumulative)"
+        color_domain.append(ai_label)
+        color_range.append("#C084FC")
+        for pt in cum_traj:
+            off = int(pt["hour_offset"])
+            rows.append({
+                "hour_label": x_labels_24h[off] if off < len(x_labels_24h) else pt["hour_label"],
+                "level_pct": float(pt["level_percent"]),
+                "volume_ml": float(pt["volume_ml"]),
+                "series": ai_label,
             })
 
     df = pd.DataFrame(rows)
@@ -94,9 +118,14 @@ def _build_reservoir_chart(
 
     lines = (
         alt.Chart(df)
-        .mark_line(point=alt.OverlayMarkDef(size=70), strokeWidth=3)
+        .mark_line(point=alt.OverlayMarkDef(size=55), strokeWidth=2.8)
         .encode(
-            x=alt.X("hour_label:N", sort=None, title="Forecast Horizon (SCADA Hour)"),
+            x=alt.X(
+                "hour_label:N",
+                sort=x_labels_24h,
+                title="24h Cumulative Horizon (Starting 14:00)",
+                axis=alt.Axis(labelAngle=-45, labelFontSize=10),
+            ),
             y=alt.Y(
                 "level_pct:Q",
                 scale=alt.Scale(domain=[y_min, y_max]),

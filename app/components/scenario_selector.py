@@ -1,7 +1,7 @@
 """One-click SCADA scenario control bar (4 demo scenarios + Reset & Re-seed).
 
-Uses Streamlit on_click callbacks with a re-entrancy lock so each button click
-executes strictly ONCE before the page renders (no duplicate runs or extra st.rerun()).
+Queues clicks via on_click callbacks with a re-entrancy lock so each button click
+executes strictly ONCE while displaying a visible st.spinner during run_agent().
 """
 import streamlit as st
 from config.constants import DEFAULT_SCADA_HOUR
@@ -17,36 +17,36 @@ from tools.write_gateway import refuse_direct_write_bypass
 from components.badges import section_header
 
 
-def _execute_scenario(scenario_id: int) -> None:
-    """Callback: reset DB, inject scenario, invoke LangGraph agent once with re-entrancy lock."""
-    if st.session_state.get("_scenario_lock"):
+def _queue_scenario(scenario_id: int) -> None:
+    """Callback: queue a single scenario run if not already running or queued."""
+    if st.session_state.get("_scenario_lock") or st.session_state.get("_queued_scenario") is not None:
         return
+    st.session_state["_queued_scenario"] = scenario_id
 
-    st.session_state["_scenario_lock"] = True
-    try:
-        injectors = {
-            1: inject_scenario_1,
-            2: inject_scenario_2,
-            3: inject_scenario_3,
-            4: inject_scenario_4,
-        }
-        reset_database()
-        info = injectors[scenario_id]()
 
-        result = run_agent(scenario_id=scenario_id, current_hour=DEFAULT_SCADA_HOUR)
+def _execute_scenario(scenario_id: int) -> None:
+    """Reset DB, inject scenario, invoke LangGraph agent, and cache outputs."""
+    injectors = {
+        1: inject_scenario_1,
+        2: inject_scenario_2,
+        3: inject_scenario_3,
+        4: inject_scenario_4,
+    }
+    reset_database()
+    info = injectors[scenario_id]()
 
-        bypass_result = None
-        flagged = [a for a in result.get("sanitized_alerts", []) if a.get("injection_detected")]
-        if scenario_id == 4 or flagged:
-            bypass_result = refuse_direct_write_bypass(target_valve_id="V-12", attempted_status="OPEN")
+    result = run_agent(scenario_id=scenario_id, current_hour=DEFAULT_SCADA_HOUR)
 
-        st.session_state["active_scenario"] = scenario_id
-        st.session_state["active_scenario_name"] = f"Scenario {scenario_id}: {info['name']}"
-        st.session_state["last_agent_result"] = result
-        st.session_state["last_bypass_result"] = bypass_result
-        st.session_state["last_hitl_feedback"] = None
-    finally:
-        st.session_state["_scenario_lock"] = False
+    bypass_result = None
+    flagged = [a for a in result.get("sanitized_alerts", []) if a.get("injection_detected")]
+    if scenario_id == 4 or flagged:
+        bypass_result = refuse_direct_write_bypass(target_valve_id="V-12", attempted_status="OPEN")
+
+    st.session_state["active_scenario"] = scenario_id
+    st.session_state["active_scenario_name"] = f"Scenario {scenario_id}: {info['name']}"
+    st.session_state["last_agent_result"] = result
+    st.session_state["last_bypass_result"] = bypass_result
+    st.session_state["last_hitl_feedback"] = None
 
 
 def _reset_database_callback() -> None:
@@ -57,6 +57,7 @@ def _reset_database_callback() -> None:
     st.session_state["_scenario_lock"] = True
     try:
         reset_database()
+        st.session_state["_queued_scenario"] = None
         st.session_state["active_scenario"] = None
         st.session_state["active_scenario_name"] = "Clean 24h Baseline (Re-seeded)"
         st.session_state["last_agent_result"] = None
@@ -82,7 +83,7 @@ def render_scenario_selector() -> None:
             width="stretch",
             key="btn_scenario_1",
             disabled=is_locked,
-            on_click=_execute_scenario,
+            on_click=_queue_scenario,
             args=(1,),
             help="Sector 4 J-14 leak + P-17 flatline + T-INTAKE-2 drift",
         )
@@ -93,7 +94,7 @@ def render_scenario_selector() -> None:
             width="stretch",
             key="btn_scenario_2",
             disabled=is_locked,
-            on_click=_execute_scenario,
+            on_click=_queue_scenario,
             args=(2,),
             help="Peak tariff ($0.48/kWh) + Intake 2 bloom derating vs. 35% floor & replan",
         )
@@ -104,7 +105,7 @@ def render_scenario_selector() -> None:
             width="stretch",
             key="btn_scenario_3",
             disabled=is_locked,
-            on_click=_execute_scenario,
+            on_click=_queue_scenario,
             args=(3,),
             help="Isolate Sector 4 leak via V-12 staged PENDING for operator Approve/Reject",
         )
@@ -115,7 +116,7 @@ def render_scenario_selector() -> None:
             width="stretch",
             key="btn_scenario_4",
             disabled=is_locked,
-            on_click=_execute_scenario,
+            on_click=_queue_scenario,
             args=(4,),
             help="Full-alert regex quarantine + direct SQLite write bypass refused",
         )
@@ -130,3 +131,13 @@ def render_scenario_selector() -> None:
             on_click=_reset_database_callback,
             help="Restore pristine 24h baseline with fixed seed 42",
         )
+
+    queued_scenario = st.session_state.pop("_queued_scenario", None)
+    if queued_scenario is not None and not st.session_state.get("_scenario_lock"):
+        st.session_state["_scenario_lock"] = True
+        try:
+            with st.spinner("Running AquaGrid agent… LLM thinking, CODE checking"):
+                _execute_scenario(queued_scenario)
+        finally:
+            st.session_state["_scenario_lock"] = False
+        st.rerun()
