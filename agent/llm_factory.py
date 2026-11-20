@@ -9,7 +9,7 @@ Supports:
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from openai import OpenAI
 from config.settings import settings
 
@@ -364,6 +364,138 @@ class LLMClient:
         logger.info("Using deterministic offline mock agent fallback.")
         mock_res = generate_offline_mock_response(system_prompt, user_prompt)
         return mock_res, "Deterministic Offline Engine"
+
+    def _get_chat_provider_chain(self) -> list[dict]:
+        """Return chat fallback chain: Groq 120b -> Groq 20b -> Gemini -> Ollama."""
+        demo_chain = LLMClient(mode="demo")._get_provider_chain()
+        # Keep chat timeouts snappy so failover feels responsive
+        for p in demo_chain:
+            if "ollama" in p["name"].lower():
+                p["timeout"] = min(float(p.get("timeout", 60)), 60.0)
+            else:
+                p["timeout"] = min(float(p.get("timeout", settings.REQUEST_TIMEOUT)), 35.0)
+        return demo_chain
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_executor: Callable[[str, dict], Any],
+        max_tool_steps: int = 5,
+    ) -> tuple[Optional[str], str, list[dict]]:
+        """
+        Run a multi-turn OpenAI-compatible chat with live tool calling across the fallback chain:
+        Groq (gpt-oss-120b) -> Groq (gpt-oss-20b) -> Gemini -> Ollama -> Offline Engine.
+
+        Returns (answer_text_or_None, provider_name, tool_trace).
+        Returns (None, "Deterministic Offline Engine", []) if no LLM provider is reachable.
+        """
+        providers = self._get_chat_provider_chain()
+        max_steps = max(1, min(int(max_tool_steps), 5))
+
+        for p in providers:
+            if "groq" in p["name"].lower() and not self._has_real_api_key(p["api_key"]):
+                continue
+            if "gemini" in p["name"].lower() and not self._has_real_api_key(p["api_key"]):
+                continue
+
+            try:
+                client = OpenAI(
+                    base_url=p["base_url"],
+                    api_key=p["api_key"],
+                    timeout=p.get("timeout", settings.REQUEST_TIMEOUT),
+                    max_retries=p.get("max_retries", 0),
+                )
+                conv = [dict(m) for m in messages]
+                tool_trace: list[dict] = []
+                steps = 0
+
+                while steps <= max_steps:
+                    req_kwargs: dict[str, Any] = {
+                        "model": p["model"],
+                        "messages": conv,
+                        "temperature": 0.2,
+                    }
+                    if steps < max_steps and tools:
+                        req_kwargs["tools"] = tools
+                        req_kwargs["tool_choice"] = "auto"
+                    elif steps == max_steps:
+                        conv.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Maximum tool steps reached. Provide a clear, concise final answer now "
+                                    "using only the live tool results already retrieved."
+                                ),
+                            }
+                        )
+                    req_kwargs.update(p.get("extra_kwargs", {}))
+
+                    response = client.chat.completions.create(**req_kwargs)
+                    msg = response.choices[0].message
+                    msg_tool_calls = getattr(msg, "tool_calls", None) or []
+
+                    if msg_tool_calls and steps < max_steps:
+                        serialized_calls = []
+                        for tc in msg_tool_calls:
+                            serialized_calls.append(
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments or "{}",
+                                    },
+                                }
+                            )
+                        conv.append(
+                            {
+                                "role": "assistant",
+                                "content": msg.content or "",
+                                "tool_calls": serialized_calls,
+                            }
+                        )
+
+                        for tc in msg_tool_calls:
+                            fn_name = tc.function.name
+                            raw_args = tc.function.arguments or "{}"
+                            try:
+                                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                                if not isinstance(parsed_args, dict):
+                                    parsed_args = {}
+                            except Exception:
+                                parsed_args = {}
+
+                            tool_out = tool_executor(fn_name, parsed_args)
+                            tool_trace.append(
+                                {
+                                    "step": steps + 1,
+                                    "tool": fn_name,
+                                    "args": parsed_args,
+                                    "result": tool_out,
+                                }
+                            )
+                            conv.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "name": fn_name,
+                                    "content": json.dumps(tool_out, default=str),
+                                }
+                            )
+                        steps += 1
+                        continue
+
+                    raw_text = (msg.content or "").strip()
+                    clean_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE).strip()
+                    if clean_text:
+                        return clean_text, p["name"], tool_trace
+                    break
+            except Exception as e:
+                logger.warning(f"Chat provider {p['name']} failed: {e}. Trying next provider in fallback chain...")
+                continue
+
+        return None, "Deterministic Offline Engine", []
 
 
 llm_client = LLMClient()

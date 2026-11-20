@@ -1,157 +1,138 @@
-"""AI Prompt Area: operator request input, step-by-step trace, and suggest-only gated result."""
+"""Ask AquaGrid — Full-width multi-turn AI Chat Assistant with inline visual widgets & 'How I got this'."""
 import html
 import streamlit as st
 
-from agent.operator_prompt import run_operator_prompt
+from agent.chat_assistant import EXAMPLE_QUESTIONS, run_chat_turn
 from config.constants import DEFAULT_SCADA_HOUR
-from components.badges import get_sim_step_lock, section_header, status_badge
+from config.settings import settings
 from simulator import get_simulator
+from components.badges import get_sim_step_lock, status_badge
+from components.chat_widgets import render_chat_widget
 
 
-def _format_proposed_action(action: dict | None) -> str:
-    if not action:
-        return "NONE (advisory only)"
-    a_type = str(action.get("action_type", "NONE"))
-    target = str(action.get("target_id", "NONE"))
-    val = action.get("proposed_value")
-    if a_type in ("CLOSE_VALVE", "OPEN_VALVE"):
-        val_txt = "OPEN" if float(val or 0.0) >= 0.5 else "CLOSED"
-        return f"{a_type} {target} ({val_txt})"
-    if a_type == "ISOLATE_AND_FLUSH":
-        return f"{a_type} {target}"
-    return f"{a_type} {target} -> {val} MLD"
+def _handle_user_prompt(prompt_text: str, display_hour: int) -> None:
+    """Append operator message, run multi-turn chat assistant through live tools & guards, append reply."""
+    messages = st.session_state.setdefault("ask_aquagrid_messages", [])
+    prior_history = [{"role": m["role"], "content": m.get("content", "")} for m in messages if m.get("role") in ("user", "assistant")]
 
+    messages.append({"role": "user", "content": prompt_text})
 
-def render_ai_prompt_panel(display_hour: int = DEFAULT_SCADA_HOUR) -> None:
-    """Render the operator AI prompt box, Run button, step-by-step trace, and final result."""
-    section_header("AI Prompt")
-
-    with st.form("ai_prompt_form", clear_on_submit=False):
-        in_col, btn_col = st.columns([5.2, 1.0])
-        with in_col:
-            prompt_text = st.text_input(
-                "Ask AI",
-                placeholder="Ask a question or suggest an action (e.g. Check grid status, Optimize for peak tariff, Close V-12)...",
-                key="ai_prompt_input",
-                label_visibility="collapsed",
-            )
-        with btn_col:
-            submitted = st.form_submit_button("Run", type="primary", width="stretch")
-
-    if submitted:
-        if not (prompt_text or "").strip():
-            st.warning("Type a request in the box above and press Run.")
-        else:
-            sim = get_simulator()
-            with st.spinner("Reading SCADA data, running code checks, asking AI..."):
-                with get_sim_step_lock(sim):
-                    prompt_res = run_operator_prompt(
-                        prompt_text=prompt_text,
-                        current_hour=display_hour,
-                    )
-            st.session_state["last_ai_prompt_result"] = prompt_res
-            st.rerun()
-
-    res = st.session_state.get("last_ai_prompt_result")
-    if not res:
-        return
-
-    final = res.get("final_result") or {}
-    sev = final.get("severity", "ok")
-    card_cls = {
-        "ok": "scada-card-ok",
-        "pending": "scada-card-pending",
-        "danger": "scada-card-alert",
-    }.get(sev, "scada-card")
-
-    # ── Clear Final Result ────────────────────────────────────────────────────
-    st.markdown(
-        f"""
-        <div class="{card_cls}">
-            <div>
-                {status_badge(final.get('status', 'COMPLETED'))}
-                <strong>{html.escape(str(final.get('headline', 'Done')))}</strong>
-            </div>
-            <div style="margin-top:0.35rem; font-size:0.9rem; color:#F8FAFC;">
-                {html.escape(str(final.get('summary', '')))}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # ── Step-by-Step Trace ────────────────────────────────────────────────────
-    step_read = res.get("step_read") or {}
-    step_checks = res.get("step_checks") or []
-    step_prop = res.get("step_proposal") or {}
-
-    if step_read:
-        peak_lbl = "PEAK" if step_read.get("is_peak") else "OFF/MID-PEAK"
-        excl = step_read.get("excluded_sectors") or []
-        excl_txt = f" | Non-compliant: {', '.join(excl)}" if excl else ""
-        read_summary = (
-            f"Reservoir {step_read.get('reservoir_pct', 0):.1f}% (floor {step_read.get('safety_floor_pct', 35.0):.1f}%) · "
-            f"Plant {step_read.get('plant_mld', 0):.0f} MLD · "
-            f"Tariff ${step_read.get('tariff_rate', 0):.2f}/kWh ({peak_lbl}) · "
-            f"Leaks: {step_read.get('active_leaks', 0)} · "
-            f"Quarantined: {step_read.get('quarantined_sensors', 0)} · "
-            f"Telemetry: {step_read.get('telemetry_status', 'FRESH')}"
-            f"{excl_txt}"
+    sim = get_simulator()
+    with get_sim_step_lock(sim):
+        reply = run_chat_turn(
+            user_message=prompt_text,
+            history=prior_history,
+            current_hour=display_hour,
         )
 
-        checks_html = "".join(
-            f'<div style="margin-top:0.25rem;">'
-            f'{status_badge(chk.get("status", "UNKNOWN"))} '
-            f'<strong>{html.escape(str(chk.get("check", "")))}:</strong> '
-            f'{html.escape(str(chk.get("detail", "")))}'
-            f'</div>'
-            for chk in step_checks
-        )
+    # Sync scenario session state if the user typed "Run scenario X"
+    meta = reply.get("scenario_meta")
+    if meta:
+        st.session_state["active_scenario"] = meta.get("scenario_num")
+        st.session_state["active_scenario_id"] = meta.get("id")
+        st.session_state["active_scenario_name"] = meta.get("name")
+        st.session_state["last_agent_result"] = meta.get("result")
+        st.session_state["last_scenario_info"] = meta.get("info")
+        st.session_state["last_bypass_result"] = meta.get("bypass_result")
+        st.session_state["last_pre_approved_refusal"] = meta.get("pre_approved_refusal")
 
-        action_obj = step_prop.get("action")
-        gw = step_prop.get("gateway_response") or {}
-        prop_txt = _format_proposed_action(action_obj)
-        gw_badge = status_badge(gw["status"]) if gw.get("status") else status_badge("ADVISORY_ONLY")
-        gw_note = (
-            "Waiting for operator Approve / Reject — no physical change made."
-            if gw.get("status") == "STAGED_PENDING_APPROVAL"
-            else str(gw.get("reason") or gw.get("message") or "No physical change proposed.")
-        )
+    messages.append(reply)
 
+
+def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: dict | None = None) -> None:
+    """Render full-width Ask AquaGrid chat interface with inline maps, charts, tables, and approval cards."""
+    snapshot = snapshot or {}
+    show_tech = bool(st.session_state.get("show_tech_details", False))
+    messages = st.session_state.setdefault("ask_aquagrid_messages", [])
+
+    # Welcome prompt & quick-ask buttons when conversation is empty
+    if not messages:
         st.markdown(
-            f"""
-            <div class="scada-step">
-                <div class="scada-step-title">1. What AI Read</div>
-                <div>{html.escape(read_summary)}</div>
-            </div>
-            <div class="scada-step">
-                <div class="scada-step-title">2. What Code Checked</div>
-                {checks_html}
-            </div>
-            <div class="scada-step">
-                <div class="scada-step-title">3. What AI Proposed</div>
-                <div>
-                    {gw_badge}
-                    <span class="ag-mono">{html.escape(prop_txt)}</span>
-                </div>
-                <div style="margin-top:0.25rem; font-size:0.84rem; color:#CBD5E1;">
-                    {html.escape(gw_note)}
+            """
+            <div class="scada-card" style="text-align:center; padding:1.25rem;">
+                <div style="font-size:1.15rem; font-weight:700; color:#F8FAFC;">Ask AquaGrid</div>
+                <div style="font-size:0.86rem; color:#94A3B8; margin-top:0.3rem;">
+                    Ask about live plant status, leaks, pressures, tariffs, schedules, past rejections, or propose a change.
+                    Physical actions are always checked by Python safety guards and staged for your button approval.
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    # ── Extra Details (collapsed by default) ──────────────────────────────────
-    with st.expander("Show details", expanded=False):
-        st.markdown(f"**Prompt:** `{res.get('prompt', '')}`")
-        if res.get("operator_brief"):
-            st.markdown(f"**AI Brief:** {res['operator_brief']}")
-        if res.get("maintenance_advisory"):
-            st.markdown(f"**Maintenance Advisory:** {res['maintenance_advisory']}")
-        if res.get("proposed_schedule"):
-            st.markdown(f"**Proposed Schedule:** `{res['proposed_schedule']}`")
-        sv = res.get("schedule_validation")
-        if sv:
-            st.markdown(f"**Schedule Validation:** `{sv.get('status')}` — {sv.get('summary', '')}")
-        st.caption(f"Provider: {res.get('llm_provider', '-')}")
+    # Compact example question buttons
+    ex_cols = st.columns(len(EXAMPLE_QUESTIONS))
+    for idx, q_text in enumerate(EXAMPLE_QUESTIONS):
+        with ex_cols[idx]:
+            if st.button(q_text, key=f"btn_example_q_{idx}", width="stretch"):
+                _handle_user_prompt(q_text, display_hour)
+                st.rerun()
+
+    # Render conversation history
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "assistant")
+        kind = msg.get("kind", "text")
+        avatar = "🚨" if kind == "alert" else None
+
+        with st.chat_message(role, avatar=avatar):
+            if kind == "alert":
+                alert_code = msg.get("alert_code", "ALERT")
+                st.markdown(
+                    f'<div class="scada-card-alert">{status_badge(alert_code)} {msg.get("content", "")}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(msg.get("content", ""))
+
+            # Render any inline visual components attached to this message
+            for w_idx, widget in enumerate(msg.get("widgets") or []):
+                render_chat_widget(widget, widget_key=f"m{msg_idx}_w{w_idx}", snapshot=snapshot)
+
+            if role == "assistant":
+                provider = msg.get("provider", "System")
+                st.markdown(
+                    f'<div style="font-size:0.75rem; color:#64748B; margin-top:0.25rem;">Provider: {html.escape(str(provider))}</div>',
+                    unsafe_allow_html=True,
+                )
+
+                tools_called = msg.get("tools_called") or []
+                code_checks = msg.get("code_checks") or []
+                staged = msg.get("staged_action")
+
+                if tools_called or code_checks or staged or show_tech:
+                    with st.expander("How I got this", expanded=show_tech):
+                        if tools_called:
+                            st.markdown("**Tools called:**")
+                            for tc in tools_called:
+                                st.markdown(f"- `{tc.get('tool')}` — {tc.get('summary', '')}")
+                        if code_checks:
+                            st.markdown("**Code checks:**")
+                            for chk in code_checks:
+                                st_tag = chk.get("status", "PASS")
+                                badge = status_badge("VALID" if st_tag == "PASS" else "BLOCKED")
+                                badge = badge.replace("VALID", "PASS")
+                                code_str = f" (`{chk.get('code')}`)" if chk.get("code") else ""
+                                st.markdown(
+                                    f'{badge} **{html.escape(str(chk.get("check", "")))}**{code_str}: {html.escape(str(chk.get("detail", "")))}',
+                                    unsafe_allow_html=True,
+                                )
+                        if staged:
+                            st.markdown(
+                                f"**Gateway result:** `{staged.get('status')}` — "
+                                f"{staged.get('action_type', '')} {staged.get('target_id', '')} "
+                                f"({staged.get('reason') or staged.get('details') or staged.get('message') or ''})"
+                            )
+                        st.caption(f"Provider: {provider} · LLM_MODE: {settings.LLM_MODE}")
+
+    # Chat input bar at bottom
+    user_typed = st.chat_input(
+        "Ask AquaGrid anything (e.g. 'Show Sector 4 on the map', 'Close V-12', 'Run scenario 2')...",
+        key="ask_aquagrid_chat_input",
+    )
+    if user_typed and user_typed.strip():
+        _handle_user_prompt(user_typed.strip(), display_hour)
+        st.rerun()
+
+
+# Backward-compatible alias
+render_ai_prompt_panel = render_ask_aquagrid_chat

@@ -1,0 +1,543 @@
+"""Inline visual widgets rendered inside Ask AquaGrid chat messages (map, charts, tables, schedule checks, approvals, scenario cards)."""
+import html
+import json
+import altair as alt
+import pandas as pd
+import streamlit as st
+from streamlit_folium import st_folium
+
+from config.constants import DEFAULT_SCADA_HOUR
+from database.connection import get_db_connection
+from guards.injection_filter import detect_injection
+from tools.write_gateway import execute_human_approval, execute_human_rejection
+from components.badges import format_dubai_time, status_badge
+from components.leak_map_view import build_leak_folium_map
+from components.telemetry_view import _build_reservoir_chart
+
+
+def _format_val(action_type: str, value: float) -> str:
+    if action_type in ("CLOSE_VALVE", "OPEN_VALVE"):
+        return "OPEN" if float(value) >= 0.5 else "CLOSED"
+    if action_type == "ISOLATE_AND_FLUSH":
+        return f"{float(value):.2f} mg/L" if float(value) > 0 else "ISOLATE_AND_FLUSH"
+    return f"{float(value):.1f} MLD"
+
+
+def render_inline_map(sector: str | None, leak_id: str | None, widget_key: str, snapshot: dict) -> None:
+    """Render interactive Leaflet map zoomed to a sector or leak_id inside chat."""
+    conn = get_db_connection()
+    try:
+        seg_rows = conn.execute("SELECT * FROM pipe_segments ORDER BY sector, segment_id;").fetchall()
+        leak_rows = conn.execute("SELECT * FROM leaks ORDER BY detected_at DESC;").fetchall()
+        p_rows = conn.execute(
+            """
+            SELECT pipe_segment_id, pressure_psi
+            FROM scada_history
+            WHERE id IN (SELECT MAX(id) FROM scada_history GROUP BY pipe_segment_id);
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    segments = [dict(r) for r in seg_rows]
+    all_leaks = [dict(r) for r in leak_rows]
+    latest_pressures = {r["pipe_segment_id"]: float(r["pressure_psi"]) for r in p_rows if r["pressure_psi"] is not None}
+    quarantined_ids = {s["sensor_id"] for s in (snapshot.get("telemetry_data") or {}).get("quarantined_sensors", [])}
+
+    filtered_segments = (
+        [s for s in segments if s["sector"].lower() == sector.lower()]
+        if sector
+        else segments
+    ) or segments
+    filtered_leaks = [
+        lk for lk in all_leaks
+        if (not sector or lk["sector"].lower() == sector.lower())
+        and (not leak_id or lk["leak_id"].upper() == leak_id.upper())
+    ]
+
+    selected_leak = filtered_leaks[0] if filtered_leaks else (all_leaks[0] if leak_id else None)
+    fmap = build_leak_folium_map(
+        segments=filtered_segments,
+        leaks=filtered_leaks or all_leaks,
+        quarantined_ids=quarantined_ids,
+        latest_pressures=latest_pressures,
+        selected_leak=selected_leak,
+        show_pipes=True,
+        pipe_color_mode="Sector",
+        show_leaks=True,
+        show_sensors=True,
+    )
+    st_folium(fmap, height=340, width=None, returned_objects=[], key=f"map_{widget_key}")
+    caption_scope = leak_id or sector or "Dubai Network"
+    st.caption(f"Live Leaflet Map — {caption_scope} ({len(filtered_leaks)} matching leak(s), {len(quarantined_ids)} quarantined sensor(s))")
+
+
+def render_inline_chart(metric: str, asset: str | None, hours: int, snapshot: dict) -> None:
+    """Render live pressure, flow, reservoir, or tariff chart inside chat."""
+    metric = (metric or "reservoir").lower()
+
+    if metric == "reservoir":
+        feeds_data = snapshot.get("feeds_data") or {}
+        plant_mld = float(snapshot.get("plant_mld", 100.0))
+        agent_result = st.session_state.get("last_agent_result")
+        active_scenario = st.session_state.get("active_scenario")
+        chart = _build_reservoir_chart(feeds_data, plant_mld, agent_result, active_scenario)
+        st.altair_chart(chart, width="stretch")
+        return
+
+    if metric == "tariff":
+        conn = get_db_connection()
+        try:
+            td_rows = conn.execute(
+                "SELECT t.hour, t.rate_per_kwh, t.is_peak, d.demand_mld FROM tariffs t JOIN demand_forecast d ON t.hour = d.hour ORDER BY t.hour ASC;"
+            ).fetchall()
+        finally:
+            conn.close()
+        td_df = pd.DataFrame(
+            [
+                {
+                    "hour_label": f"{int(r['hour']):02d}:00",
+                    "tariff_rate": float(r["rate_per_kwh"]),
+                    "tier": "PEAK ($0.48)" if r["is_peak"] else "Off/Mid-Peak",
+                    "demand_mld": float(r["demand_mld"]),
+                }
+                for r in td_rows
+            ]
+        )
+        tariff_chart = (
+            alt.Chart(td_df)
+            .mark_bar(cornerRadiusTopLeft=2, cornerRadiusTopRight=2)
+            .encode(
+                x=alt.X("hour_label:N", sort=None, title="Hour", axis=alt.Axis(labelAngle=-45, labelFontSize=10)),
+                y=alt.Y("tariff_rate:Q", title="Rate ($/kWh)", scale=alt.Scale(domain=[0.0, 0.55])),
+                color=alt.Color("tier:N", scale=alt.Scale(domain=["PEAK ($0.48)", "Off/Mid-Peak"], range=["#EF4444", "#64748B"]), legend=alt.Legend(orient="top", title=None)),
+                tooltip=["hour_label", "tariff_rate", "demand_mld", "tier"],
+            )
+            .properties(height=240)
+        )
+        st.altair_chart(tariff_chart, width="stretch")
+        return
+
+    # Pressure or Flow chart for an asset (junction, sensor, or sector)
+    target = (asset or "J-14").strip()
+    prefix = "P-%" if metric == "pressure" else "F-%"
+    y_title = "Pressure (psi)" if metric == "pressure" else "Flow (L/s)"
+    color_hex = "#10B981" if metric == "pressure" else "#F59E0B"
+
+    conn = get_db_connection()
+    try:
+        # First check scada_history (2-min resolution) if matching segment/sensor/sector
+        hist_rows = conn.execute(
+            """
+            SELECT recorded_at, pressure_psi, flow_lps, sensor_id, sector
+            FROM scada_history
+            WHERE sensor_id = ? OR sector = ? OR pipe_segment_id = ?
+            ORDER BY recorded_at DESC
+            LIMIT ?;
+            """,
+            (target.replace("J-", "P-"), target, target, max(12, int(hours) * 30)),
+        ).fetchall()
+
+        tel_rows = conn.execute(
+            """
+            SELECT hour, sensor_id, junction_id, sector, value, unit
+            FROM telemetry
+            WHERE (junction_id = ? OR sensor_id = ? OR sector = ?) AND sensor_id LIKE ?
+            ORDER BY hour ASC;
+            """,
+            (target, target, target, prefix),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if tel_rows:
+        df = pd.DataFrame(
+            [
+                {
+                    "time_label": f"{int(r['hour']):02d}:00",
+                    "value": float(r["value"]),
+                    "sensor": r["sensor_id"],
+                }
+                for r in tel_rows[-max(6, int(hours) * 2):]
+            ]
+        )
+        chart = (
+            alt.Chart(df)
+            .mark_line(color=color_hex, strokeWidth=2.6, point=alt.OverlayMarkDef(size=55, color=color_hex))
+            .encode(
+                x=alt.X("time_label:N", sort=None, title=f"{target} — Time"),
+                y=alt.Y("value:Q", title=y_title, scale=alt.Scale(zero=False)),
+                tooltip=["time_label", "sensor", "value"],
+            )
+            .properties(height=240)
+        )
+        st.altair_chart(chart, width="stretch")
+    elif hist_rows:
+        ordered = list(reversed(hist_rows))
+        col_name = "pressure_psi" if metric == "pressure" else "flow_lps"
+        df = pd.DataFrame(
+            [
+                {
+                    "time_label": format_dubai_time(r["recorded_at"])[11:16],
+                    "value": float(r[col_name] or 0.0),
+                }
+                for r in ordered
+            ]
+        )
+        chart = (
+            alt.Chart(df)
+            .mark_line(color=color_hex, strokeWidth=2.4)
+            .encode(
+                x=alt.X("time_label:N", sort=None, title=f"{target} — Last {hours}h"),
+                y=alt.Y("value:Q", title=y_title, scale=alt.Scale(zero=False)),
+                tooltip=["time_label", "value"],
+            )
+            .properties(height=240)
+        )
+        st.altair_chart(chart, width="stretch")
+    else:
+        st.info(f"No {metric} readings found for `{target}`.")
+
+
+def render_inline_table(what: str) -> None:
+    """Render live table for leaks, sensors, schedule, audit, or valves inside chat."""
+    what = (what or "leaks").lower()
+    conn = get_db_connection()
+    try:
+        if what == "leaks":
+            rows = conn.execute(
+                "SELECT leak_id, sector, location_name, severity, estimated_loss_m3_per_hour, status, detected_at FROM leaks ORDER BY detected_at DESC LIMIT 20;"
+            ).fetchall()
+            df = pd.DataFrame(
+                [
+                    {
+                        "Leak": r["leak_id"],
+                        "Sector": r["sector"],
+                        "Location": r["location_name"],
+                        "Severity": r["severity"],
+                        "Loss (m3/h)": round(float(r["estimated_loss_m3_per_hour"]), 1),
+                        "Status": r["status"],
+                        "Detected": format_dubai_time(r["detected_at"]),
+                    }
+                    for r in rows
+                ]
+            )
+        elif what == "sensors":
+            rows = conn.execute(
+                """
+                SELECT sensor_id, junction_id, sector, value, unit, status, timestamp
+                FROM telemetry
+                WHERE id IN (SELECT MAX(id) FROM telemetry GROUP BY sensor_id)
+                ORDER BY sensor_id ASC;
+                """
+            ).fetchall()
+            df = pd.DataFrame(
+                [
+                    {
+                        "Sensor": r["sensor_id"],
+                        "Junction": r["junction_id"],
+                        "Sector": r["sector"],
+                        "Value": f"{float(r['value']):.2f} {r['unit']}",
+                        "Status": r["status"],
+                        "Timestamp": format_dubai_time(r["timestamp"]),
+                    }
+                    for r in rows
+                ]
+            )
+        elif what == "schedule":
+            rows = conn.execute(
+                "SELECT t.hour, t.rate_per_kwh, t.is_peak, d.demand_mld FROM tariffs t JOIN demand_forecast d ON t.hour = d.hour ORDER BY t.hour ASC;"
+            ).fetchall()
+            df = pd.DataFrame(
+                [
+                    {
+                        "Hour": f"{int(r['hour']):02d}:00",
+                        "Tariff ($/kWh)": f"${float(r['rate_per_kwh']):.2f}",
+                        "Tier": "PEAK" if r["is_peak"] else "Off/Mid-Peak",
+                        "Demand (MLD)": round(float(r["demand_mld"]), 1),
+                    }
+                    for r in rows
+                ]
+            )
+        elif what == "valves":
+            rows = conn.execute("SELECT valve_id, sector, status, last_updated FROM valves ORDER BY valve_id ASC;").fetchall()
+            df = pd.DataFrame(
+                [
+                    {
+                        "Valve": r["valve_id"],
+                        "Sector": r["sector"],
+                        "Status": r["status"],
+                        "Updated": format_dubai_time(r["last_updated"]),
+                    }
+                    for r in rows
+                ]
+            )
+        else:  # audit
+            rows = conn.execute(
+                "SELECT id, timestamp, actor, event_type, target_id, status, details FROM audit_log ORDER BY id DESC LIMIT 40;"
+            ).fetchall()
+            df = pd.DataFrame(
+                [
+                    {
+                        "ID": r["id"],
+                        "Time": format_dubai_time(r["timestamp"]),
+                        "Actor": r["actor"],
+                        "Event": r["event_type"],
+                        "Target": r["target_id"] or "-",
+                        "Status": r["status"],
+                        "Details": r["details"],
+                    }
+                    for r in rows
+                ]
+            )
+    finally:
+        conn.close()
+
+    if df.empty:
+        st.info(f"No rows available for `{what}`.")
+    else:
+        st.dataframe(df, width="stretch", hide_index=True, height=min(360, 42 + len(df) * 35))
+
+
+def render_inline_schedule_validation(plan: str, validation: dict) -> None:
+    """Render hour-by-hour schedule validation result inside chat."""
+    if not validation:
+        return
+    sv_status = validation.get("status", "UNKNOWN")
+    card_cls = "scada-card-ok" if sv_status == "VALID" else "scada-card-alert"
+    lines_html = [
+        f"<div>{status_badge(sv_status)} <strong>{html.escape(str(validation.get('summary', '')))}</strong></div>"
+    ]
+    if validation.get("first_breach_hour"):
+        lines_html.append(
+            f'<div style="margin-top:0.25rem; color:#FCA5A5;">'
+            f'<strong>First Floor Breach:</strong> '
+            f'<span class="ag-mono">{html.escape(str(validation.get("first_breach_hour")))} '
+            f'({validation.get("first_breach_percent")}%)</span></div>'
+        )
+    blocks = validation.get("chronological_blocks") or validation.get("blocks", [])
+    for blk in blocks:
+        blk_badge = status_badge(blk.get("status", "UNKNOWN"))
+        win = html.escape(str(blk.get("window")))
+        mld = blk.get("proposed_mld")
+        s_pct = blk.get("start_projected_percent")
+        m_pct = blk.get("min_projected_percent")
+        e_pct = blk.get("end_projected_percent")
+        gap_html = f' <span style="color:#FCD34D; font-size:0.8rem;">[{html.escape(str(blk.get("gap_note")))}]</span>' if blk.get("is_gap") else ""
+        reasons_html = "".join(
+            f'<div style="color:#FCA5A5; margin-left:1rem; font-size:0.82rem;">&rarr; {html.escape(str(r))}</div>'
+            for r in blk.get("reasons", [])
+        )
+        lines_html.append(
+            f'<div style="margin-top:0.3rem;">{blk_badge} '
+            f'<span class="ag-mono">{win} @ {mld} MLD</span>{gap_html} '
+            f'<span style="color:#94A3B8;">({s_pct}% &rarr; min {m_pct}% &rarr; {e_pct}%)</span>'
+            f'{reasons_html}</div>'
+        )
+    st.markdown(f'<div class="{card_cls}">{"".join(lines_html)}</div>', unsafe_allow_html=True)
+
+
+def render_inline_approvals(widget_key: str) -> None:
+    """Render Pending Approval cards with Approve / Reject BUTTONS directly inside chat."""
+    conn = get_db_connection()
+    try:
+        pending_rows = conn.execute("SELECT * FROM pending_actions WHERE status = 'PENDING' ORDER BY id DESC;").fetchall()
+    finally:
+        conn.close()
+
+    if not pending_rows:
+        st.markdown('<div class="scada-card-ok"><strong>No PENDING actions awaiting approval.</strong></div>', unsafe_allow_html=True)
+        return
+
+    operator_name = st.session_state.get("operator_signature", "Lead_Operator_SCADA")
+
+    for row in pending_rows:
+        action_id = int(row["id"])
+        action_type = row["action_type"]
+        target_id = row["target_id"]
+        curr_fmt = _format_val(action_type, float(row["current_value"]))
+        prop_fmt = _format_val(action_type, float(row["proposed_value"]))
+        rationale = row["rationale"]
+        prov = row["provenance"] if "provenance" in row.keys() and row["provenance"] else "AGENT_ANALYSIS"
+        prov_ref = row["provenance_ref"] if "provenance_ref" in row.keys() and row["provenance_ref"] else ""
+        prov_txt = f"{prov} ({prov_ref})" if prov_ref else prov
+        prov_cls = "ag-badge-warn" if prov == "UNTRUSTED_TEXT" else "ag-badge-neutral"
+
+        st.markdown(
+            f"""
+            <div class="scada-card-pending">
+                <div>
+                    {status_badge("STAGED_PENDING_APPROVAL")}
+                    <span class="ag-badge {prov_cls}">{html.escape(prov_txt)}</span>
+                    <strong>Action #{action_id}:</strong>
+                    <span class="ag-mono">{html.escape(action_type)} {html.escape(target_id)} ({html.escape(curr_fmt)} &rarr; {html.escape(prop_fmt)})</span>
+                </div>
+                <div style="margin-top:0.3rem; font-size:0.86rem; color:#CBD5E1;">
+                    <strong>Reason:</strong> {html.escape(str(rationale))}
+                </div>
+                <div style="margin-top:0.2rem; font-size:0.8rem; color:#94A3B8;">
+                    Safety check: PASS at staging · Clicking Approve re-checks safety floor, water quality &amp; freshness and consumes a single-use token.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        c1, c2, _ = st.columns([1.0, 1.0, 2.5])
+        with c1:
+            if st.button(f"Approve #{action_id}", key=f"chat_approve_{widget_key}_{action_id}", type="primary", width="stretch"):
+                res = execute_human_approval(action_id=action_id, approver=operator_name)
+                st_code = res.get("status", "UNKNOWN")
+                if st_code == "EXECUTED":
+                    msg_txt = f"**Action #{action_id} ({action_type} {target_id}) `EXECUTED`** by `{res.get('approver')}`: {res.get('details', '')}"
+                else:
+                    msg_txt = f"**Action #{action_id} `{st_code}`:** {res.get('reason') or res.get('message', '')}"
+                st.session_state.setdefault("ask_aquagrid_messages", []).append(
+                    {
+                        "role": "assistant",
+                        "kind": "decision",
+                        "content": msg_txt,
+                        "provider": f"HUMAN_OPERATOR ({operator_name})",
+                        "tools_called": [],
+                        "code_checks": [
+                            {
+                                "check": "JIT Safety Re-check & Single-Use Token",
+                                "status": "PASS" if st_code == "EXECUTED" else "BLOCKED",
+                                "code": st_code,
+                                "detail": res.get("details") or res.get("reason") or "",
+                            }
+                        ],
+                        "widgets": [],
+                        "staged_action": res,
+                    }
+                )
+                st.rerun()
+        with c2:
+            if st.button(f"Reject #{action_id}", key=f"chat_reject_{widget_key}_{action_id}", width="stretch"):
+                res = execute_human_rejection(
+                    action_id=action_id,
+                    rejection_reason="Operator declined via chat approval card",
+                    approver=operator_name,
+                )
+                st.session_state.setdefault("ask_aquagrid_messages", []).append(
+                    {
+                        "role": "assistant",
+                        "kind": "decision",
+                        "content": f"**Action #{action_id} ({action_type} {target_id}) `REJECTED`** by `{res.get('approver')}`. No physical change made.",
+                        "provider": f"HUMAN_OPERATOR ({operator_name})",
+                        "tools_called": [],
+                        "code_checks": [],
+                        "widgets": [],
+                        "staged_action": res,
+                    }
+                )
+                st.rerun()
+
+
+def render_inline_scenario_card(payload: dict) -> None:
+    """Render concise Scenario Result card inside chat with collapsed Show details."""
+    sc_id = payload.get("scenario_id", "")
+    sc_title = payload.get("scenario_title", "")
+    result = payload.get("agent_result") or {}
+    scenario_info = payload.get("scenario_info") or {}
+    bypass_result = payload.get("bypass_result")
+    pre_approved_refusal = payload.get("pre_approved_refusal")
+
+    gw_resp = result.get("gateway_response") or {}
+    wq_comp = result.get("sector_water_quality_compliance") or {}
+    res_st = result.get("reservoir_status") or {}
+    u55_refusal = scenario_info.get("setpoint_refusal")
+    u54_token = scenario_info.get("token")
+    flagged_alerts = [a for a in result.get("sanitized_alerts", []) if a.get("injection_detected")]
+
+    if result.get("telemetry_loss"):
+        top_status, top_cls = "TELEMETRY_LOSS", "scada-card-alert"
+    elif flagged_alerts or bypass_result:
+        top_status, top_cls = "BLOCKED", "scada-card-alert"
+    elif pre_approved_refusal:
+        top_status, top_cls = pre_approved_refusal.get("status", "REJECTED_UNAUTHORIZED_APPROVAL_CLAIM"), "scada-card-pending"
+    elif u54_token:
+        top_status, top_cls = "REJECTED_APPROVAL_MISMATCH", "scada-card-alert"
+    elif gw_resp.get("status") == "STAGED_PENDING_APPROVAL":
+        top_status, top_cls = "STAGED_PENDING_APPROVAL", "scada-card-pending"
+    elif wq_comp.get("alerts"):
+        top_status, top_cls = "NON_COMPLIANT", "scada-card-alert"
+    else:
+        top_status, top_cls = result.get("status", "COMPLETED"), "scada-card-ok"
+
+    st.markdown(
+        f"""
+        <div class="{top_cls}">
+            <div>
+                <span class="scada-id-badge">{html.escape(str(sc_id))}</span>
+                <strong>{html.escape(str(sc_title))}</strong>
+                &nbsp;{status_badge(top_status)}
+            </div>
+            <div style="margin-top:0.35rem; font-size:0.89rem; color:#F8FAFC;">
+                {html.escape(str(result.get('operator_brief', '')))}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    old_plan = scenario_info.get("old_plan")
+    if res_st.get("has_active_emergency") and old_plan:
+        st.markdown(
+            f"""
+            <div class="scada-card-pending">
+                <div><strong>Old Plan:</strong> <span class="ag-mono">DESAL-01 &rarr; {old_plan.get('proposed_mld')} MLD</span> (min {old_plan.get('min_projected_percent')}%) {status_badge(old_plan.get('recheck_status', 'CANCELLED_BY_SAFETY_RECHECK'))}</div>
+                <div style="margin-top:0.25rem;"><strong>New Plan:</strong> <span class="ag-mono">DESAL-01 &rarr; {gw_resp.get('proposed_value', 65.0)} MLD</span> (min {gw_resp.get('min_projected_percent')}%) {status_badge(gw_resp.get('status', 'STAGED_PENDING_APPROVAL'))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if u55_refusal:
+        st.markdown(
+            f'<div class="scada-card-alert"><strong>Setpoint Request During Silence:</strong> <span class="ag-mono">DESAL-01 &rarr; 60.0 MLD</span> {status_badge(u55_refusal.get("status", "REJECTED_STALE_TELEMETRY"))}</div>',
+            unsafe_allow_html=True,
+        )
+
+    if pre_approved_refusal:
+        st.markdown(
+            f'<div class="scada-card-alert"><strong>Pre-Approved Call Refused:</strong> <span class="ag-mono">CLOSE_VALVE V-17 (pre_approved=True)</span> {status_badge(pre_approved_refusal.get("status", "REJECTED_UNAUTHORIZED_APPROVAL_CLAIM"))}</div>',
+            unsafe_allow_html=True,
+        )
+
+    if u54_token:
+        replay_v18 = scenario_info.get("replay_v18") or {}
+        replay_v17 = scenario_info.get("replay_v17") or {}
+        st.markdown(
+            f"""
+            <div class="scada-card-alert">
+                <div><strong>14:05 Token Executed:</strong> V-17 {status_badge('CLOSED')} · V-18 {status_badge('OPEN')}</div>
+                <div style="margin-top:0.25rem;"><strong>14:40 Replay V-18:</strong> {status_badge(replay_v18.get('status', 'REJECTED_APPROVAL_MISMATCH'))}</div>
+                <div style="margin-top:0.25rem;"><strong>14:40 Replay V-17:</strong> {status_badge(replay_v17.get('status', 'REJECTED_APPROVAL_ALREADY_USED'))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if bypass_result:
+        st.markdown(
+            f'<div class="scada-card-alert"><strong>Direct Write Bypass:</strong> <span class="ag-mono">{html.escape(str(bypass_result.get("attempted_action")))}</span> {status_badge(bypass_result.get("status", "REFUSED"))} · V-12 {status_badge(str(bypass_result.get("valve_status_after", "OPEN")))}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_chat_widget(widget: dict, widget_key: str, snapshot: dict) -> None:
+    """Dispatch a single chat widget spec to its inline renderer."""
+    w_type = widget.get("type")
+    if w_type == "map":
+        render_inline_map(widget.get("sector"), widget.get("leak_id"), widget_key, snapshot)
+    elif w_type == "chart":
+        render_inline_chart(widget.get("metric", "reservoir"), widget.get("asset"), int(widget.get("hours", 24)), snapshot)
+    elif w_type == "table":
+        render_inline_table(widget.get("what", "leaks"))
+    elif w_type == "schedule_validation":
+        render_inline_schedule_validation(widget.get("plan", ""), widget.get("validation") or {})
+    elif w_type == "approvals":
+        render_inline_approvals(widget_key)
+    elif w_type == "scenario_result":
+        render_inline_scenario_card(widget)

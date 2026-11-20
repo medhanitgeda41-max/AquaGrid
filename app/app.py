@@ -1,4 +1,4 @@
-"""AquaGrid Streamlit SCADA Control Room — Clean Operator Dashboard & AI Prompt.
+"""AquaGrid Chat-First SCADA Control Room.
 
 Launch from project root:
     python -m streamlit run app/app.py
@@ -14,6 +14,7 @@ for _p in (PROJECT_ROOT, APP_DIR):
         sys.path.insert(0, _p)
 
 import streamlit as st
+from agent.chat_assistant import collect_system_alerts
 from config.constants import DEFAULT_SCADA_HOUR
 from config.region_config import now_local
 from database.connection import get_db_connection, init_db
@@ -21,15 +22,8 @@ from database.seed_data import seed_database
 from simulator import get_simulator
 from components.badges import inject_scada_css
 from components.header import render_header
-from components.live_sim_control import render_live_sim_controls
-from components.approval_card import render_approval_card
-from components.ai_prompt_panel import render_ai_prompt_panel
-from components.incident_brief import render_incident_brief
-from components.scenario_selector import render_scenario_selector
-from components.leak_map_view import render_leak_map_view
-from components.telemetry_view import render_telemetry_view
-from components.ai_suggestions_view import render_ai_suggestions_and_run_log
-from components.audit_log_view import render_audit_log
+from components.sidebar import render_sidebar
+from components.ai_prompt_panel import render_ask_aquagrid_chat
 
 
 def _ensure_database_initialized() -> None:
@@ -49,69 +43,42 @@ def _ensure_database_initialized() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="AquaGrid SCADA Control Room",
+        page_title="Ask AquaGrid — SCADA Control Room",
         page_icon="💧",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
     inject_scada_css()
     _ensure_database_initialized()
 
-    # 1. Header: 5 Key Operator Values + Active Alerts
+    # Determine active clock hour (real Dubai hour when Live Sim is ON, or 14:00 for deterministic scenarios)
     sim = get_simulator()
-    if st.session_state.get("live_sim_toggle", False):
-        display_hour = sim.current_hour if not sim.real_time_clock else now_local().hour
+    if st.session_state.get("live_sim_toggle", False) and sim is not None:
+        display_hour = sim.current_hour if not getattr(sim, "real_time_clock", True) else now_local().hour
     else:
         display_hour = DEFAULT_SCADA_HOUR
+
+    # 1. Thin always-visible 1-line status bar at top
     snapshot = render_header(display_hour=display_hour)
 
-    # 2. Compact Live Simulation Bar
-    render_live_sim_controls()
+    # 2. Compact sidebar: Live Simulation, Scenarios (Round 1 & 2), Open Audit Log, Tech Details, Clear Chat
+    render_sidebar()
 
-    # 3. Pending Approvals surfaced immediately whenever operator signoff is needed
-    pending_count = snapshot.get("pending_count", 0)
-    if pending_count > 0 or st.session_state.get("last_hitl_feedback"):
-        render_approval_card(key_prefix="top", show_history=False)
-
-    st.divider()
-
-    # 4. Clean 4-Tab Operator Workspace
-    approvals_badge = f" ({pending_count})" if pending_count > 0 else ""
-    tab_main, tab_map, tab_telemetry, tab_logs = st.tabs(
-        [
-            f"Overview & AI{approvals_badge}",
-            "Leak Map",
-            "Telemetry",
-            "Logs & Details",
-        ]
+    # 3. Auto-post any new system ALERT messages (leaks, water quality, telemetry loss, floor breach, live checks) into chat
+    seen_alerts = st.session_state.setdefault("_seen_alert_keys", set())
+    live_summary = getattr(sim, "last_tick_summary", None) if st.session_state.get("live_sim_toggle", False) else None
+    new_alert_msgs, updated_seen = collect_system_alerts(
+        telemetry_data=snapshot.get("telemetry_data") or {},
+        feeds_data=snapshot.get("feeds_data") or {},
+        seen_alert_keys=seen_alerts,
+        live_tick_summary=live_summary,
     )
+    if new_alert_msgs:
+        st.session_state["_seen_alert_keys"] = updated_seen
+        st.session_state.setdefault("ask_aquagrid_messages", []).extend(new_alert_msgs)
 
-    with tab_main:
-        # AI Prompt Area (request box + Run + step-by-step trace + clear final result)
-        render_ai_prompt_panel(display_hour=display_hour)
-
-        # Latest Scenario Result (concise summary + collapsed Show details)
-        if st.session_state.get("last_agent_result"):
-            st.divider()
-            render_incident_brief()
-
-        st.divider()
-
-        # Round 1 & Round 2 Scenarios + Reset
-        render_scenario_selector()
-
-    with tab_map:
-        render_leak_map_view(snapshot)
-
-    with tab_telemetry:
-        render_telemetry_view(snapshot)
-
-    with tab_logs:
-        render_approval_card(key_prefix="center", show_history=True)
-        st.divider()
-        render_ai_suggestions_and_run_log()
-        st.divider()
-        render_audit_log()
+    # 4. Full-width "Ask AquaGrid" multi-turn chat with inline visual widgets & button-only approvals
+    render_ask_aquagrid_chat(display_hour=display_hour, snapshot=snapshot)
 
 
 if __name__ == "__main__":
