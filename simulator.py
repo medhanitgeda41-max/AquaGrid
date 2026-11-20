@@ -108,6 +108,7 @@ class LiveScadaSimulator:
         self._rng = random.Random(seed)
 
         self._lock = threading.Lock()
+        self._step_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._tick_count: int = 0
@@ -118,6 +119,11 @@ class LiveScadaSimulator:
         self._prev_sensor_vals: dict[str, float] = {}
         self._prev_sector_chlorine: dict[str, float] = {}
         self._feed_paused: bool = False
+
+    @property
+    def step_lock(self) -> threading.RLock:
+        """Re-entrant lock serializing simulator batch writes against scenario DB resets."""
+        return self._step_lock
 
     @property
     def is_feed_paused(self) -> bool:
@@ -217,6 +223,13 @@ class LiveScadaSimulator:
             self._feed_paused = False
 
     def step(self, force_fault: Optional[str] = None, now_override: Optional[datetime] = None) -> dict:
+        """
+        Execute one SCADA batch tick (serialized with step_lock so concurrent scenarios never contend on SQLite).
+        """
+        with self._step_lock:
+            return self._step_impl(force_fault=force_fault, now_override=now_override)
+
+    def _step_impl(self, force_fault: Optional[str] = None, now_override: Optional[datetime] = None) -> dict:
         """
         Execute one SCADA batch tick:
         - In real-time mode: uses real local Dubai time (HH:MM:SS), diurnal demand curve,

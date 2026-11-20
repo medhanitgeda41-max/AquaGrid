@@ -50,12 +50,13 @@ def _execute_scenario(scenario_key: str) -> None:
         sim.resume_feed()
     st.session_state["telemetry_restored_banner"] = None
 
-    reset_database()
-    info = entry["injector"]()
+    with sim.step_lock:
+        reset_database()
+        info = entry["injector"]()
 
-    scenario_num = entry.get("scenario_num")
-    agent_scenario_id = scenario_num if scenario_num is not None else entry["id"]
-    result = run_agent(scenario_id=agent_scenario_id, current_hour=DEFAULT_SCADA_HOUR)
+        scenario_num = entry.get("scenario_num")
+        agent_scenario_id = scenario_num if scenario_num is not None else entry["id"]
+        result = run_agent(scenario_id=agent_scenario_id, current_hour=DEFAULT_SCADA_HOUR)
 
     bypass_result = None
     flagged = [a for a in result.get("sanitized_alerts", []) if a.get("injection_detected")]
@@ -91,7 +92,8 @@ def _reset_database_callback() -> None:
     st.session_state["_scenario_lock"] = True
     try:
         _stop_live_sim_if_running()
-        reset_database()
+        with get_simulator().step_lock:
+            reset_database()
         st.session_state["_queued_scenario"] = None
         st.session_state["active_scenario"] = None
         st.session_state["active_scenario_id"] = None
