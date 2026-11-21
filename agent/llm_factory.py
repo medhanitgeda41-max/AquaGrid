@@ -425,17 +425,21 @@ class LLMClient:
         messages: list[dict],
         fallback_context_builder: Optional[Callable[[], str]] = None,
     ) -> str:
-        """If a provider does not support tool calling or returned empty content, pre-fetch live data into prompt."""
+        """Retry once without tools using the live SCADA snapshot already in messages (or fetched via builder)."""
         conv = [dict(m) for m in messages]
-        if fallback_context_builder is not None:
+        has_snapshot_already = any(
+            m.get("role") == "system" and "LIVE SCADA SNAPSHOT" in str(m.get("content", ""))
+            for m in conv
+        )
+        if not has_snapshot_already and fallback_context_builder is not None:
             ctx_blob = fallback_context_builder()
             if ctx_blob:
                 conv.append(
                     {
                         "role": "system",
                         "content": (
-                            "Tool calling is unavailable for this turn. Answer using ONLY this live SCADA data "
-                            "fetched by Python code (never invent numbers):\n" + ctx_blob
+                            "LIVE SCADA SNAPSHOT (fetched by Python code — use these exact values, "
+                            "never ask the operator to enable tools or run queries):\n" + ctx_blob
                         ),
                     }
                 )
@@ -549,7 +553,7 @@ class LLMClient:
                         conv.append(
                             {
                                 "role": "assistant",
-                                "content": clean_text or "",
+                                "content": clean_text if clean_text else None,
                                 "tool_calls": serialized_calls,
                             }
                         )
@@ -575,7 +579,6 @@ class LLMClient:
                                 {
                                     "role": "tool",
                                     "tool_call_id": tc_id,
-                                    "name": fn_name,
                                     "content": json.dumps(tool_out, default=str),
                                 }
                             )
@@ -591,7 +594,7 @@ class LLMClient:
                     break
             except Exception as e:
                 logger.exception("Chat provider %s failed during tool-calling turn", p["name"])
-                # Retry once on the same provider WITHOUT tools (handles models lacking tool-call support)
+                # Retry once on the same provider WITHOUT tools (handles Groq/Gemini/Ollama tool-call errors)
                 needs_no_tools_retry = True
                 tool_err = f"{type(e).__name__}: {e}"
             else:
@@ -606,12 +609,18 @@ class LLMClient:
                         fallback_context_builder=fallback_context_builder,
                     )
                     if plain_text:
-                        tried.append({"provider": p["name"], "status": "OK (no-tools fallback)", "error": ""})
+                        tried.append(
+                            {
+                                "provider": p["name"],
+                                "status": "OK (retried without tools)",
+                                "error": f"Tool call failed ({tool_err}); answered using live snapshot",
+                            }
+                        )
                         return plain_text, p["name"], tool_trace
                     tried.append({"provider": p["name"], "status": "FAILED", "error": tool_err})
                 except Exception as e2:
                     logger.exception("Chat provider %s also failed without tools", p["name"])
-                    tried.append({"provider": p["name"], "status": "FAILED", "error": f"{type(e2).__name__}: {e2}"})
+                    tried.append({"provider": p["name"], "status": "FAILED", "error": f"{tool_err} | retry: {type(e2).__name__}: {e2}"})
 
         return None, "Deterministic Offline Engine", []
 

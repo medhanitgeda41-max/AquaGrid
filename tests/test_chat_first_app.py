@@ -371,3 +371,133 @@ def test_end_to_end_chat_questions_in_dev_and_demo_mode(llm_mode):
         for am in alert_msgs:
             assert "**" not in am.get("alert_body", "")
             assert "`" not in am.get("alert_body", "")
+
+
+def test_five_hour_plan_with_mocked_groq_validates_replans_and_stages_action():
+    """'make a 5-hour production plan' with mocked Groq returns exact 5-hour plan, validation, reservoir chart, and STAGED_PENDING_APPROVAL."""
+    import json
+    from types import SimpleNamespace
+    from agent.chat_assistant import parse_planning_horizon_hours
+    from agent.llm_factory import LLMClient
+    from config.settings import settings
+
+    assert parse_planning_horizon_hours("make a 5-hour production plan") == 5
+    assert parse_planning_horizon_hours("plan the next 8 hours") == 8
+    assert parse_planning_horizon_hours("plan production for tomorrow") == 24
+    assert parse_planning_horizon_hours("Why was the last plan rejected?") is None
+
+    # Raise peak demand so an aggressive 5 MLD plan breaches 35% floor and forces a replan!
+    conn = get_db_connection()
+    try:
+        for h in range(14, 19):
+            conn.execute("UPDATE demand_forecast SET demand_mld = 320.0 WHERE hour = ?;", (h,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    groq_calls = {"n": 0, "saw_snapshot": False}
+
+    def _mock_groq_create(**kwargs):
+        groq_calls["n"] += 1
+        sys_blob = " ".join(str(m.get("content", "")) for m in kwargs.get("messages", []) if m.get("role") == "system")
+        if "LIVE SCADA SNAPSHOT" in sys_blob and "tariffs_next_24h" in sys_blob:
+            groq_calls["saw_snapshot"] = True
+        if groq_calls["n"] == 1:
+            # Attempt 1: aggressive peak cut -> Python physics guard rejects (< 35% floor)
+            payload = json.dumps({"outputs_mld": [5.0, 5.0, 5.0, 5.0, 5.0], "summary": "Aggressive peak cut."})
+        else:
+            # Attempt 2 (replan): safe 5-hour schedule above 35% floor
+            payload = json.dumps({"outputs_mld": [75.0, 75.0, 75.0, 75.0, 95.0], "summary": "Replanned safe 5-hour schedule."})
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=payload, tool_calls=None))])
+
+    fake_groq = [
+        {"name": "Groq (openai/gpt-oss-120b)", "base_url": "https://api.groq.com/openai/v1", "api_key": "gsk_live_test", "model": "openai/gpt-oss-120b", "timeout": 10.0, "max_retries": 0}
+    ]
+    client = LLMClient(mode="demo")
+
+    with (
+        patch.object(settings, "LLM_MODE", "demo"),
+        patch.object(client, "_get_chat_provider_chain", return_value=fake_groq),
+        patch("agent.chat_assistant.llm_client", client),
+        patch("agent.llm_factory.OpenAI", return_value=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_mock_groq_create)))),
+    ):
+        reply = run_chat_turn("make a 5-hour production plan", history=[], current_hour=14)
+
+    assert groq_calls["saw_snapshot"] is True
+    assert groq_calls["n"] == 2, "Planner must replan when first 5h schedule breaches 35% floor!"
+    assert reply["provider"] == "Groq (openai/gpt-oss-120b)"
+    assert len(reply["plan_rows"]) == 5
+    assert [r["Window"] for r in reply["plan_rows"]] == [
+        "14:00-15:00",
+        "15:00-16:00",
+        "16:00-17:00",
+        "17:00-18:00",
+        "18:00-19:00",
+    ]
+    assert reply["schedule_validation"]["status"] == "VALID"
+    assert reply["staged_action"]["status"] == "STAGED_PENDING_APPROVAL"
+    assert reply["staged_action"]["action_type"] == "SET_PLANT_OUTPUT"
+    assert reply["staged_action"]["target_id"] == "DESAL-01"
+
+    widget_types = [w["type"] for w in reply["widgets"]]
+    assert "plan_table" in widget_types
+    assert "schedule_validation" in widget_types
+    assert "chart" in widget_types
+    assert "approvals" in widget_types
+
+    lower_ans = reply["content"].lower()
+    assert "enable tool" not in lower_ans
+    assert "run the live queries" not in lower_ans
+
+    # Plant setpoint must NOT be mutated until operator clicks Approve
+    conn = get_db_connection()
+    try:
+        assert float(conn.execute("SELECT production_mld FROM plant_setpoints WHERE plant_id = 'DESAL-01';").fetchone()["production_mld"]) == 100.0
+    finally:
+        conn.close()
+
+
+def test_groq_tool_call_failure_retries_without_tools_using_snapshot_and_never_begs_for_tools():
+    """If Groq tool calling fails, code retries once without tools using pre-loaded live snapshot; tool-begging text is never returned."""
+    from types import SimpleNamespace
+    from agent.llm_factory import LLMClient
+
+    calls = []
+
+    def _groq_tool_fail_then_snapshot(**kwargs):
+        calls.append(kwargs)
+        if "tools" in kwargs:
+            raise RuntimeError("400 Bad Request: tool_use_failed")
+        # Retry without tools MUST already contain the live SCADA snapshot!
+        sys_txt = " ".join(str(m.get("content", "")) for m in kwargs.get("messages", []) if m.get("role") == "system")
+        assert "LIVE SCADA SNAPSHOT" in sys_txt
+        assert "48.0" in sys_txt
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Reservoir RES-01 is at 48.0% with 0 active leaks.", tool_calls=None))])
+
+    fake_groq = [
+        {"name": "Groq (openai/gpt-oss-120b)", "base_url": "https://api.groq.com/openai/v1", "api_key": "gsk_live_test", "model": "openai/gpt-oss-120b", "timeout": 10.0, "max_retries": 0}
+    ]
+    client = LLMClient(mode="demo")
+
+    with (
+        patch.object(client, "_get_chat_provider_chain", return_value=fake_groq),
+        patch("agent.chat_assistant.llm_client", client),
+        patch("agent.llm_factory.OpenAI", return_value=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=_groq_tool_fail_then_snapshot)))),
+    ):
+        reply = run_chat_turn("What is the current status?", history=[], current_hour=14)
+
+    assert len(calls) == 2
+    assert "tools" in calls[0] and "tools" not in calls[1]
+    assert reply["provider"] == "Groq (openai/gpt-oss-120b)"
+    assert "48.0%" in reply["content"]
+    assert "enable tool" not in reply["content"].lower()
+    assert "run the live queries" not in reply["content"].lower()
+    assert any("tool_use_failed" in str(pt.get("error", "")) for pt in reply["providers_tried"])
+
+    # Also verify anti-begging guard: if an LLM ever says "re-enable tool calls" / "run the live queries", it is replaced!
+    begging_text = "Let me know when you'd like me to run the live queries (or if you can re-enable tool calls)."
+    with patch("agent.chat_assistant.llm_client.chat_with_tools", return_value=(begging_text, "Groq (openai/gpt-oss-120b)", [])):
+        clean_reply = run_chat_turn("What is the reservoir level?", history=[], current_hour=14)
+        assert "enable tool" not in clean_reply["content"].lower()
+        assert "run the live queries" not in clean_reply["content"].lower()
+        assert "48.0%" in clean_reply["content"]

@@ -526,6 +526,15 @@ def render_inline_scenario_card(payload: dict) -> None:
         )
 
 
+def render_inline_plan_table(horizon_hours: int, rows: list[dict]) -> None:
+    """Render an N-hour production plan table inside chat."""
+    if not rows:
+        return
+    st.markdown(f"**{horizon_hours}-Hour Production Plan**")
+    df = pd.DataFrame(rows)
+    st.dataframe(df, width="stretch", hide_index=True, height=min(360, 42 + len(df) * 35))
+
+
 def render_chat_widget(widget: dict, widget_key: str, snapshot: dict) -> None:
     """Dispatch a single chat widget spec to its inline renderer."""
     w_type = widget.get("type")
@@ -535,6 +544,8 @@ def render_chat_widget(widget: dict, widget_key: str, snapshot: dict) -> None:
         render_inline_chart(widget.get("metric", "reservoir"), widget.get("asset"), int(widget.get("hours", 24)), snapshot)
     elif w_type == "table":
         render_inline_table(widget.get("what", "leaks"))
+    elif w_type == "plan_table":
+        render_inline_plan_table(int(widget.get("horizon_hours", len(widget.get("rows") or []))), widget.get("rows") or [])
     elif w_type == "schedule_validation":
         render_inline_schedule_validation(widget.get("plan", ""), widget.get("validation") or {})
     elif w_type == "approvals":

@@ -44,17 +44,19 @@ EXAMPLE_QUESTIONS = [
 ASK_AQUAGRID_SYSTEM_PROMPT = """You are Ask AquaGrid, the real-time SCADA AI assistant for the Coastal Water Authority.
 
 STRICT RULES:
-1. ALWAYS call the live read tools before stating any number (reservoir %, MLD output, tariff rate, pressures, flows, chlorine residual, leaks, valve states, or audit history). NEVER invent or guess numbers.
-2. Answer ANY operator question clearly and concisely: plant status, leaks, quarantined sensors, reservoir & dynamic emergency floor, electricity tariffs, what-if schedules, past actions in the Audit Log, why a plan was rejected, what any technical status code means, and recommended next steps.
-3. Use prior conversation messages naturally for follow-up questions (e.g. "Why?", "What about Sector 2?", "And if demand rises?").
-4. Use DISPLAY TOOLS to render helpful visuals inside your reply whenever relevant:
-   - show_map(sector, leak_id): when asked about map locations, leaks, or a sector.
+1. A complete LIVE SCADA SNAPSHOT (reservoir %, dynamic floor, DESAL-01 output & limits, algae bloom cap, next 24h tariffs & demand forecast, active leaks, quarantined sensors, per-sector chlorine, pending actions, and telemetry freshness) is ALREADY provided in the system context for every turn. Use those live values directly — NEVER invent numbers.
+2. NEVER ask the operator to enable tools, re-enable tool calls, run live queries, or supply data that the system already has. Tool calls are OPTIONAL for extra details (Audit Log lookup, rendering maps/charts/tables, validating custom schedules, or staging a gated action).
+3. If live data is genuinely unavailable (for example telemetry_freshness.is_telemetry_loss is true / TELEMETRY_LOSS), explicitly state WHICH telemetry data is missing or stale and WHY you cannot plan or stage setpoint/valve changes until the feed is restored.
+4. Answer ANY operator question clearly and concisely: plant status, leaks, quarantined sensors, reservoir & dynamic emergency floor, electricity tariffs, hourly production plans, past actions in the Audit Log, why a plan was rejected, what any technical status code means, and next steps.
+5. Use prior conversation messages naturally for follow-up questions (e.g. "Why?", "What about Sector 2?", "And if demand rises?").
+6. Use DISPLAY TOOLS to render helpful visuals inside your reply whenever relevant:
+   - show_map(sector, leak_id): map locations, leaks, or a sector.
    - show_chart(metric, asset, hours): metric in ["pressure", "flow", "reservoir", "tariff"].
    - show_table(what): what in ["leaks", "sensors", "schedule", "audit", "valves"].
-   - show_schedule_validation(plan): whenever validating or planning a 24h production schedule.
-   - show_pending_approvals(): whenever showing pending actions awaiting operator signoff.
-5. If the operator asks for a physical change (e.g. "reduce output to 70 MLD", "close V-12", "isolate and flush Sector 2"), you may ONLY call propose_gated_action. All Python safety guards run automatically inside the gateway. State the exact gateway status code (STAGED_PENDING_APPROVAL or REJECTED_* + reason) and remind the operator to click the Approve or Reject button on the approval card.
-6. You can NEVER execute, auto-approve, or bypass operator approval. Keep exact technical status codes unchanged (STAGED_PENDING_APPROVAL, REJECTED_BY_SAFETY_GUARD, REJECTED_WATER_QUALITY, CANCELLED_BY_SAFETY_RECHECK, REJECTED_UNAUTHORIZED_APPROVAL_CLAIM, REJECTED_APPROVAL_MISMATCH, REJECTED_APPROVAL_ALREADY_USED, REJECTED_APPROVAL_EXPIRED, TELEMETRY_LOSS, REJECTED_STALE_TELEMETRY, CANCELLED_STALE_TELEMETRY, NON_COMPLIANT, UNTRUSTED_TEXT, VALID, GAP).
+   - show_schedule_validation(plan): validating a production schedule.
+   - show_pending_approvals(): showing pending actions awaiting operator signoff.
+7. If the operator asks for a physical change (e.g. "reduce output to 70 MLD", "close V-12", "isolate and flush Sector 2"), you may ONLY call propose_gated_action. All Python safety guards run automatically inside the gateway. State the exact gateway status code (STAGED_PENDING_APPROVAL or REJECTED_* + reason) and remind the operator to click the Approve or Reject button on the approval card.
+8. You can NEVER execute, auto-approve, or bypass operator approval. Keep exact technical status codes unchanged (STAGED_PENDING_APPROVAL, REJECTED_BY_SAFETY_GUARD, REJECTED_WATER_QUALITY, CANCELLED_BY_SAFETY_RECHECK, REJECTED_UNAUTHORIZED_APPROVAL_CLAIM, REJECTED_APPROVAL_MISMATCH, REJECTED_APPROVAL_ALREADY_USED, REJECTED_APPROVAL_EXPIRED, TELEMETRY_LOSS, REJECTED_STALE_TELEMETRY, CANCELLED_STALE_TELEMETRY, NON_COMPLIANT, UNTRUSTED_TEXT, VALID, GAP).
 """
 
 CHAT_TOOLS_SCHEMA: list[dict] = [
@@ -68,6 +70,7 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
                 "properties": {
                     "current_hour": {"type": "integer", "description": "Hour of day (0-23). Defaults to active SCADA hour."}
                 },
+                "required": [],
             },
         },
     },
@@ -82,6 +85,7 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
                     "horizon_hours": {"type": "integer", "description": "Forecast horizon in hours (default 6)."},
                     "current_hour": {"type": "integer", "description": "Hour of day (0-23)."},
                 },
+                "required": [],
             },
         },
     },
@@ -90,7 +94,7 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
         "function": {
             "name": "read_valves_and_pending_actions",
             "description": "Read live isolation valve states (V-01..V-20), DESAL-01 plant setpoint, active emergency commitments, pending/resolved actions, and tracked map leaks.",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -104,6 +108,7 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
                     "limit": {"type": "integer", "description": "Max entries to return (default 20, max 50)."},
                     "event_filter": {"type": "string", "description": "Optional substring filter on event_type, status, or details."},
                 },
+                "required": [],
             },
         },
     },
@@ -118,6 +123,7 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
                     "sector": {"type": "string", "description": "Optional sector name like 'Sector 4'."},
                     "leak_id": {"type": "string", "description": "Optional leak ID like 'LEAK-001'."},
                 },
+                "required": [],
             },
         },
     },
@@ -163,13 +169,13 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "show_schedule_validation",
-            "description": "Validate a 24h production schedule using the deterministic Python physics guard and display the hour-by-hour check card in chat.",
+            "description": "Validate a production schedule using the deterministic Python physics guard and display the hour-by-hour check card in chat.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "plan": {
                         "type": "string",
-                        "description": "Time-blocked schedule string, e.g. '00:00-06:00 at 115 MLD, 06:00-14:00 at 95 MLD, 14:00-18:00 at 60 MLD, 18:00-24:00 at 95 MLD'.",
+                        "description": "Time-blocked schedule string, e.g. '14:00-15:00 at 65 MLD, 15:00-16:00 at 65 MLD'.",
                     },
                     "current_hour": {"type": "integer", "description": "Starting hour (default active SCADA hour)."},
                 },
@@ -182,7 +188,7 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
         "function": {
             "name": "show_pending_approvals",
             "description": "Display interactive Pending Approval cards (with Approve and Reject buttons) inside this chat reply.",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -228,6 +234,528 @@ _SCENARIO_TRIGGER_RE = re.compile(
     r"\b(?:run|start|trigger|execute|launch|load)\s+(?:scenario\s+)?(r1-s[1-4]|u-5\.[1-5]|[1-4])\b",
     re.IGNORECASE,
 )
+
+_PLAN_HOURS_RE = re.compile(
+    r"(?:(?:next|for)\s+(\d{1,2})\s*[- ]?\s*h(?:our)?s?|(\d{1,2})\s*[- ]?\s*h(?:our)?s?\s*(?:production\s+)?(?:plan|schedule))",
+    re.IGNORECASE,
+)
+
+_TOOL_BEGGING_RE = re.compile(
+    r"(?:re-?enable\s+tool|enable\s+tool|run\s+the\s+live\s+queries|enable\s+function\s+call|"
+    r"let\s+me\s+know\s+when\s+you(?:'d| would)\s+like\s+me\s+to\s+run|don't\s+have\s+access\s+to\s+live)",
+    re.IGNORECASE,
+)
+
+
+def parse_planning_horizon_hours(text: str) -> Optional[int]:
+    """Detect production planning requests and return requested horizon in hours (1..24), or None."""
+    cleaned = (text or "").strip()
+    lower = cleaned.lower()
+    if not cleaned:
+        return None
+    # Do not intercept questions asking WHY a previous plan was rejected/cancelled
+    if any(k in lower for k in ("why ", "why?", "rejected", "cancelled", "last plan", "what does ", "meaning of")):
+        return None
+    if not any(k in lower for k in ("plan", "schedule")):
+        return None
+    # Explicit N hours (e.g. "make a 5-hour production plan", "plan the next 8 hours", "24-hour plan")
+    m = _PLAN_HOURS_RE.search(cleaned)
+    if m:
+        raw_n = m.group(1) or m.group(2)
+        if raw_n and raw_n.isdigit():
+            return max(1, min(int(raw_n), 24))
+    if "tomorrow" in lower or "next day" in lower or "24h" in lower:
+        return 24
+    if any(k in lower for k in ("make a", "create a", "build a", "generate a", "draft a", "plan production", "production plan", "production schedule")):
+        return 24
+    return None
+
+
+def build_live_scada_snapshot(
+    current_hour: int = DEFAULT_SCADA_HOUR,
+    db_path: Optional[str] = None,
+) -> dict:
+    """Fetch a compact, complete live SCADA snapshot BEFORE calling the LLM so it always has real data."""
+    tel = read_network_telemetry(current_hour=current_hour, db_path=db_path, log_audit=False)
+    feeds = read_tariff_and_quality_feeds(horizon_hours=24, current_hour=current_hour, db_path=db_path, log_audit=False)
+    vp = _read_valves_and_pending_snapshot(db_path=db_path)
+
+    conn = get_db_connection(db_path)
+    try:
+        t_rows = conn.execute("SELECT hour, rate_per_kwh, is_peak FROM tariffs ORDER BY hour ASC;").fetchall()
+        d_rows = conn.execute("SELECT hour, demand_mld FROM demand_forecast ORDER BY hour ASC;").fetchall()
+    finally:
+        conn.close()
+
+    tariff_by_h = {int(r["hour"]): {"rate_per_kwh": float(r["rate_per_kwh"]), "is_peak": bool(r["is_peak"])} for r in t_rows}
+    demand_by_h = {int(r["hour"]): float(r["demand_mld"]) for r in d_rows}
+
+    tariffs_24h = []
+    demand_24h = []
+    for off in range(24):
+        h = (current_hour + off) % 24
+        t_info = tariff_by_h.get(h, {"rate_per_kwh": 0.20, "is_peak": False})
+        tariffs_24h.append({"hour": f"{h:02d}:00", "rate_per_kwh": t_info["rate_per_kwh"], "is_peak": t_info["is_peak"]})
+        demand_24h.append({"hour": f"{h:02d}:00", "demand_mld": demand_by_h.get(h, 90.0)})
+
+    res = feeds.get("reservoir") or {}
+    wq = feeds.get("water_quality") or {}
+    wq_comp = feeds.get("sector_water_quality_compliance") or {}
+    plant = vp.get("plant_setpoint") or {}
+
+    return {
+        "current_hour": current_hour,
+        "reservoir": {
+            "level_percent": float(res.get("current_level_percent", 48.0)),
+            "volume_ml": float(res.get("current_volume_ml", 240.0)),
+            "capacity_ml": float(res.get("capacity_ml", 500.0)),
+            "safety_floor_percent": float(res.get("safety_floor_percent", 35.0)),
+            "has_active_emergency": bool(res.get("has_active_emergency", False)),
+            "floor_banner": res.get("floor_banner", ""),
+        },
+        "desal_01": {
+            "current_output_mld": float(feeds.get("current_plant_output_mld", plant.get("production_mld", 100.0))),
+            "min_mld": 0.0,
+            "max_capacity_mld": float(plant.get("max_capacity_mld", 120.0)),
+            "algae_cap_mld": float(wq.get("max_allowable_output_mld", 120.0)),
+            "bloom_severity": str(wq.get("bloom_severity", "NONE")),
+            "status": str(plant.get("status", "ONLINE")),
+        },
+        "tariffs_next_24h": tariffs_24h,
+        "demand_next_24h": demand_24h,
+        "tariff_by_hour": tariff_by_h,
+        "demand_by_hour": demand_by_h,
+        "active_leaks": tel.get("leak_alerts") or [],
+        "quarantined_sensors": [
+            {"sensor_id": s.get("sensor_id"), "junction_id": s.get("junction_id"), "sector": s.get("sector"), "reasons": s.get("reasons", [])}
+            for s in (tel.get("quarantined_sensors") or [])
+        ],
+        "sector_chlorine": wq_comp.get("sectors") or [],
+        "excluded_sectors": feeds.get("excluded_sectors") or [],
+        "pending_actions": [
+            {
+                "id": p["id"],
+                "action_type": p["action_type"],
+                "target_id": p["target_id"],
+                "current_value": p["current_value"],
+                "proposed_value": p["proposed_value"],
+                "rationale": p["rationale"],
+                "provenance": p.get("provenance", "AGENT_ANALYSIS"),
+            }
+            for p in (vp.get("pending_actions") or [])
+        ],
+        "telemetry_freshness": tel.get("telemetry_freshness") or {},
+        "raw_feeds": feeds,
+        "raw_telemetry": tel,
+    }
+
+
+def _compact_snapshot_json(snapshot: dict) -> str:
+    """Serialize snapshot excluding redundant raw_feeds/raw_telemetry/by_hour dicts for concise LLM context."""
+    compact = {
+        k: v
+        for k, v in snapshot.items()
+        if k not in ("raw_feeds", "raw_telemetry", "tariff_by_hour", "demand_by_hour")
+    }
+    return json.dumps(compact, separators=(",", ":"), default=str)
+
+
+def _format_hourly_blocks(start_hour: int, hourly_outputs: list[float]) -> str:
+    """Format exact hourly blocks '14:00-15:00 at 65 MLD, 15:00-16:00 at 65 MLD, ...'."""
+    parts = []
+    for idx, mld in enumerate(hourly_outputs):
+        h0 = (start_hour + idx) % 24
+        h1 = (start_hour + idx + 1) % 24
+        h1_str = "24:00" if (h0 == 23 and h1 == 0) else f"{h1:02d}:00"
+        parts.append(f"{h0:02d}:00-{h1_str} at {round(float(mld), 1):g} MLD")
+    return ", ".join(parts)
+
+
+def _deterministic_hourly_plan(
+    snapshot: dict,
+    horizon_hours: int,
+    boost_mld: float = 0.0,
+) -> list[float]:
+    """Compute a tariff-aware, bloom-capped, water-quality-safe hourly output sequence for exact N hours."""
+    start_h = int(snapshot["current_hour"])
+    desal = snapshot["desal_01"]
+    algae_cap = float(desal["algae_cap_mld"])
+    curr_mld = float(desal["current_output_mld"])
+    res = snapshot["reservoir"]
+    eff_floor = float(res["safety_floor_percent"])
+    start_vol = float(res["volume_ml"])
+    cap_ml = float(res["capacity_ml"])
+    tariff_by_h = snapshot["tariff_by_hour"]
+    demand_by_h = snapshot["demand_by_hour"]
+    excluded = snapshot["excluded_sectors"]
+
+    outputs: list[float] = []
+    sim_vol = start_vol
+    floor_ml = (eff_floor / 100.0) * cap_ml + 1.5  # small safety margin above floor
+
+    for off in range(horizon_hours):
+        h = (start_h + off) % 24
+        t_info = tariff_by_h.get(h, {"rate_per_kwh": 0.20, "is_peak": False})
+        dem = float(demand_by_h.get(h, 90.0))
+
+        if excluded:
+            # Water quality priority: never throttle below safe baseline during non-compliance
+            target = min(max(curr_mld, dem), algae_cap)
+        elif t_info["is_peak"]:
+            # Peak tariff ($0.48/kWh): save energy while staying safely above dynamic floor
+            target = min(65.0 + boost_mld, algae_cap)
+        elif t_info["rate_per_kwh"] <= 0.10:
+            # Off-peak ($0.09/kWh): recharge reservoir
+            target = min(115.0, algae_cap)
+        else:
+            # Mid-peak ($0.20/kWh): match demand smoothly
+            target = min(max(95.0, dem) + boost_mld, algae_cap)
+
+        # Lookahead physics check for this hour: ensure reservoir never dips below floor_ml
+        projected_vol = sim_vol + (target - dem) / 24.0
+        if projected_vol < floor_ml:
+            needed = dem + (floor_ml - sim_vol) * 24.0
+            target = min(algae_cap, max(target, round(needed + 2.0, 1)))
+            projected_vol = sim_vol + (target - dem) / 24.0
+
+        target = round(max(0.0, min(algae_cap, target)), 1)
+        outputs.append(target)
+        sim_vol = max(0.0, min(cap_ml, sim_vol + (target - dem) / 24.0))
+
+    return outputs
+
+
+def _parse_llm_hourly_plan(raw_text: str, start_hour: int, horizon_hours: int) -> Optional[list[float]]:
+    """Extract an N-hour list of MLD outputs from LLM JSON or time-block text."""
+    if not raw_text:
+        return None
+    # 1. Try JSON {"hourly_plan": [{"hour": 14, "output_mld": 70}, ...]} or {"outputs_mld": [70, ...]}
+    try:
+        m_json = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
+        if m_json:
+            obj = json.loads(m_json.group(0))
+            if isinstance(obj.get("outputs_mld"), list) and len(obj["outputs_mld"]) == horizon_hours:
+                return [float(x) for x in obj["outputs_mld"]]
+            if isinstance(obj.get("hourly_plan"), list) and len(obj["hourly_plan"]) == horizon_hours:
+                return [float(item.get("output_mld", item.get("mld", 0.0))) for item in obj["hourly_plan"]]
+    except Exception:
+        pass
+    # 2. Try HH:MM-HH:MM at X MLD blocks
+    matches = re.findall(r"(\d{1,2}):00\s*[-–]\s*(\d{1,2}):00\s*(?:at|@|:)?\s*(\d+(?:\.\d+)?)\s*mld", raw_text, re.IGNORECASE)
+    if matches:
+        by_hour: dict[int, float] = {}
+        for s_h, e_h, mld_s in matches:
+            sh, eh, mld_v = int(s_h) % 24, int(e_h), float(mld_s)
+            if eh == 24:
+                eh = 24
+            else:
+                eh = eh % 24
+            cur = sh
+            steps = 0
+            while steps < 24:
+                by_hour[cur] = mld_v
+                cur = (cur + 1) % 24
+                steps += 1
+                if (eh == 24 and cur == 0) or (eh != 24 and cur == eh):
+                    break
+        if all(((start_hour + off) % 24) in by_hour for off in range(horizon_hours)):
+            return [by_hour[(start_hour + off) % 24] for off in range(horizon_hours)]
+    return None
+
+
+def run_production_planner_for_chat(
+    user_message: str,
+    horizon_hours: int,
+    snapshot: dict,
+    current_hour: int = DEFAULT_SCADA_HOUR,
+    db_path: Optional[str] = None,
+) -> dict:
+    """
+    Real N-hour production planner flow:
+    1. Checks TELEMETRY_LOSS first (refuses planning with exact missing-data explanation).
+    2. Proposes exact N-hour schedule from current_hour using live snapshot + LLM (with offline fallback).
+    3. Validates via pure-Python validate_production_schedule() with dynamic floor & algae cap.
+    4. Replans up to 2 times if rejected.
+    5. Stages first-hour SET_PLANT_OUTPUT via write gateway (STAGED_PENDING_APPROVAL only).
+    6. Returns plan table, block validation, reservoir chart, and approval card widgets.
+    """
+    tf = snapshot["telemetry_freshness"]
+    res = snapshot["reservoir"]
+    desal = snapshot["desal_01"]
+    excluded = snapshot["excluded_sectors"]
+    eff_floor = float(res["safety_floor_percent"])
+    algae_cap = float(desal["algae_cap_mld"])
+
+    tools_called = [
+        {"tool": "read_network_telemetry", "args": {"current_hour": current_hour}, "summary": f"freshness={tf.get('status', 'FRESH')}, leaks={len(snapshot['active_leaks'])}, quarantined={len(snapshot['quarantined_sensors'])}"},
+        {"tool": "read_tariff_and_quality_feeds", "args": {"horizon_hours": 24, "current_hour": current_hour}, "summary": f"RES-01={res['level_percent']:.1f}% (floor {eff_floor:.1f}%), DESAL-01={desal['current_output_mld']:.0f} MLD, cap={algae_cap:.0f} MLD"},
+    ]
+    code_checks = [
+        {"check": "Prompt Injection Filter", "status": "PASS", "code": "ALLOWED", "detail": "No prompt-injection syntax."},
+        {
+            "check": "Telemetry Freshness",
+            "status": "BLOCKED" if tf.get("is_telemetry_loss") else "PASS",
+            "code": tf.get("status", "FRESH"),
+            "detail": tf.get("banner", "Telemetry fresh."),
+        },
+        {
+            "check": "Sector Water Quality",
+            "status": "BLOCKED" if excluded else "PASS",
+            "code": "NON_COMPLIANT" if excluded else "COMPLIANT",
+            "detail": "All 6 sectors >= 0.20 mg/L chlorine." if not excluded else f"NON_COMPLIANT: {', '.join(excluded)}",
+        },
+    ]
+
+    # 1. Hard stop on TELEMETRY_LOSS — clearly explain what data is missing
+    if tf.get("is_telemetry_loss"):
+        _audit("CHAT_PLANNER_BLOCKED", "DESAL-01", "TELEMETRY_LOSS", f"{horizon_hours}h plan blocked: {tf.get('banner')}", actor="CODE_GUARD", db_path=db_path)
+        return {
+            "role": "assistant",
+            "kind": "refusal",
+            "content": (
+                f"Cannot generate a **{horizon_hours}-hour production plan** right now because live SCADA sensor telemetry "
+                f"is missing/stale (`TELEMETRY_LOSS`: {tf.get('banner', 'feed silent > 180s')}). "
+                f"Without fresh pressure, flow, and reservoir timestamps, AquaGrid holds the last safe state "
+                f"(`DESAL-01` at {desal['current_output_mld']:.0f} MLD) and refuses new setpoint proposals. "
+                f"Restore the telemetry feed in the sidebar to resume planning."
+            ),
+            "provider": "CODE_GUARD (Telemetry Freshness)",
+            "tools_called": tools_called,
+            "code_checks": code_checks,
+            "widgets": [{"type": "table", "what": "sensors"}],
+            "staged_action": None,
+            "providers_tried": [],
+        }
+
+    # 2. Propose -> Validate -> Replan (up to MAX_REPLANS = 2)
+    max_replans = 2
+    active_llm_client = llm_client
+    if not hasattr(active_llm_client, "chat_with_tools"):
+        import agent.llm_factory as _lf_mod
+
+        _lf_mod = importlib.reload(_lf_mod)
+        active_llm_client = _lf_mod.llm_client
+
+    provider_used = "Deterministic Offline Engine"
+    providers_tried: list[dict] = []
+    violations_history: list[str] = []
+    best_outputs: list[float] = []
+    best_schedule_str = ""
+    best_validation: dict = {}
+    llm_rationale = ""
+
+    raw_feeds = snapshot["raw_feeds"]
+    wq_raw = raw_feeds.get("water_quality") or {}
+    demand_by_h = snapshot["demand_by_hour"]
+    tariff_by_h = snapshot["tariff_by_hour"]
+    demand_list = [float(demand_by_h.get((current_hour + i) % 24, 90.0)) for i in range(horizon_hours)]
+
+    for attempt in range(max_replans + 1):
+        proposed_outputs: Optional[list[float]] = None
+
+        # Try real LLM planner first with full live snapshot
+        planner_prompt = (
+            f"Create an exact {horizon_hours}-hour desalination production plan for DESAL-01 starting at {current_hour:02d}:00 "
+            f"(hours {', '.join(f'{(current_hour + i) % 24:02d}:00' for i in range(horizon_hours))}).\n"
+            f"Operator request: {user_message}\n"
+            f"Constraints from live snapshot: DESAL-01 range 0-{desal['max_capacity_mld']:.0f} MLD, "
+            f"algae cap {algae_cap:.0f} MLD, RES-01 currently {res['level_percent']:.1f}% with mandatory safety floor {eff_floor:.1f}%."
+            + (f"\nPrevious attempt was REJECTED by Python physics guard: {'; '.join(violations_history)}. Increase output so reservoir stays >= {eff_floor:.1f}% and <= {algae_cap:.0f} MLD." if violations_history else "")
+            + f"\nReturn ONLY valid JSON: {{\"outputs_mld\": [<exactly {horizon_hours} floats>], \"summary\": \"1-2 sentence explanation\"}}."
+        )
+        planner_msgs = [
+            {"role": "system", "content": ASK_AQUAGRID_SYSTEM_PROMPT},
+            {"role": "system", "content": "LIVE SCADA SNAPSHOT:\n" + _compact_snapshot_json(snapshot)},
+            {"role": "user", "content": planner_prompt},
+        ]
+        try:
+            chat_fn = active_llm_client.chat_with_tools
+            sig_params = inspect.signature(chat_fn).parameters
+            if "fallback_context_builder" in sig_params:
+                raw_reply, prov, _ = chat_fn(
+                    messages=planner_msgs,
+                    tools=[],
+                    tool_executor=lambda n, a: {},
+                    max_tool_steps=1,
+                    fallback_context_builder=lambda: _compact_snapshot_json(snapshot),
+                )
+            else:
+                raw_reply, prov, _ = chat_fn(
+                    messages=planner_msgs,
+                    tools=[],
+                    tool_executor=lambda n, a: {},
+                    max_tool_steps=1,
+                )
+            providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
+            if raw_reply:
+                parsed = _parse_llm_hourly_plan(raw_reply, current_hour, horizon_hours)
+                if parsed is not None:
+                    proposed_outputs = parsed
+                    provider_used = prov
+                    try:
+                        m_j = re.search(r"\{.*\}", raw_reply, flags=re.DOTALL)
+                        if m_j:
+                            llm_rationale = str(json.loads(m_j.group(0)).get("summary", ""))
+                    except Exception:
+                        pass
+        except Exception:
+            logger.exception("Planner LLM attempt #%d failed; falling back to live-data deterministic planner", attempt + 1)
+
+        if proposed_outputs is None:
+            proposed_outputs = _deterministic_hourly_plan(snapshot, horizon_hours, boost_mld=attempt * 15.0)
+            if provider_used == "Deterministic Offline Engine":
+                provider_used = "Deterministic Offline Engine"
+
+        schedule_str = _format_hourly_blocks(current_hour, proposed_outputs)
+        validation = validate_production_schedule(
+            proposed_schedule=schedule_str,
+            current_volume_ml=float(res["volume_ml"]),
+            demand_by_hour=demand_by_h,
+            fallback_demand_mld=demand_list,
+            bloom_severity=str(wq_raw.get("bloom_severity", "NONE")),
+            turbidity_ntu=float(wq_raw.get("intake_turbidity_ntu", 1.2)),
+            chlorine_ppm=float(wq_raw.get("intake_chlorine_ppm", 1.8)),
+            min_floor_percent=eff_floor / 100.0,
+            current_hour=current_hour,
+            current_plant_output_mld=float(desal["current_output_mld"]),
+            excluded_sectors=excluded,
+        )
+        tools_called.append(
+            {
+                "tool": "show_schedule_validation",
+                "args": {"attempt": attempt + 1, "horizon_hours": horizon_hours},
+                "summary": f"Attempt #{attempt + 1}: {validation.get('status')} — {validation.get('summary', '')[:100]}",
+            }
+        )
+
+        best_outputs = proposed_outputs
+        best_schedule_str = schedule_str
+        best_validation = validation
+
+        if validation.get("status") == "VALID":
+            break
+
+        # Collect rejection reasons for replan
+        rej_reasons = [validation.get("summary", "Safety guard violation")]
+        for blk in validation.get("rejected_blocks") or []:
+            rej_reasons.extend(blk.get("reasons", []))
+        violations_history.append(" | ".join(rej_reasons[:2]))
+
+    # Build exact N-hour Plan Table rows from cumulative trajectory
+    cum_traj = best_validation.get("cumulative_trajectory") or []
+    plan_rows: list[dict] = []
+    sim_vol = float(res["volume_ml"])
+    cap_ml = float(res["capacity_ml"])
+    for idx in range(horizon_hours):
+        h0 = (current_hour + idx) % 24
+        h1 = (current_hour + idx + 1) % 24
+        h1_str = "24:00" if (h0 == 23 and h1 == 0) else f"{h1:02d}:00"
+        mld = float(best_outputs[idx])
+        dem = float(demand_by_h.get(h0, 90.0))
+        t_info = tariff_by_h.get(h0, {"rate_per_kwh": 0.20, "is_peak": False})
+        if idx + 1 < len(cum_traj):
+            proj_pct = float(cum_traj[idx + 1]["level_percent"])
+        else:
+            sim_vol = max(0.0, min(cap_ml, sim_vol + (mld - dem) / 24.0))
+            proj_pct = round((sim_vol / cap_ml) * 100.0, 2)
+        hr_ok = (mld <= algae_cap + 1e-6) and (proj_pct >= eff_floor - 1e-6) and (not (excluded and mld < float(desal["current_output_mld"])))
+        plan_rows.append(
+            {
+                "Window": f"{h0:02d}:00-{h1_str}",
+                "Output (MLD)": round(mld, 1),
+                "Demand (MLD)": round(dem, 1),
+                "Tariff ($/kWh)": f"${t_info['rate_per_kwh']:.2f}" + (" (PEAK)" if t_info["is_peak"] else ""),
+                "Projected RES-01 (%)": round(proj_pct, 2),
+                "Status": "VALID" if hr_ok else "REJECTED_BY_CODE",
+            }
+        )
+
+    sv_status = best_validation.get("status", "UNKNOWN")
+    code_checks.append(
+        {
+            "check": f"{horizon_hours}h Schedule Validator (floor {eff_floor:.1f}%)",
+            "status": "PASS" if sv_status == "VALID" else "BLOCKED",
+            "code": sv_status,
+            "detail": best_validation.get("summary", ""),
+        }
+    )
+
+    # Stage first-hour SET_PLANT_OUTPUT through write gateway (suggest-only!)
+    first_mld = float(best_outputs[0])
+    gw_resp = stage_gated_valve_or_setpoint_action(
+        action_type="SET_PLANT_OUTPUT",
+        target_id="DESAL-01",
+        proposed_value=first_mld,
+        rationale=(
+            f"{horizon_hours}-hour production plan starting {current_hour:02d}:00 "
+            f"(first hour {first_mld:.1f} MLD; floor {eff_floor:.1f}%, cap {algae_cap:.0f} MLD)."
+        ),
+        db_path=db_path,
+        provenance="AGENT_ANALYSIS",
+        provenance_ref="ASK_AQUAGRID_PLANNER",
+    )
+    gw_status = str(gw_resp.get("status", "UNKNOWN"))
+    tools_called.append(
+        {
+            "tool": "propose_gated_action",
+            "args": {"action_type": "SET_PLANT_OUTPUT", "target_id": "DESAL-01", "proposed_value": first_mld},
+            "summary": f"{gw_status}: DESAL-01 -> {first_mld:.1f} MLD",
+        }
+    )
+    code_checks.append(
+        {
+            "check": "Write Gateway & Safety Guards",
+            "status": "PASS" if gw_status == "STAGED_PENDING_APPROVAL" else "BLOCKED",
+            "code": gw_status,
+            "detail": gw_resp.get("reason") or gw_resp.get("message") or "",
+        }
+    )
+
+    widgets: list[dict] = [
+        {"type": "plan_table", "horizon_hours": horizon_hours, "rows": plan_rows},
+        {"type": "schedule_validation", "plan": best_schedule_str, "validation": best_validation},
+        {"type": "chart", "metric": "reservoir", "asset": "RES-01", "hours": horizon_hours},
+    ]
+    if gw_status in ("STAGED_PENDING_APPROVAL", "REJECTED_DUPLICATE_PENDING"):
+        widgets.append({"type": "approvals"})
+
+    min_proj = min(r["Projected RES-01 (%)"] for r in plan_rows) if plan_rows else res["level_percent"]
+    replan_note = f" (replanned {len(violations_history)} time(s) after guard feedback)" if violations_history else ""
+    gw_line = (
+        f"First-hour setpoint **DESAL-01 → {first_mld:.1f} MLD** staged as `{gw_status}` (Action #{gw_resp.get('action_id')}) — "
+        f"click **Approve** or **Reject** on the approval card below."
+        if gw_status == "STAGED_PENDING_APPROVAL"
+        else f"Gateway status for **DESAL-01 → {first_mld:.1f} MLD**: `{gw_status}` — {gw_resp.get('reason') or gw_resp.get('message', '')}"
+    )
+    rationale_line = f"\n\n{llm_rationale}" if llm_rationale and not _TOOL_BEGGING_RE.search(llm_rationale) else ""
+    answer_text = (
+        f"**{horizon_hours}-Hour Production Plan ({current_hour:02d}:00–{(current_hour + horizon_hours) % 24:02d}:00)**{replan_note}: "
+        f"Schedule validation **`{sv_status}`** (min projected RES-01 **{min_proj:.2f}%** vs **{eff_floor:.1f}%** floor, "
+        f"algae cap **{algae_cap:.0f} MLD**).\n\n{gw_line}{rationale_line}"
+    )
+
+    _audit(
+        "CHAT_PLANNER_COMPLETED",
+        "DESAL-01",
+        gw_status,
+        f"{horizon_hours}h plan ({sv_status}): {best_schedule_str[:220]} -> gateway={gw_status}",
+        actor="LLM_AGENT",
+        db_path=db_path,
+    )
+
+    return {
+        "role": "assistant",
+        "kind": "text",
+        "content": answer_text,
+        "provider": provider_used,
+        "tools_called": tools_called,
+        "code_checks": code_checks,
+        "widgets": widgets,
+        "staged_action": gw_resp,
+        "providers_tried": providers_tried,
+        "plan_rows": plan_rows,
+        "schedule_validation": best_validation,
+    }
 
 STATUS_CODE_GLOSSARY = {
     "STAGED_PENDING_APPROVAL": "Action passed deterministic Python safety guards and is queued as PENDING awaiting operator Approve/Reject button click.",
@@ -920,6 +1448,20 @@ def run_chat_turn(
     if sc_id:
         return run_scenario_for_chat(sc_id, current_hour=current_hour, db_path=db_path)
 
+    # ── ALWAYS PRE-FETCH LIVE SCADA SNAPSHOT BEFORE CALLING THE LLM ───────────
+    live_snapshot = build_live_scada_snapshot(current_hour=current_hour, db_path=db_path)
+
+    # ── PRODUCTION PLANNER FLOW: "make a 5-hour plan", "plan next N hours", "plan for tomorrow"
+    plan_hours = parse_planning_horizon_hours(cleaned)
+    if plan_hours is not None:
+        return run_production_planner_for_chat(
+            user_message=cleaned,
+            horizon_hours=plan_hours,
+            snapshot=live_snapshot,
+            current_hour=current_hour,
+            db_path=db_path,
+        )
+
     # ── LIVE TOOL EXECUTOR (read-only + display + single gated stage tool) ────
     widgets: list[dict] = []
     tools_called_summary: list[dict] = []
@@ -1128,8 +1670,35 @@ def run_chat_turn(
         )
         return out
 
-    # Build multi-turn message list for the LLM (preserving prior user/assistant exchanges!)
-    llm_messages: list[dict] = [{"role": "system", "content": ASK_AQUAGRID_SYSTEM_PROMPT}]
+    # Seed code checks & snapshot summary from the pre-fetched live snapshot
+    tf_snap = live_snapshot["telemetry_freshness"]
+    res_snap = live_snapshot["reservoir"]
+    excl_snap = live_snapshot["excluded_sectors"]
+    _record_check(
+        "Telemetry Freshness",
+        not bool(tf_snap.get("is_telemetry_loss")),
+        tf_snap.get("status", "FRESH"),
+        tf_snap.get("banner", "Telemetry fresh."),
+    )
+    _record_check(
+        "Reservoir Safety Floor",
+        float(res_snap["level_percent"]) >= float(res_snap["safety_floor_percent"]),
+        "VALID" if float(res_snap["level_percent"]) >= float(res_snap["safety_floor_percent"]) else "REJECTED_BY_SAFETY_GUARD",
+        f"RES-01 {res_snap['level_percent']:.1f}% vs {res_snap['safety_floor_percent']:.1f}% floor.",
+    )
+    _record_check(
+        "Sector Water Quality",
+        len(excl_snap) == 0,
+        "COMPLIANT" if not excl_snap else "NON_COMPLIANT",
+        "All 6 sectors >= 0.20 mg/L chlorine." if not excl_snap else f"NON_COMPLIANT: {', '.join(excl_snap)}",
+    )
+    snapshot_json = _compact_snapshot_json(live_snapshot)
+
+    # Build multi-turn message list for the LLM WITH live SCADA snapshot always pre-loaded!
+    llm_messages: list[dict] = [
+        {"role": "system", "content": ASK_AQUAGRID_SYSTEM_PROMPT},
+        {"role": "system", "content": "LIVE SCADA SNAPSHOT (current real-time values — do not ask to enable tools or run queries):\n" + snapshot_json},
+    ]
     for msg in prior[-12:]:
         role = msg.get("role")
         content = str(msg.get("content") or "").strip()
@@ -1137,24 +1706,8 @@ def run_chat_turn(
             llm_messages.append({"role": role, "content": content})
     llm_messages.append({"role": "user", "content": f"[Active SCADA Hour: {current_hour:02d}:00]\n{cleaned}"})
 
-    # Build compact live context helper for providers that do not support OpenAI tool calling
     def _build_live_fallback_context() -> str:
-        tel_now = _execute_tool("read_network_telemetry", {"current_hour": current_hour})
-        feeds_now = _execute_tool("read_tariff_and_quality_feeds", {"horizon_hours": 6, "current_hour": current_hour})
-        valves_now = _execute_tool("read_valves_and_pending_actions", {})
-        snapshot_ctx = {
-            "hour": current_hour,
-            "reservoir": feeds_now.get("reservoir"),
-            "plant_setpoint": valves_now.get("plant_setpoint"),
-            "tariff_now": (feeds_now.get("tariffs") or [{}])[0],
-            "water_quality": feeds_now.get("water_quality"),
-            "excluded_sectors": feeds_now.get("excluded_sectors"),
-            "telemetry_freshness": tel_now.get("telemetry_freshness"),
-            "leak_alerts": tel_now.get("leak_alerts"),
-            "quarantined_sensors": tel_now.get("quarantined_sensors"),
-            "pending_actions": valves_now.get("pending_actions"),
-        }
-        return json.dumps(snapshot_ctx, default=str)
+        return snapshot_json
 
     # Ensure llm_client has chat_with_tools even after a live Streamlit hot-reload
     active_llm_client = llm_client
@@ -1190,14 +1743,18 @@ def run_chat_turn(
             )
 
         providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
-        if not answer_text:
+        # Safety net: never return a response begging the operator to enable tools or run live queries!
+        if not answer_text or _TOOL_BEGGING_RE.search(answer_text):
+            if answer_text and _TOOL_BEGGING_RE.search(answer_text):
+                logger.warning("Replaced tool-begging LLM response from %s with live-snapshot answer", provider_used)
             answer_text = _offline_chat_fallback(
                 user_message=cleaned,
                 history=prior,
                 tool_executor=_execute_tool,
                 current_hour=current_hour,
             )
-            provider_used = "Deterministic Offline Engine"
+            if not provider_used or provider_used == "Deterministic Offline Engine":
+                provider_used = "Deterministic Offline Engine"
     except Exception as exc:
         logger.exception("Ask AquaGrid chat turn failed for message: %s", cleaned[:160])
         providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])

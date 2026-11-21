@@ -134,9 +134,11 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
                             )
                         if show_tech and error_detail:
                             st.error(f"**Technical Error:** `{error_detail}`")
-                        if show_tech and providers_tried:
-                            st.markdown("**Providers tried:**")
+                        if providers_tried and (show_tech or any(pt.get("error") for pt in providers_tried)):
+                            st.markdown("**Provider chain notes:**")
                             for pt in providers_tried:
+                                if not show_tech and not pt.get("error"):
+                                    continue
                                 err_suffix = f" — {pt['error']}" if pt.get("error") else ""
                                 st.markdown(f"- `{pt.get('provider')}`: `{pt.get('status')}`{err_suffix}")
                         st.caption(f"Provider: {provider} · LLM_MODE: {settings.LLM_MODE}")
