@@ -200,3 +200,148 @@ def test_simulate_valve_change_impact_and_part2_animation_html():
     assert "window.localStorage" in html_out
     assert "window.__AQUAGRID_PRESERVE_CAMERA__ = true;" in html_out
 
+
+def test_show_3d_tool_default_routing_and_2d_override():
+    """'show Sector 4', 'where is the leak', 'show the reservoir', 'show valve V-12' use show_3d by default; '2D' uses 2D map."""
+    from unittest.mock import patch
+    from agent.chat_assistant import build_3d_render_summary, run_chat_turn
+
+    inject_scenario_1()
+
+    with patch("agent.chat_assistant.llm_client.chat_with_tools", return_value=(None, "Deterministic Offline Engine", [])):
+        r_s4 = run_chat_turn("show Sector 4", history=[], current_hour=14)
+        assert any(w["type"] == "twin_3d" and w["focus"] == "Sector 4" for w in r_s4["widgets"])
+        assert "Sector 4" in r_s4["content"]
+
+        r_lk = run_chat_turn("where is the leak", history=[], current_hour=14)
+        assert any(w["type"] == "twin_3d" for w in r_lk["widgets"])
+
+        r_res = run_chat_turn("show the reservoir", history=[], current_hour=14)
+        assert any(w["type"] == "twin_3d" and w["focus"] == "RES-01" for w in r_res["widgets"])
+
+        r_v12 = run_chat_turn("show valve V-12", history=[], current_hour=14)
+        assert any(w["type"] == "twin_3d" and w["focus"] == "V-12" for w in r_v12["widgets"])
+
+        # Explicit 2D request uses the 2D OpenStreetMap widget
+        r_2d = run_chat_turn("show Sector 4 in 2D", history=[], current_hour=14)
+        assert any(w["type"] == "map" and w["sector"] == "Sector 4" for w in r_2d["widgets"])
+
+    # Direct tool summary matches live DB
+    s_v12 = build_3d_render_summary("V-12", current_hour=14)
+    assert s_v12["displayed"] is True and s_v12["view"] == "3D" and s_v12["focus_id"] == "V-12"
+    assert "V-12" in s_v12["summary_text"]
+
+
+def test_approval_card_3d_preview_and_post_approve_vs_reject():
+    """Approval card computes 3D valve preview + flow delta; Approve attaches post-action 3D view; Reject changes nothing."""
+    from unittest.mock import patch
+    import components.chat_widgets as cw
+    from database.connection import get_db_connection
+    from tools.write_gateway import stage_gated_valve_or_setpoint_action
+
+    # Stage CLOSE_VALVE V-12
+    gw = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-12",
+        proposed_value=0.0,
+        rationale="Isolate Sector 4 J-14 rupture",
+    )
+    assert gw["status"] == "STAGED_PENDING_APPROVAL"
+    action_id = gw["action_id"]
+
+    # 1. Preview includes V-12 focus, highlighted downstream pipes, and computed flow drop
+    prev = cw.build_approval_impact_preview("CLOSE_VALVE", "V-12")
+    assert prev["focus"] == "V-12"
+    assert "SEG-S4-01" in prev["highlight_pipe_ids"]
+    assert any("-> 0 L/s" in line for line in prev["summary_lines"])
+
+    # 2. Clicking Approve executes V-12 and posts 3D view focused on V-12
+    fake_state: dict = {"operator_signature": "Test_Operator", "ask_aquagrid_messages": []}
+
+    class _Col:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _btn_approve(label, **kwargs):
+        return label.startswith("Approve")
+
+    with (
+        patch.object(cw.st, "session_state", fake_state),
+        patch.object(cw.st, "markdown"),
+        patch.object(cw.st, "columns", return_value=(_Col(), _Col(), _Col())),
+        patch.object(cw.st, "button", side_effect=_btn_approve),
+        patch.object(cw.st, "rerun"),
+        patch.object(cw, "render_3d_digital_twin"),
+    ):
+        cw.render_inline_approvals("test_ap")
+
+    assert len(fake_state["ask_aquagrid_messages"]) == 1
+    dec = fake_state["ask_aquagrid_messages"][0]
+    assert "EXECUTED" in dec["content"]
+    assert any(w["type"] == "twin_3d" and w["focus"] == "V-12" for w in dec["widgets"])
+
+    conn = get_db_connection()
+    try:
+        assert conn.execute("SELECT status FROM valves WHERE valve_id = 'V-12';").fetchone()["status"] == "CLOSED"
+    finally:
+        conn.close()
+
+    # 3. Clicking Reject on a fresh pending action leaves valve unchanged and attaches no 3D widget
+    reset_database()
+    gw2 = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-12",
+        proposed_value=0.0,
+        rationale="Second test staging",
+    )
+    assert gw2["status"] == "STAGED_PENDING_APPROVAL"
+    fake_state2: dict = {"operator_signature": "Test_Operator", "ask_aquagrid_messages": []}
+
+    with (
+        patch.object(cw.st, "session_state", fake_state2),
+        patch.object(cw.st, "markdown"),
+        patch.object(cw.st, "columns", return_value=(_Col(), _Col(), _Col())),
+        patch.object(cw.st, "button", side_effect=lambda label, **kw: label.startswith("Reject")),
+        patch.object(cw.st, "rerun"),
+        patch.object(cw, "render_3d_digital_twin"),
+    ):
+        cw.render_inline_approvals("test_rej")
+
+    assert len(fake_state2["ask_aquagrid_messages"]) == 1
+    rej_msg = fake_state2["ask_aquagrid_messages"][0]
+    assert "REJECTED" in rej_msg["content"]
+    assert rej_msg["widgets"] == []
+    conn = get_db_connection()
+    try:
+        assert conn.execute("SELECT status FROM valves WHERE valve_id = 'V-12';").fetchone()["status"] == "OPEN"
+    finally:
+        conn.close()
+
+
+def test_scenarios_show_relevant_3d_views_in_result():
+    """Scenarios attach targeted 3D views: J-14 leak (R1-S1), reservoir (R1-S2), V-12 (R1-S3), Sector 2 (U-5.1), Sector 6 (U-5.2), V-17 (U-5.3)."""
+    from unittest.mock import patch
+    from agent.chat_assistant import run_scenario_for_chat
+    from agent.llm_factory import generate_offline_mock_response
+
+    expected = {
+        "R1-S1": ("LEAK-", "Sector 4"),
+        "R1-S2": ("reservoir",),
+        "R1-S3": ("V-12",),
+        "U-5.1": ("Sector 2",),
+        "U-5.2": ("Sector 6",),
+        "U-5.3": ("V-17",),
+    }
+
+    with patch("agent.nodes.llm_client.query", side_effect=lambda sp, up: (generate_offline_mock_response(sp, up), "Deterministic Offline Engine")):
+        for sc_id, valid_prefixes in expected.items():
+            msg = run_scenario_for_chat(sc_id, current_hour=14)
+            w3d = [w for w in msg.get("widgets", []) if w.get("type") == "twin_3d"]
+            assert len(w3d) == 1, f"{sc_id} missing twin_3d widget"
+            focus_val = str(w3d[0]["focus"])
+            assert any(focus_val.startswith(p) for p in valid_prefixes), f"{sc_id} got unexpected 3D focus {focus_val}"
+
+

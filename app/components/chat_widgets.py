@@ -8,6 +8,7 @@ from streamlit_folium import st_folium
 
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection
+from digital_twin.hydraulics import simulate_valve_change_impact
 from guards.injection_filter import detect_injection
 from tools.write_gateway import execute_human_approval, execute_human_rejection
 from components.badges import format_dubai_time, status_badge
@@ -30,6 +31,7 @@ def render_inline_map(
     widget_key: str,
     snapshot: dict,
     show_boundaries_default: bool = True,
+    show_view_toggle: bool = True,
 ) -> None:
     """Render interactive Leaflet map with sector boundaries, layer toggles, English basemap toggle, and single-sector summary table."""
     from config.region_config import SECTOR_COLOR_NAMES
@@ -75,25 +77,25 @@ def render_inline_map(
         highlight_sector = norm_sector
 
     # "2D Map / 3D View" toggle so operators can inspect either the 2D OSM map or the 3D digital twin
-    view_mode = st.radio(
-        "Map View",
-        options=["2D Map", "3D View"],
-        index=0,
-        horizontal=True,
-        key=f"map_view_mode_{widget_key}",
-        label_visibility="collapsed",
-    )
-
-    if view_mode == "3D View":
-        focus_arg = leak_id or highlight_sector or "all"
-        render_3d_digital_twin(
-            focus=focus_arg,
-            widget_key=f"inline3d_{widget_key}",
-            height=430,
-            current_hour=DEFAULT_SCADA_HOUR,
-            show_controls=True,
+    if show_view_toggle:
+        view_mode = st.radio(
+            "Map View",
+            options=["2D Map", "3D View"],
+            index=0,
+            horizontal=True,
+            key=f"map_view_mode_{widget_key}",
+            label_visibility="collapsed",
         )
-        return
+        if view_mode == "3D View":
+            focus_arg = leak_id or highlight_sector or "all"
+            render_3d_digital_twin(
+                focus=focus_arg,
+                widget_key=f"inline3d_{widget_key}",
+                height=430,
+                current_hour=DEFAULT_SCADA_HOUR,
+                show_controls=True,
+            )
+            return
 
     # Compact layer toggles (OpenStreetMap is the only basemap)
     t1, t2, t3, t4, t5 = st.columns([1.3, 0.9, 1.0, 0.9, 0.9])
@@ -438,8 +440,77 @@ def render_inline_schedule_validation(plan: str, validation: dict) -> None:
     st.markdown(f'<div class="{card_cls}">{"".join(lines_html)}</div>', unsafe_allow_html=True)
 
 
+def render_inline_3d(
+    focus: str | None,
+    widget_key: str,
+    snapshot: dict,
+    height: int = 440,
+) -> None:
+    """Render the interactive 3D Digital Twin inside chat with a '3D View / 2D Map' toggle."""
+    focus_val = (focus or "all").strip() or "all"
+    view_mode = st.radio(
+        "Twin View",
+        options=["3D View", "2D Map"],
+        index=0,
+        horizontal=True,
+        key=f"twin_view_mode_{widget_key}",
+        label_visibility="collapsed",
+    )
+    if view_mode == "2D Map":
+        sec_arg = focus_val if focus_val.lower().startswith("sector") else "all"
+        lid_arg = focus_val.upper() if focus_val.upper().startswith("LEAK-") else None
+        render_inline_map(
+            sector=sec_arg,
+            leak_id=lid_arg,
+            widget_key=f"fb2d_{widget_key}",
+            snapshot=snapshot,
+            show_boundaries_default=True,
+            show_view_toggle=False,
+        )
+        return
+
+    render_3d_digital_twin(
+        focus=focus_val,
+        widget_key=f"twin3d_{widget_key}",
+        height=height,
+        current_hour=DEFAULT_SCADA_HOUR,
+        show_controls=True,
+    )
+
+
+def build_approval_impact_preview(action_type: str, target_id: str, db_path: str | None = None) -> dict:
+    """Compute hydraulic impact preview & 3D focus metadata for a pending HITL approval card (read-only)."""
+    a_type = str(action_type or "").upper()
+    t_id = str(target_id or "").upper()
+    if a_type in ("CLOSE_VALVE", "OPEN_VALVE"):
+        new_st = "CLOSED" if a_type == "CLOSE_VALVE" else "OPEN"
+        impact = simulate_valve_change_impact(valve_id=t_id, new_status=new_st, db_path=db_path)
+        return {
+            "focus": t_id,
+            "highlight_pipe_ids": impact["affected_pipe_ids"],
+            "summary_lines": impact["summary_lines"],
+            "affected_pipes": impact["affected_pipes"],
+        }
+    if a_type == "SET_PLANT_OUTPUT":
+        return {
+            "focus": "reservoir",
+            "highlight_pipe_ids": [],
+            "summary_lines": [f"DESAL-01 output setpoint change affects RES-01 level trajectory"],
+            "affected_pipes": [],
+        }
+    if a_type == "ISOLATE_AND_FLUSH" and t_id.startswith("SECTOR-"):
+        sec_num = t_id.split("-")[-1].lstrip("0") or "1"
+        return {
+            "focus": f"Sector {sec_num}",
+            "highlight_pipe_ids": [],
+            "summary_lines": [f"Isolate & flush Sector {sec_num} to restore chlorine residual >= 0.20 mg/L"],
+            "affected_pipes": [],
+        }
+    return {"focus": "all", "highlight_pipe_ids": [], "summary_lines": [], "affected_pipes": []}
+
+
 def render_inline_approvals(widget_key: str) -> None:
-    """Render Pending Approval cards with Approve / Reject BUTTONS directly inside chat."""
+    """Render Pending Approval cards with compact 3D hydraulic preview and Approve / Reject BUTTONS directly inside chat."""
     conn = get_db_connection()
     try:
         pending_rows = conn.execute("SELECT * FROM pending_actions WHERE status = 'PENDING' ORDER BY id DESC;").fetchall()
@@ -464,6 +535,17 @@ def render_inline_approvals(widget_key: str) -> None:
         prov_txt = f"{prov} ({prov_ref})" if prov_ref else prov
         prov_cls = "ag-badge-warn" if prov == "UNTRUSTED_TEXT" else "ag-badge-neutral"
 
+        preview = build_approval_impact_preview(action_type, target_id)
+        flow_lines = preview.get("summary_lines") or []
+        flow_html = ""
+        if flow_lines:
+            flow_joined = " &middot; ".join(html.escape(line) for line in flow_lines[:3])
+            flow_html = (
+                f'<div style="margin-top:0.25rem; font-size:0.83rem; color:#FDE68A;">'
+                f'<strong>Computed Flow Change:</strong> <span class="ag-mono">{flow_joined}</span>'
+                f'</div>'
+            )
+
         st.markdown(
             f"""
             <div class="scada-card-pending">
@@ -476,6 +558,7 @@ def render_inline_approvals(widget_key: str) -> None:
                 <div style="margin-top:0.3rem; font-size:0.86rem; color:#CBD5E1;">
                     <strong>Reason:</strong> {html.escape(str(rationale))}
                 </div>
+                {flow_html}
                 <div style="margin-top:0.2rem; font-size:0.8rem; color:#94A3B8;">
                     Safety check: PASS at staging · Clicking Approve re-checks safety floor, water quality &amp; freshness and consumes a single-use token.
                 </div>
@@ -484,13 +567,27 @@ def render_inline_approvals(widget_key: str) -> None:
             unsafe_allow_html=True,
         )
 
+        # Compact 3D preview showing affected valve / asset and highlighted downstream pipes
+        render_3d_digital_twin(
+            focus=preview["focus"],
+            widget_key=f"ap_prev_{widget_key}_{action_id}",
+            height=240,
+            current_hour=DEFAULT_SCADA_HOUR,
+            highlight_pipe_ids=preview["highlight_pipe_ids"],
+            show_controls=False,
+            preserve_camera=False,
+        )
+
         c1, c2, _ = st.columns([1.0, 1.0, 2.5])
         with c1:
             if st.button(f"Approve #{action_id}", key=f"chat_approve_{widget_key}_{action_id}", type="primary", width="stretch"):
                 res = execute_human_approval(action_id=action_id, approver=operator_name)
                 st_code = res.get("status", "UNKNOWN")
+                decision_widgets: list[dict] = []
                 if st_code == "EXECUTED":
-                    msg_txt = f"**Action #{action_id} ({action_type} {target_id}) `EXECUTED`** by `{res.get('approver')}`: {res.get('details', '')}"
+                    impact_note = f" ({'; '.join(flow_lines[:2])})" if flow_lines else ""
+                    msg_txt = f"**Action #{action_id} ({action_type} {target_id}) `EXECUTED`** by `{res.get('approver')}`: {res.get('details', '')}{impact_note}"
+                    decision_widgets.append({"type": "twin_3d", "focus": preview["focus"]})
                 else:
                     msg_txt = f"**Action #{action_id} `{st_code}`:** {res.get('reason') or res.get('message', '')}"
                 st.session_state.setdefault("ask_aquagrid_messages", []).append(
@@ -508,7 +605,7 @@ def render_inline_approvals(widget_key: str) -> None:
                                 "detail": res.get("details") or res.get("reason") or "",
                             }
                         ],
-                        "widgets": [],
+                        "widgets": decision_widgets,
                         "staged_action": res,
                     }
                 )
@@ -639,7 +736,13 @@ def render_inline_plan_table(horizon_hours: int, rows: list[dict]) -> None:
 def render_chat_widget(widget: dict, widget_key: str, snapshot: dict) -> None:
     """Dispatch a single chat widget spec to its inline renderer."""
     w_type = widget.get("type")
-    if w_type == "map":
+    if w_type == "twin_3d":
+        render_inline_3d(
+            focus=widget.get("focus", "all"),
+            widget_key=widget_key,
+            snapshot=snapshot,
+        )
+    elif w_type == "map":
         render_inline_map(
             widget.get("sector"),
             widget.get("leak_id"),

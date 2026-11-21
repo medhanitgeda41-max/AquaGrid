@@ -166,7 +166,22 @@ def render_sidebar() -> None:
 
         st.divider()
 
-        # ── Audit Log, Technical Details, Clear Chat ──────────────────────────
+        # ── 3D Digital Twin, Audit Log, Technical Details, Clear Chat ─────────
+        if st.button("Open 3D Digital Twin", key="btn_open_3d_twin", width="stretch"):
+            st.session_state.setdefault("ask_aquagrid_messages", []).append(
+                {
+                    "role": "assistant",
+                    "kind": "text",
+                    "content": "**3D Digital Twin** — Dubai Water Network (drag to rotate, scroll to zoom, hover assets for live values):",
+                    "provider": "3D Digital Twin",
+                    "tools_called": [{"tool": "show_3d", "args": {"focus": "all"}, "summary": "3D overview of all 6 sectors"}],
+                    "code_checks": [],
+                    "widgets": [{"type": "twin_3d", "focus": "all"}],
+                    "staged_action": None,
+                }
+            )
+            st.rerun()
+
         if st.button("Open Audit Log", key="btn_open_audit_log", width="stretch"):
             st.session_state.setdefault("ask_aquagrid_messages", []).append(
                 {
