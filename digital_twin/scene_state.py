@@ -299,23 +299,28 @@ def build_3d_scene_state(
         for s in (tel_data.get("quarantined_sensors") or [])
     }
 
-    # Optional hydraulic propagation hook (populated in Part 2; cleanly falls back to baseline in Part 1)
+    # Pure-Python directed-graph hydraulic propagation
+    from digital_twin.hydraulics import compute_network_flows, get_effective_valve_for_segment
+
     computed_flows: dict[str, float] = dict(flow_override_by_segment or {})
     isolated_leaks: set[str] = set()
+    rerouted_segments: set[str] = set()
+    zero_flow_segments: set[str] = set()
     if not computed_flows:
-        try:
-            from digital_twin.hydraulics import compute_network_flows
-
-            hyd = compute_network_flows(
-                segments=segments,
-                valve_statuses=valve_status_map,
-                plant_output_mld=plant_output_mld,
-                leaks=[dict(r) for r in leak_rows],
-            )
-            computed_flows = hyd.get("pipe_flows_lps") or {}
-            isolated_leaks = set(hyd.get("isolated_leak_ids") or [])
-        except ImportError:
-            pass
+        hyd = compute_network_flows(
+            segments=segments,
+            valve_statuses=valve_status_map,
+            plant_output_mld=plant_output_mld,
+            leaks=[dict(r) for r in leak_rows],
+        )
+        computed_flows = hyd.get("pipe_flows_lps") or {}
+        isolated_leaks = set(hyd.get("isolated_leak_ids") or [])
+        rerouted_segments = set(hyd.get("rerouted_segment_ids") or [])
+        zero_flow_segments = set(hyd.get("zero_flow_segment_ids") or [])
+    else:
+        for sid, fl in computed_flows.items():
+            if float(fl) <= 0.05:
+                zero_flow_segments.add(sid)
 
     focus_type, focus_id = _normalize_focus(focus)
     hl_pipes_set = set(highlight_pipe_ids or [])
@@ -335,7 +340,7 @@ def build_3d_scene_state(
         if len(pts_xz) < 2:
             continue
         diam = int(seg.get("diameter_mm", 500))
-        v_id = seg.get("isolation_valve_id", "V-01")
+        v_id = get_effective_valve_for_segment(seg)
         v_stat = valve_status_map.get(v_id, "OPEN")
         hist_item = hist_by_seg.get(seg_id, {})
 
@@ -362,6 +367,7 @@ def build_3d_scene_state(
             "end_xz": pts_xz[-1],
             "isolation_valve_id": v_id,
             "flow_lps": flow_lps,
+            "rerouted": seg_id in rerouted_segments,
             "pressure_psi": round(float(hist_item.get("pressure_psi", 55.0)), 1),
             "highlighted": bool(is_hl),
         }
@@ -583,6 +589,11 @@ def build_3d_scene_state(
             "type": focus_type,
             "id": focus_id,
             "downstream_pipe_ids": list(hl_pipes_set),
+        },
+        "hydraulics": {
+            "rerouted_segment_ids": sorted(rerouted_segments),
+            "zero_flow_segment_ids": sorted(zero_flow_segments),
+            "isolated_leak_ids": sorted(isolated_leaks),
         },
         "camera_target": camera_target,
     }

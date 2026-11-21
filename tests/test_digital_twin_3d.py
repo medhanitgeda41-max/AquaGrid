@@ -109,3 +109,94 @@ def test_3d_html_uses_https_jsdelivr_cdn_instanced_mesh_and_webgl_2d_fallback():
 
     html_no_webgl = build_3d_digital_twin_html(state, widget_id="test_twin_fb", force_no_webgl=True)
     assert "window.__AQUAGRID_FORCE_NO_WEBGL__ = true;" in html_no_webgl
+
+
+def test_hydraulic_graph_closing_v12_stops_downstream_flow_and_isolates_j14_leak():
+    """Closing V-12 in the NetworkX hydraulic graph cuts SEG-S4-01 & downstream SEG-S4-05 to 0 L/s and stops J-14 leak loss."""
+    from database.dubai_network import DUBAI_PIPE_SEGMENTS
+    from digital_twin.hydraulics import compute_network_flows
+
+    all_open = {f"V-{i:02d}": "OPEN" for i in range(1, 21)}
+    leaks = [{"leak_id": "LEAK-001", "pipe_segment_id": "SEG-S4-01", "estimated_loss_m3_per_hour": 42.5, "status": "Confirmed"}]
+
+    res_open = compute_network_flows(DUBAI_PIPE_SEGMENTS, all_open, plant_output_mld=100.0, leaks=leaks)
+    assert res_open["pipe_flows_lps"]["SEG-S4-01"] > 80.0
+    assert res_open["pipe_flows_lps"]["SEG-S4-05"] > 50.0
+    assert "LEAK-001" not in res_open["isolated_leak_ids"]
+    assert res_open["active_leak_loss_m3_hr"]["LEAK-001"] == 42.5
+
+    # Close V-12 -> downstream pipes drop to 0 L/s and J-14 leak is isolated
+    v12_closed = dict(all_open)
+    v12_closed["V-12"] = "CLOSED"
+    res_closed = compute_network_flows(DUBAI_PIPE_SEGMENTS, v12_closed, plant_output_mld=100.0, leaks=leaks)
+    assert res_closed["pipe_flows_lps"]["SEG-S4-01"] == 0.0
+    assert res_closed["pipe_flows_lps"]["SEG-S4-05"] == 0.0
+    assert res_closed["pipe_flows_lps"]["SEG-S4-02"] > 0.0  # Unaffected coastal branch stays supplied
+    assert "LEAK-001" in res_closed["isolated_leak_ids"]
+    assert res_closed["active_leak_loss_m3_hr"]["LEAK-001"] == 0.0
+
+    # Scene state reflects computed 0 L/s flow and isolated leak when V-12 is overridden CLOSED
+    inject_scenario_1()
+    st_closed = build_3d_scene_state(focus="V-12", valve_override={"V-12": "CLOSED"})
+    p_s4_01 = next(p for p in st_closed["pipes"] if p["segment_id"] == "SEG-S4-01")
+    assert p_s4_01["flow_lps"] == 0.0
+    s4_leaks = [l for l in st_closed["leaks"] if l["pipe_segment_id"] == "SEG-S4-01"]
+    assert s4_leaks and all(l["isolated"] is True and l["estimated_loss_m3_per_hour"] == 0.0 for l in s4_leaks)
+
+
+def test_hydraulic_rerouting_only_where_alternative_path_exists():
+    """Flow reroutes at reduced capacity where an open alternate ring path exists, and drops to 0 when no bypass exists."""
+    from database.dubai_network import DUBAI_PIPE_SEGMENTS
+    from digital_twin.hydraulics import compute_network_flows
+
+    all_open = {f"V-{i:02d}": "OPEN" for i in range(1, 21)}
+    base = compute_network_flows(DUBAI_PIPE_SEGMENTS, all_open, plant_output_mld=100.0)
+    base_s5_02 = base["pipe_flows_lps"]["SEG-S5-02"]
+    assert base_s5_02 > 40.0
+
+    # Close V-13 (blocks primary feeder SEG-S5-01), but V-14 & V-16 stay OPEN -> SEG-S5-02 reroutes via SEG-S5-04!
+    v13_closed = dict(all_open)
+    v13_closed["V-13"] = "CLOSED"
+    rerouted = compute_network_flows(DUBAI_PIPE_SEGMENTS, v13_closed, plant_output_mld=100.0)
+    assert rerouted["pipe_flows_lps"]["SEG-S5-01"] == 0.0
+    assert 0.0 < rerouted["pipe_flows_lps"]["SEG-S5-02"] < base_s5_02
+    assert "SEG-S5-02" in rerouted["rerouted_segment_ids"]
+
+    # Now also close V-16 (cuts the alternate path too) -> SEG-S5-02 drops to 0.0 L/s
+    both_closed = dict(v13_closed)
+    both_closed["V-16"] = "CLOSED"
+    no_alt = compute_network_flows(DUBAI_PIPE_SEGMENTS, both_closed, plant_output_mld=100.0)
+    assert no_alt["pipe_flows_lps"]["SEG-S5-02"] == 0.0
+
+    # Closing Sector 3 root trunk V-07 has NO bypass -> all Sector 3 downstream pipes drop to 0.0 L/s
+    v07_closed = dict(all_open)
+    v07_closed["V-07"] = "CLOSED"
+    s3_cut = compute_network_flows(DUBAI_PIPE_SEGMENTS, v07_closed, plant_output_mld=100.0)
+    for sid in ("SEG-S3-01", "SEG-S3-02", "SEG-S3-03", "SEG-S3-04", "SEG-S3-05"):
+        assert s3_cut["pipe_flows_lps"][sid] == 0.0
+
+
+def test_simulate_valve_change_impact_and_part2_animation_html():
+    """simulate_valve_change_impact computes exact before->after flows, and 3D HTML includes particles, spray, puddle & localStorage diff/camera."""
+    from components.digital_twin_3d import build_3d_digital_twin_html
+    from digital_twin.hydraulics import simulate_valve_change_impact
+
+    impact = simulate_valve_change_impact("V-12", "CLOSED")
+    assert "SEG-S4-01" in impact["affected_pipe_ids"]
+    assert "SEG-S4-05" in impact["affected_pipe_ids"]
+    assert any("-> 0 L/s" in line for line in impact["summary_lines"])
+
+    inject_scenario_1()
+    state = build_3d_scene_state(focus="V-12")
+    html_out = build_3d_digital_twin_html(state, widget_id="anim_test", preserve_camera=True)
+
+    assert "pipeFlowTracks" in html_out
+    assert "flowInst" in html_out
+    assert "sprayDrops" in html_out
+    assert "puddle" in html_out
+    assert "valveAnims" in html_out
+    assert "aquagrid_3d_prev_state_v1" in html_out
+    assert "aquagrid_3d_camera_v1" in html_out
+    assert "window.localStorage" in html_out
+    assert "window.__AQUAGRID_PRESERVE_CAMERA__ = true;" in html_out
+

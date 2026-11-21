@@ -370,9 +370,76 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
       camSpec.position_xyz[1] * SCALE,
       camSpec.position_xyz[2] * SCALE
     );
-    camera.position.copy(defaultCamPos);
-    controls.target.copy(defaultTarget);
+
+    // Load previous state & saved camera from window.localStorage for smooth diff animations & Live Sim camera persistence
+    const PREV_STATE_KEY = 'aquagrid_3d_prev_state_v1';
+    const CAM_STATE_KEY = 'aquagrid_3d_camera_v1';
+    const currentFocusKey = `${{(state.highlight && state.highlight.type) || 'all'}}:${{(state.highlight && state.highlight.id) || 'all'}}`;
+
+    let prevState = null;
+    try {{
+      const rawPrev = window.localStorage.getItem(PREV_STATE_KEY);
+      if (rawPrev) prevState = JSON.parse(rawPrev);
+    }} catch (e) {{
+      prevState = null;
+    }}
+
+    let savedCam = null;
+    try {{
+      const rawCam = window.localStorage.getItem(CAM_STATE_KEY);
+      if (rawCam) savedCam = JSON.parse(rawCam);
+    }} catch (e) {{
+      savedCam = null;
+    }}
+
+    let flyAnim = null;
+    if (savedCam && savedCam.pos && savedCam.target && (window.__AQUAGRID_PRESERVE_CAMERA__ || savedCam.focusKey === currentFocusKey)) {{
+      camera.position.set(savedCam.pos[0], savedCam.pos[1], savedCam.pos[2]);
+      controls.target.set(savedCam.target[0], savedCam.target[1], savedCam.target[2]);
+    }} else if (savedCam && savedCam.pos && savedCam.target && savedCam.focusKey !== currentFocusKey) {{
+      // Smoothly fly from previous camera to the new focus target
+      camera.position.set(savedCam.pos[0], savedCam.pos[1], savedCam.pos[2]);
+      controls.target.set(savedCam.target[0], savedCam.target[1], savedCam.target[2]);
+      flyAnim = {{
+        startPos: camera.position.clone(),
+        endPos: defaultCamPos.clone(),
+        startTarget: controls.target.clone(),
+        endTarget: defaultTarget.clone(),
+        startTime: 0.0,
+        duration: 1.15
+      }};
+    }} else {{
+      camera.position.copy(defaultCamPos);
+      controls.target.copy(defaultTarget);
+    }}
     controls.update();
+
+    let camSaveTimer = null;
+    function saveCameraNow() {{
+      try {{
+        window.localStorage.setItem(CAM_STATE_KEY, JSON.stringify({{
+          focusKey: currentFocusKey,
+          pos: [camera.position.x, camera.position.y, camera.position.z],
+          target: [controls.target.x, controls.target.y, controls.target.z]
+        }}));
+      }} catch (e) {{}}
+    }}
+    controls.addEventListener('change', () => {{
+      if (camSaveTimer) clearTimeout(camSaveTimer);
+      camSaveTimer = setTimeout(saveCameraNow, 150);
+    }});
+
+    // Persist compact snapshot of current state for the next update's diff animations
+    try {{
+      const nextSnapshot = {{
+        valves: Object.fromEntries((state.valves || []).map(v => [v.valve_id, String(v.status).toUpperCase()])),
+        pipeFlows: Object.fromEntries((state.pipes || []).map(p => [p.segment_id, Number(p.flow_lps || 0)])),
+        reservoirLevel: Number((state.reservoir && state.reservoir.level_percent) || 48.0),
+        plantOutput: Number((state.plant && state.plant.output_mld) || 100.0),
+        activeLeaks: Object.fromEntries((state.leaks || []).map(l => [l.leak_id, !!l.active]))
+      }};
+      window.localStorage.setItem(PREV_STATE_KEY, JSON.stringify(nextSnapshot));
+    }} catch (e) {{}}
 
     // Lighting
     scene.add(new THREE.HemisphereLight('#DBEAFE', '#1E293B', 0.85));
@@ -543,14 +610,31 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
     plantGroup.add(plantHall);
     hoverables.push(plantHall);
 
-    // Output gauge glow bar on top of plant
-    const outRatio = Math.max(0.05, Math.min(1.0, (plant.output_mld || 0) / Math.max(1, plant.max_capacity_mld || 120)));
-    const gaugeBar = new THREE.Mesh(
-      new THREE.BoxGeometry(6.0 * outRatio, 0.7, 1.0),
-      new THREE.MeshStandardMaterial({{ color: '#38BDF8', emissive: '#0284C7', emissiveIntensity: 0.9 }})
+    // Output gauge glow bar & status beacon on top of plant (animates smoothly from previous output)
+    const plantMaxCap = Math.max(1, plant.max_capacity_mld || 120);
+    const targetPlantOut = Number(plant.output_mld || 0);
+    const prevPlantOut = (prevState && typeof prevState.plantOutput === 'number') ? prevState.plantOutput : targetPlantOut;
+    const initPlantRatio = Math.max(0.05, Math.min(1.0, prevPlantOut / plantMaxCap));
+
+    const gaugeBg = new THREE.Mesh(
+      new THREE.BoxGeometry(6.2, 0.72, 1.05),
+      new THREE.MeshStandardMaterial({{ color: '#1E293B', roughness: 0.7 }})
     );
-    gaugeBar.position.set(-3.0 + 3.0 * outRatio, 3.6, 0);
+    gaugeBg.position.set(0, 3.6, 0);
+    plantGroup.add(gaugeBg);
+
+    const gaugeMat = new THREE.MeshStandardMaterial({{ color: '#38BDF8', emissive: '#0284C7', emissiveIntensity: 0.9 }});
+    const gaugeBar = new THREE.Mesh(new THREE.BoxGeometry(6.0, 0.76, 1.1), gaugeMat);
+    gaugeBar.scale.x = initPlantRatio;
+    gaugeBar.position.set(-3.0 + 3.0 * initPlantRatio, 3.6, 0);
     plantGroup.add(gaugeBar);
+
+    const plantBeacon = new THREE.Mesh(
+      new THREE.SphereGeometry(0.55, 12, 12),
+      new THREE.MeshStandardMaterial({{ color: '#38BDF8', emissive: '#38BDF8', emissiveIntensity: 1.0 }})
+    );
+    plantBeacon.position.set(3.2, 3.9, 1.6);
+    plantGroup.add(plantBeacon);
 
     // Sea intake pipes extending west into sea
     [-1.2, 1.2].forEach(zOff => {{
@@ -563,9 +647,9 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
       plantGroup.add(intake);
     }});
     scene.add(plantGroup);
-    registerLabel(`DESAL-01 · ${{plant.output_mld}} MLD`, new THREE.Vector3(plantPos.x, 5.4, plantPos.z), 'ag-label', '#38BDF8');
+    const plantLblEl = registerLabel(`DESAL-01 · ${{targetPlantOut}} MLD`, new THREE.Vector3(plantPos.x, 5.4, plantPos.z), 'ag-label', '#38BDF8');
 
-    // 5. Reservoir RES-01 (cylindrical tank with visible inner water level + safety floor ring)
+    // 5. Reservoir RES-01 (cylindrical tank with smooth animated inner water level + safety floor ring)
     const res = state.reservoir || {{ id: 'RES-01', pos_xz: [-11000, 8800], level_percent: 48, safety_floor_percent: 35, volume_ml: 240, capacity_ml: 500 }};
     const resPos = new THREE.Vector3(res.pos_xz[0] * SCALE, 0, res.pos_xz[1] * SCALE);
     const tankRadius = 4.2;
@@ -594,20 +678,24 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
     tankBase.position.set(resPos.x, 0.2, resPos.z);
     scene.add(tankBase);
 
-    const levelFrac = Math.max(0.03, Math.min(0.98, (res.level_percent || 48) / 100.0));
-    const waterH = tankHeight * levelFrac;
+    const targetResPct = Number(res.level_percent || 48.0);
+    const prevResPct = (prevState && typeof prevState.reservoirLevel === 'number') ? prevState.reservoirLevel : targetResPct;
+    const waterMat = new THREE.MeshStandardMaterial({{
+      color: targetResPct < res.safety_floor_percent ? '#EF4444' : '#0EA5E9',
+      emissive: '#0369A1',
+      emissiveIntensity: 0.45,
+      transparent: true,
+      opacity: 0.86,
+      roughness: 0.2
+    }});
+    // Unit-height cylinder scaled dynamically on Y for smooth level animation
     const waterMesh = new THREE.Mesh(
-      new THREE.CylinderGeometry(tankRadius - 0.25, tankRadius - 0.25, waterH, 28),
-      new THREE.MeshStandardMaterial({{
-        color: res.level_percent < res.safety_floor_percent ? '#EF4444' : '#0EA5E9',
-        emissive: '#0369A1',
-        emissiveIntensity: 0.45,
-        transparent: true,
-        opacity: 0.86,
-        roughness: 0.2
-      }})
+      new THREE.CylinderGeometry(tankRadius - 0.25, tankRadius - 0.25, 1.0, 28),
+      waterMat
     );
-    waterMesh.position.set(resPos.x, waterH * 0.5 + 0.2, resPos.z);
+    const initWaterH = tankHeight * Math.max(0.03, Math.min(0.98, prevResPct / 100.0));
+    waterMesh.scale.y = initWaterH;
+    waterMesh.position.set(resPos.x, initWaterH * 0.5 + 0.2, resPos.z);
     scene.add(waterMesh);
 
     // Safety floor ring around tank
@@ -620,19 +708,33 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
     floorRing.position.set(resPos.x, floorY, resPos.z);
     scene.add(floorRing);
 
-    registerLabel(`RES-01 · ${{res.level_percent}}%`, new THREE.Vector3(resPos.x, tankHeight + 1.8, resPos.z), 'ag-label', '#0EA5E9');
+    const resLblEl = registerLabel(`RES-01 · ${{targetResPct.toFixed(1)}}%`, new THREE.Vector3(resPos.x, tankHeight + 1.8, resPos.z), 'ag-label', '#0EA5E9');
 
     // Supply transmission pipe connecting DESAL-01 -> RES-01
-    const plantToRes = new THREE.CatmullRomCurve3([
+    const plantToResCurve = new THREE.CatmullRomCurve3([
       new THREE.Vector3(plantPos.x + 2.5, 0.8, plantPos.z),
       new THREE.Vector3(resPos.x, 0.8, resPos.z)
     ]);
     scene.add(new THREE.Mesh(
-      new THREE.TubeGeometry(plantToRes, 12, 0.55, 8, false),
+      new THREE.TubeGeometry(plantToResCurve, 12, 0.55, 8, false),
       new THREE.MeshStandardMaterial({{ color: '#38BDF8', emissive: '#0369A1', emissiveIntensity: 0.3 }})
     ));
 
-    // 6. Pipes as 3D tubes coloured by sector (main trunks thicker)
+    // 6. Pipes as 3D tubes coloured by sector + live water-flow particle tracks
+    const pipeFlowTracks = [];
+    // Add supply main flow track
+    pipeFlowTracks.push({{
+      curve: plantToResCurve,
+      prevFlow: prevPlantOut * 1.1,
+      targetFlow: targetPlantOut * 1.1,
+      currentFlow: prevPlantOut * 1.1,
+      mat: null,
+      activeColor: new THREE.Color('#38BDF8'),
+      dryColor: new THREE.Color('#475569'),
+      delay: 0.0,
+      particles: Array.from({{ length: lowQ ? 3 : 6 }}, (_, i) => ({{ phase: i / (lowQ ? 3 : 6) }}))
+    }});
+
     (state.pipes || []).forEach(pipe => {{
       const pts = (pipe.points_xz || []).map(p => new THREE.Vector3(p[0] * SCALE, 0.85, p[1] * SCALE));
       if (pts.length < 2) return;
@@ -641,32 +743,77 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
       const pHl = !!pipe.highlighted;
       const pDim = isFocused && !pHl && (hlInfo.type === 'sector' || hlInfo.type === 'valve');
 
+      const targetFlow = Number(pipe.flow_lps || 0);
+      const prevFlow = (prevState && prevState.pipeFlows && typeof prevState.pipeFlows[pipe.segment_id] === 'number')
+        ? prevState.pipeFlows[pipe.segment_id]
+        : targetFlow;
+      const activeCol = new THREE.Color(pipe.color || '#2563EB');
+      const dryCol = new THREE.Color('#475569');
+
       const mat = new THREE.MeshStandardMaterial({{
-        color: pipe.flow_lps <= 0.05 ? '#64748B' : pipe.color,
-        emissive: pHl ? pipe.color : '#000000',
-        emissiveIntensity: pHl ? 0.45 : 0.0,
+        color: prevFlow <= 0.05 ? dryCol : activeCol,
+        emissive: pHl ? activeCol : new THREE.Color('#000000'),
+        emissiveIntensity: pHl ? 0.5 : 0.0,
         roughness: 0.35,
         metalness: 0.3,
         transparent: pDim,
         opacity: pDim ? 0.28 : 0.96
       }});
       const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, Math.max(12, pts.length * 6), radius, 8, false), mat);
-      tube.userData.tooltip = `<strong>${{pipe.segment_id}}</strong> (${{pipe.sector}})<br/>${{pipe.name}}<br/>${{pipe.diameter_mm}}mm ${{pipe.is_trunk ? 'Trunk' : 'Distribution'}} · Valve: ${{pipe.isolation_valve_id}}<br/>Flow: <strong>${{pipe.flow_lps}} L/s</strong> · Pressure: ${{pipe.pressure_psi}} psi`;
+      const rerouteTag = pipe.rerouted ? ' · REROUTED' : '';
+      tube.userData.tooltip = `<strong>${{pipe.segment_id}}</strong> (${{pipe.sector}})<br/>${{pipe.name}}<br/>${{pipe.diameter_mm}}mm ${{pipe.is_trunk ? 'Trunk' : 'Distribution'}} · Valve: ${{pipe.isolation_valve_id}}<br/>Flow: <strong>${{pipe.flow_lps}} L/s</strong>${{rerouteTag}} · Pressure: ${{pipe.pressure_psi}} psi`;
       scene.add(tube);
       hoverables.push(tube);
+
+      // Particle count proportional to max(prevFlow, targetFlow); 0 particles if flow is 0 both before and after
+      const maxFlow = Math.max(prevFlow, targetFlow);
+      const maxCount = lowQ ? 4 : 9;
+      const pCount = maxFlow <= 0.05 ? 0 : Math.max(2, Math.min(maxCount, Math.round(maxFlow / (lowQ ? 35 : 16))));
+      const flowChanged = Math.abs(targetFlow - prevFlow) > 0.5;
+      pipeFlowTracks.push({{
+        curve,
+        prevFlow,
+        targetFlow,
+        currentFlow: prevFlow,
+        mat,
+        activeColor: activeCol,
+        dryColor: dryCol,
+        delay: flowChanged ? 0.65 : 0.0,
+        particles: Array.from({{ length: pCount }}, (_, i) => ({{ phase: i / Math.max(1, pCount) }}))
+      }});
     }});
 
-    // 7. Valves as 3D handwheels on pipes (green OPEN, red CLOSED) with labels
+    // Single InstancedMesh for all moving water flow particles across the whole network
+    const totalFlowParticles = pipeFlowTracks.reduce((acc, tr) => acc + tr.particles.length, 0);
+    let flowInst = null;
+    if (totalFlowParticles > 0) {{
+      flowInst = new THREE.InstancedMesh(
+        new THREE.SphereGeometry(0.32, 8, 8),
+        new THREE.MeshBasicMaterial({{ color: '#BAE6FD' }}),
+        totalFlowParticles
+      );
+      scene.add(flowInst);
+    }}
+
+    // 7. Valves as 3D handwheels on pipes (green OPEN, red CLOSED) with ~2s diff turn + color transition
+    const valveAnims = [];
+    const colOpen = new THREE.Color('#22C55E');
+    const colClosed = new THREE.Color('#EF4444');
     (state.valves || []).forEach(v => {{
       const vx = v.pos_xz[0] * SCALE;
       const vz = v.pos_xz[1] * SCALE;
-      const isOpen = String(v.status).toUpperCase() === 'OPEN';
-      const vColor = isOpen ? '#22C55E' : '#EF4444';
+      const targetOpen = String(v.status).toUpperCase() === 'OPEN';
+      const prevStatStr = (prevState && prevState.valves && prevState.valves[v.valve_id]) ? prevState.valves[v.valve_id] : v.status;
+      const prevOpen = String(prevStatStr).toUpperCase() === 'OPEN';
+      const changed = prevOpen !== targetOpen;
+
+      const initColor = prevOpen ? colOpen.clone() : colClosed.clone();
+      const targetColor = targetOpen ? colOpen.clone() : colClosed.clone();
+      const vColorHex = targetOpen ? '#22C55E' : '#EF4444';
 
       const vGroup = new THREE.Group();
       vGroup.position.set(vx, 1.55, vz);
 
-      // Stem
       const stem = new THREE.Mesh(
         new THREE.CylinderGeometry(0.14, 0.14, 1.1, 8),
         new THREE.MeshStandardMaterial({{ color: '#94A3B8', metalness: 0.6 }})
@@ -674,11 +821,10 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
       stem.position.y = -0.35;
       vGroup.add(stem);
 
-      // Wheel ring + cross spokes
       const wheelGroup = new THREE.Group();
       const wheelMat = new THREE.MeshStandardMaterial({{
-        color: vColor,
-        emissive: vColor,
+        color: initColor.clone(),
+        emissive: initColor.clone(),
         emissiveIntensity: v.highlighted ? 0.65 : 0.3,
         roughness: 0.3,
         metalness: 0.4
@@ -693,17 +839,28 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
       wheelGroup.position.y = 0.2;
       vGroup.add(wheelGroup);
 
-      // Invisible hit sphere for easy hover
       const hit = new THREE.Mesh(
         new THREE.SphereGeometry(1.4, 8, 8),
         new THREE.MeshBasicMaterial({{ transparent: true, opacity: 0.0, depthWrite: false }})
       );
-      hit.userData.tooltip = `<strong>Valve ${{v.valve_id}}</strong> (${{v.sector}})<br/>Status: <span style="color:${{vColor}}; font-weight:700;">${{v.status}}</span>${{v.pipe_segment_id ? '<br/>Segment: ' + v.pipe_segment_id : ''}}`;
+      hit.userData.tooltip = `<strong>Valve ${{v.valve_id}}</strong> (${{v.sector}})<br/>Status: <span style="color:${{vColorHex}}; font-weight:700;">${{v.status}}</span>${{v.pipe_segment_id ? '<br/>Segment: ' + v.pipe_segment_id : ''}}`;
       vGroup.add(hit);
       hoverables.push(hit);
 
       scene.add(vGroup);
-      registerLabel(v.valve_id, new THREE.Vector3(vx, 2.7, vz), 'ag-label ag-label-valve', vColor);
+      const lblEl = registerLabel(v.valve_id, new THREE.Vector3(vx, 2.7, vz), 'ag-label ag-label-valve', vColorHex);
+
+      if (changed) {{
+        valveAnims.push({{
+          wheelGroup,
+          wheelMat,
+          lblEl,
+          fromColor: initColor,
+          toColor: targetColor,
+          spinSign: targetOpen ? -1.0 : 1.0,
+          duration: 2.0
+        }});
+      }}
     }});
 
     // 8. Sensors as small glowing points (quarantined = grey + warning icon)
@@ -730,39 +887,85 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
       }}
     }});
 
-    // 9. Leaks as red pulsing markers
-    const pulsingLeaks = [];
+    // 9. Leaks with water spray fountain + expanding street puddle (spray stops when isolated!)
+    const leakEffects = [];
+    const dropletGeo = new THREE.SphereGeometry(0.18, 6, 6);
+    const dropletMat = new THREE.MeshBasicMaterial({{ color: '#7DD3FC', transparent: true, opacity: 0.9 }});
+
     (state.leaks || []).forEach(lk => {{
-      if (!lk.active) return;
+      const wasActive = !!(prevState && prevState.activeLeaks && prevState.activeLeaks[lk.leak_id]);
+      const isActive = !!lk.active && !lk.isolated;
+      const justIsolated = wasActive && !isActive;
+      if (!isActive && !justIsolated) return;
+
       const lx = lk.pos_xz[0] * SCALE;
       const lz = lk.pos_xz[1] * SCALE;
 
-      const core = new THREE.Mesh(
-        new THREE.SphereGeometry(0.9, 16, 16),
-        new THREE.MeshStandardMaterial({{ color: '#EF4444', emissive: '#DC2626', emissiveIntensity: 1.0 }})
-      );
+      const coreMat = new THREE.MeshStandardMaterial({{
+        color: isActive ? '#EF4444' : '#94A3B8',
+        emissive: isActive ? '#DC2626' : '#475569',
+        emissiveIntensity: isActive ? 1.0 : 0.3
+      }});
+      const core = new THREE.Mesh(new THREE.SphereGeometry(0.9, 16, 16), coreMat);
       core.position.set(lx, 1.5, lz);
-      core.userData.tooltip = `<strong>${{lk.leak_id}}</strong> (${{lk.severity}} · ${{lk.status}})<br/>${{lk.location_name}}<br/>Loss: <strong>${{lk.estimated_loss_m3_per_hour}} m³/hr</strong>`;
+      core.userData.tooltip = `<strong>${{lk.leak_id}}</strong> (${{lk.severity}} · ${{isActive ? lk.status : 'ISOLATED'}})<br/>${{lk.location_name}}<br/>Loss: <strong>${{lk.estimated_loss_m3_per_hour}} m³/hr</strong>`;
       scene.add(core);
       hoverables.push(core);
 
       const pulseRing = new THREE.Mesh(
         new THREE.RingGeometry(1.1, 1.8, 28),
-        new THREE.MeshBasicMaterial({{ color: '#EF4444', transparent: true, opacity: 0.75, side: THREE.DoubleSide }})
+        new THREE.MeshBasicMaterial({{ color: '#EF4444', transparent: true, opacity: isActive ? 0.75 : 0.0, side: THREE.DoubleSide }})
       );
       pulseRing.rotation.x = -Math.PI / 2;
       pulseRing.position.set(lx, 0.25, lz);
       scene.add(pulseRing);
 
-      pulsingLeaks.push({{ core, ring: pulseRing }});
-      registerLabel(`🚨 ${{lk.leak_id}}`, new THREE.Vector3(lx, 3.6, lz), 'ag-label', '#EF4444');
+      // Street puddle beneath the leak
+      const puddleMat = new THREE.MeshBasicMaterial({{
+        color: '#0EA5E9',
+        transparent: true,
+        opacity: isActive ? 0.48 : 0.35,
+        side: THREE.DoubleSide
+      }});
+      const puddle = new THREE.Mesh(new THREE.CircleGeometry(2.6, 24), puddleMat);
+      puddle.rotation.x = -Math.PI / 2;
+      puddle.position.set(lx, 0.16, lz);
+      scene.add(puddle);
+
+      // Parabolic water spray fountain droplets
+      const dropCount = lowQ ? 8 : 18;
+      const sprayDrops = [];
+      for (let i = 0; i < dropCount; i++) {{
+        const ang = (i / dropCount) * Math.PI * 2 + (i % 3) * 0.25;
+        const speed = 1.6 + (i % 4) * 0.45;
+        const drop = new THREE.Mesh(dropletGeo, dropletMat);
+        drop.position.set(lx, 1.4, lz);
+        scene.add(drop);
+        sprayDrops.push({{ mesh: drop, ang, speed, offset: i / dropCount }});
+      }}
+
+      leakEffects.push({{
+        lx, lz, core, ring: pulseRing, puddle, puddleMat, sprayDrops,
+        isActive, justIsolated
+      }});
+      registerLabel(
+        isActive ? `🚨 ${{lk.leak_id}}` : `✓ ${{lk.leak_id}} ISOLATED`,
+        new THREE.Vector3(lx, 4.0, lz),
+        'ag-label',
+        isActive ? '#EF4444' : '#22C55E'
+      );
     }});
 
-    // Reset view button
+    // Reset view button (smoothly flies back to default camera & updates localStorage)
     document.getElementById('ag-reset-btn').addEventListener('click', () => {{
-      camera.position.copy(defaultCamPos);
-      controls.target.copy(defaultTarget);
-      controls.update();
+      flyAnim = {{
+        startPos: camera.position.clone(),
+        endPos: defaultCamPos.clone(),
+        startTarget: controls.target.clone(),
+        endTarget: defaultTarget.clone(),
+        startTime: clock.getElapsedTime(),
+        duration: 0.85
+      }};
     }});
 
     // Raycaster hover tooltips
@@ -799,24 +1002,119 @@ if (!window.detectWebGL || !window.detectWebGL()) {{
       renderer.setSize(w, h);
     }});
 
-    // Animation loop
+    // Animation loop (water particles, valve turn/color diff, reservoir level, plant glow, leak spray & camera fly-to)
     const projVec = new THREE.Vector3();
+    const pDummy = new THREE.Object3D();
+    const pPos = new THREE.Vector3();
     const clock = new THREE.Clock();
+    let prevTime = 0;
+
+    function easeOutCubic(x) {{
+      return 1 - Math.pow(1 - Math.max(0, Math.min(1, x)), 3);
+    }}
+
     function animate() {{
       requestAnimationFrame(animate);
       const t = clock.getElapsedTime();
+      const dt = Math.min(0.05, Math.max(0.001, t - prevTime));
+      prevTime = t;
+
+      // 1. Camera fly-to transition (if focus changed or Reset clicked)
+      if (flyAnim) {{
+        const u = easeOutCubic((t - flyAnim.startTime) / flyAnim.duration);
+        camera.position.lerpVectors(flyAnim.startPos, flyAnim.endPos, u);
+        controls.target.lerpVectors(flyAnim.startTarget, flyAnim.endTarget, u);
+        if (u >= 1.0) {{
+          flyAnim = null;
+          saveCameraNow();
+        }}
+      }}
       controls.update();
 
-      // Pulse leak markers
-      for (const item of pulsingLeaks) {{
-        const s = 1.0 + 0.35 * Math.sin(t * 4.5);
-        item.core.scale.setScalar(s);
-        const rScale = 1.0 + ((t * 1.4) % 1.8);
-        item.ring.scale.setScalar(rScale);
-        item.ring.material.opacity = Math.max(0.0, 0.85 - (rScale - 1.0) * 0.45);
+      // 2. Smooth reservoir level & plant output gauge animation (~2.0s)
+      const lvlU = easeOutCubic(t / 2.0);
+      const curResPct = prevResPct + (targetResPct - prevResPct) * lvlU;
+      const curWaterH = tankHeight * Math.max(0.03, Math.min(0.98, curResPct / 100.0));
+      waterMesh.scale.y = curWaterH;
+      waterMesh.position.y = curWaterH * 0.5 + 0.2;
+      resLblEl.textContent = `RES-01 · ${{curResPct.toFixed(1)}}%`;
+
+      const curPlantOut = prevPlantOut + (targetPlantOut - prevPlantOut) * lvlU;
+      const curPlantRatio = Math.max(0.05, Math.min(1.0, curPlantOut / plantMaxCap));
+      gaugeBar.scale.x = curPlantRatio;
+      gaugeBar.position.x = -3.0 + 3.0 * curPlantRatio;
+      gaugeMat.emissiveIntensity = 0.65 + 0.35 * Math.sin(t * 2.5) * curPlantRatio;
+      plantBeacon.scale.setScalar(0.85 + 0.25 * Math.sin(t * 3.5));
+      plantLblEl.textContent = `DESAL-01 · ${{curPlantOut.toFixed(0)}} MLD`;
+
+      // 3. Valve wheel rotation + green <-> red transition (~2.0s)
+      for (const va of valveAnims) {{
+        const vu = easeOutCubic(t / va.duration);
+        va.wheelGroup.rotation.y = va.spinSign * Math.PI * 2.0 * vu;
+        va.wheelMat.color.copy(va.fromColor).lerp(va.toColor, vu);
+        va.wheelMat.emissive.copy(va.fromColor).lerp(va.toColor, vu);
       }}
 
-      // Project floating 3D labels to 2D screen positions
+      // 4. Water flow particles along each pipe (speed & visibility proportional to flow; none when flow == 0)
+      if (flowInst) {{
+        let instIdx = 0;
+        for (const tr of pipeFlowTracks) {{
+          const fu = tr.delay > 0 ? easeOutCubic((t - tr.delay) / 1.8) : 1.0;
+          tr.currentFlow = tr.prevFlow + (tr.targetFlow - tr.prevFlow) * fu;
+          if (tr.mat) {{
+            const wetFrac = Math.min(1.0, tr.currentFlow / 25.0);
+            tr.mat.color.copy(tr.dryColor).lerp(tr.activeColor, wetFrac);
+          }}
+          const speed = (tr.currentFlow / 100.0) * 0.28;
+          const visibleScale = tr.currentFlow <= 0.05 ? 0.0 : Math.min(1.15, 0.55 + (tr.currentFlow / 120.0) * 0.6);
+
+          for (const pt of tr.particles) {{
+            if (visibleScale > 0.0) {{
+              pt.phase = (pt.phase + dt * speed) % 1.0;
+              tr.curve.getPointAt(pt.phase, pPos);
+              pDummy.position.set(pPos.x, pPos.y + 0.42, pPos.z);
+              pDummy.scale.setScalar(visibleScale);
+            }} else {{
+              pDummy.position.set(0, -100, 0);
+              pDummy.scale.setScalar(0.0);
+            }}
+            pDummy.updateMatrix();
+            flowInst.setMatrixAt(instIdx++, pDummy.matrix);
+          }}
+        }}
+        flowInst.instanceMatrix.needsUpdate = true;
+      }}
+
+      // 5. Leak water spray fountain + puddle (stops smoothly when isolated!)
+      for (const lk of leakEffects) {{
+        const sprayIntensity = lk.isActive ? 1.0 : Math.max(0.0, 1.0 - easeOutCubic((t - 0.8) / 1.6));
+        if (lk.isActive) {{
+          const s = 1.0 + 0.3 * Math.sin(t * 4.5);
+          lk.core.scale.setScalar(s);
+          const rScale = 1.0 + ((t * 1.4) % 1.8);
+          lk.ring.scale.setScalar(rScale);
+          lk.ring.material.opacity = Math.max(0.0, 0.8 - (rScale - 1.0) * 0.45);
+          lk.puddle.scale.setScalar(0.95 + 0.12 * Math.sin(t * 2.2));
+        }} else {{
+          lk.core.scale.setScalar(0.75);
+          lk.ring.material.opacity = 0.0;
+          lk.puddleMat.opacity = 0.15 + 0.25 * sprayIntensity;
+        }}
+        for (const dr of lk.sprayDrops) {{
+          if (sprayIntensity <= 0.02) {{
+            dr.mesh.visible = false;
+          }} else {{
+            dr.mesh.visible = true;
+            const cyc = (t * 1.6 + dr.offset) % 1.0;
+            const r = cyc * dr.speed * 1.6 * sprayIntensity;
+            const y = 1.3 + (4.2 * cyc - 4.2 * cyc * cyc) * (2.6 * sprayIntensity);
+            dr.mesh.position.set(lk.lx + Math.cos(dr.ang) * r, Math.max(0.2, y), lk.lz + Math.sin(dr.ang) * r);
+            dr.mesh.scale.setScalar(0.8 * sprayIntensity);
+          }}
+        }}
+      }}
+
+      // 6. Project floating 3D labels to 2D screen positions
       const cw = container.clientWidth;
       const ch = container.clientHeight;
       for (const item of labelAnchors) {{
@@ -861,7 +1159,7 @@ def render_3d_digital_twin(
     flow_override_by_segment: Optional[dict[str, float]] = None,
     valve_override: Optional[dict[str, str]] = None,
     show_controls: bool = True,
-    preserve_camera: bool = False,
+    preserve_camera: Optional[bool] = None,
 ) -> dict:
     """Render the interactive 3D Digital Twin inside Streamlit with Low quality toggle. Returns the scene state."""
     low_q = False
@@ -871,6 +1169,9 @@ def render_3d_digital_twin(
             low_q = st.checkbox("Low quality", value=False, key=f"twin_lowq_{widget_key}")
         with c_info:
             st.caption("Drag to rotate · Scroll to zoom · Right-drag to pan · Hover assets for live values")
+
+    # Automatically preserve user camera angle when Live Simulation is ON
+    eff_preserve = bool(st.session_state.get("live_sim_toggle", False)) if preserve_camera is None else bool(preserve_camera)
 
     scene_state = build_3d_scene_state(
         focus=focus,
@@ -884,7 +1185,7 @@ def render_3d_digital_twin(
         scene_state=scene_state,
         widget_id=widget_key,
         height=height,
-        preserve_camera=preserve_camera,
+        preserve_camera=eff_preserve,
     )
     components.html(html_str, height=height + 6, scrolling=False)
     return scene_state
