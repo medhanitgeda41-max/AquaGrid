@@ -33,7 +33,7 @@ def clean_db():
 
 
 def test_sector_boundaries_computed_for_all_6_sectors_and_contain_all_assets():
-    """All 6 sectors get buffered (~300m) convex-hull polygons that strictly contain every pipe vertex, valve, junction, and sensor."""
+    """All 6 sectors get buffered (~500m) convex-hull polygons that strictly contain every pipe vertex, valve, junction, and sensor."""
     assert SECTOR_COLOR_NAMES == {
         "Sector 1": "blue",
         "Sector 2": "green",
@@ -44,7 +44,7 @@ def test_sector_boundaries_computed_for_all_6_sectors_and_contain_all_assets():
     }
     assert set(SECTOR_COLORS.keys()) == set(SECTOR_COLOR_NAMES.keys())
 
-    boundaries = compute_sector_boundaries(DUBAI_PIPE_SEGMENTS, buffer_meters=300.0)
+    boundaries = compute_sector_boundaries(DUBAI_PIPE_SEGMENTS)
     assert set(boundaries.keys()) == {f"Sector {i}" for i in range(1, 7)}
 
     for sec, binfo in boundaries.items():
@@ -81,7 +81,7 @@ def test_show_map_all_draws_6_boundaries_and_sector_4_zooms_and_highlights():
     assert all_summary["highlight_sector"] is None
     assert "All sectors" in all_summary["zoom_target"]
     assert all_summary["layers_drawn"] == ["Sector boundaries", "Pipes", "Sensors", "Valves", "Leaks"]
-    assert all_summary["basemap"] == "CartoDB Positron (light_all)"
+    assert all_summary["basemap"] == "OpenStreetMap"
     assert all_summary["total_pipes"] == 28
     assert all_summary["total_valves"] == 20
     assert set(all_summary["per_sector"].keys()) == {f"Sector {i}" for i in range(1, 7)}
@@ -95,7 +95,7 @@ def test_show_map_all_draws_6_boundaries_and_sector_4_zooms_and_highlights():
     assert s4_summary["zoom_bounds"] is not None
     assert "Sector 4" in s4_summary["summary_text"] and "purple" in s4_summary["summary_text"]
 
-    # Build real Folium map HTML and verify CartoDB Positron basemap, legend, sector labels, boundaries & valves render
+    # Build real Folium map HTML and verify OpenStreetMap basemap ONLY (zero CARTO URLs), collapsible bottom-right legend, fitBounds & boundaries
     fmap_all = build_leak_folium_map(
         segments=DUBAI_PIPE_SEGMENTS,
         leaks=[],
@@ -108,12 +108,15 @@ def test_show_map_all_draws_6_boundaries_and_sector_4_zooms_and_highlights():
         show_valves=True,
         show_leaks=True,
         highlight_sector=None,
-        basemap="CartoDB Positron",
     )
     html_all = fmap_all.get_root().render()
-    assert "basemaps.cartocdn.com/light_all" in html_all
+    assert "carto" not in html_all.lower()
+    assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in html_all
+    assert "OpenStreetMap contributors" in html_all
+    assert "fitBounds" in html_all
     assert "Sector Boundaries" in html_all
-    assert "Sectors &amp; Assets" in html_all
+    assert "<details" in html_all and "Legend" in html_all and "right: 10px" in html_all
+    assert "border-radius:999px" not in html_all  # No dark pill/circle markers on sector labels
     for i in range(1, 7):
         assert f"Sector {i}" in html_all
 
@@ -125,11 +128,30 @@ def test_show_map_all_draws_6_boundaries_and_sector_4_zooms_and_highlights():
         selected_leak=None,
         show_boundaries=True,
         highlight_sector="Sector 4",
-        basemap="CartoDB Positron",
     )
     html_s4 = fmap_s4.get_root().render()
+    assert "carto" not in html_s4.lower()
     assert "fitBounds" in html_s4
     assert "Sector 4 (purple boundary)" in html_s4
+    # Highlighted Sector 4 has stronger weight (4.5) while dimmed sectors have lighter weight (1.5)
+    assert '"weight": 4.5' in html_s4
+    assert '"weight": 1.5' in html_s4
+
+
+def test_show_the_sectors_without_naming_one_shows_all_6_directly():
+    """'show the sectors' or 'show the map' without naming a sector shows all 6 sectors directly instead of asking which sector."""
+    def _mock_ask_which_sector(messages, tools, tool_executor, max_tool_steps=5, fallback_context_builder=None, status_callback=None):
+        return "Which sector would you like me to display?", "Groq (openai/gpt-oss-120b)", []
+
+    with patch("agent.chat_assistant.llm_client.chat_with_tools", side_effect=_mock_ask_which_sector):
+        reply = run_chat_turn("show the sectors", history=[], current_hour=14)
+
+    map_widgets = [w for w in reply.get("widgets", []) if w.get("type") == "map"]
+    assert len(map_widgets) == 1
+    assert map_widgets[0]["sector"] == "all"
+    assert map_widgets[0]["show_boundaries"] is True
+    assert "which sector" not in reply["content"].lower()
+    assert "OpenStreetMap" in reply["content"]
 
 
 def test_truthful_map_description_replaces_untrue_boundary_claims():

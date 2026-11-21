@@ -465,16 +465,24 @@ class LLMClient:
         tool_executor: Callable[[str, dict], Any],
         max_tool_steps: int = 5,
         fallback_context_builder: Optional[Callable[[], str]] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> tuple[Optional[str], str, list[dict]]:
         """
         Run a multi-turn OpenAI-compatible chat with live tool calling across the fallback chain.
         Safely handles tool_calls=None, content=None, providers without tool support, and exceptions.
-        Records every tried provider in self.last_chat_providers_tried.
+        Records every tried provider in self.last_chat_providers_tried and emits live status updates.
         """
         providers = self._get_chat_provider_chain()
         max_steps = max(1, min(int(max_tool_steps), 5))
         tried: list[dict] = []
         self.last_chat_providers_tried = tried
+
+        def _emit(step_text: str) -> None:
+            if callable(status_callback):
+                try:
+                    status_callback(step_text)
+                except Exception:
+                    pass
 
         for p in providers:
             if "groq" in p["name"].lower() and not self._has_real_api_key(p["api_key"]):
@@ -484,6 +492,7 @@ class LLMClient:
                 tried.append({"provider": p["name"], "status": "SKIPPED", "error": "API key not configured"})
                 continue
 
+            _emit(f"Asking {p['name']}...")
             client = OpenAI(
                 base_url=p["base_url"],
                 api_key=p["api_key"],
@@ -622,7 +631,16 @@ class LLMClient:
                     logger.exception("Chat provider %s also failed without tools", p["name"])
                     tried.append({"provider": p["name"], "status": "FAILED", "error": f"{tool_err} | retry: {type(e2).__name__}: {e2}"})
 
+            short_name = p["name"].split(" (")[0].strip() or p["name"]
+            _emit(f"{short_name} busy, trying backup model...")
+
         return None, "Deterministic Offline Engine", []
+
+
+def provider_supports_streaming(provider_name: str) -> bool:
+    """Return True when the answering provider supports streamed text output (Groq, Gemini, Ollama)."""
+    low = (provider_name or "").lower()
+    return any(tok in low for tok in ("groq", "gemini", "ollama"))
 
 
 llm_client = LLMClient()

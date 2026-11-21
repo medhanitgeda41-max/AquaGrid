@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 import html
 import json
+import math
 import altair as alt
 from branca.element import MacroElement, Template
 import folium
@@ -117,51 +118,62 @@ def _build_segment_history_charts(segment_id: str) -> tuple[alt.Chart | None, al
     return p_chart, f_chart
 
 
+def _centroid_distance_m(c1: list[float], c2: list[float]) -> float:
+    """Approximate planar distance in meters between two [lat, lon] centroids."""
+    ref_lat = 0.5 * (float(c1[0]) + float(c2[0]))
+    dy = (float(c1[0]) - float(c2[0])) * 111_320.0
+    dx = (float(c1[1]) - float(c2[1])) * 111_320.0 * math.cos(math.radians(ref_lat))
+    return math.hypot(dx, dy)
+
+
 def _build_map_legend_html() -> str:
-    """Build floating bottom-left Leaflet legend HTML listing Sectors 1-6 colors + symbols for sensors, valves, leaks."""
+    """Build compact collapsible bottom-right Leaflet legend listing Sectors 1-6 colors + asset symbols."""
     sec_items = "".join(
-        f'<div style="display:flex; align-items:center; gap:6px; margin:2px 0;">'
-        f'<span style="display:inline-block; width:13px; height:13px; border-radius:3px; '
+        f'<div style="display:flex; align-items:center; gap:5px; margin:2px 0;">'
+        f'<span style="display:inline-block; width:10px; height:10px; border-radius:2px; '
         f'background:{SECTOR_COLORS[s]}33; border:2px solid {SECTOR_COLORS[s]};"></span>'
         f'<span><strong>{s}</strong> ({SECTOR_COLOR_NAMES[s]})</span></div>'
         for s in ("Sector 1", "Sector 2", "Sector 3", "Sector 4", "Sector 5", "Sector 6")
     )
     return f"""
     {{% macro html(this, kwargs) %}}
-    <div style="
+    <details style="
         position: fixed;
-        bottom: 18px;
-        left: 14px;
+        bottom: 26px;
+        right: 10px;
         z-index: 9999;
-        background: rgba(17, 24, 39, 0.92);
+        background: rgba(17, 24, 39, 0.90);
         color: #F8FAFC;
         border: 1px solid #334155;
-        border-radius: 8px;
-        padding: 8px 11px;
+        border-radius: 6px;
+        padding: 4px 8px;
         font-family: system-ui, -apple-system, sans-serif;
-        font-size: 11px;
-        line-height: 1.35;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+        font-size: 10px;
+        line-height: 1.3;
+        max-width: 170px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.32);
     ">
-        <div style="font-weight:700; margin-bottom:4px; color:#E2E8F0; border-bottom:1px solid #334155; padding-bottom:2px;">
-            Sectors &amp; Assets
+        <summary style="cursor:pointer; font-weight:700; color:#E2E8F0; user-select:none;">
+            Legend
+        </summary>
+        <div style="margin-top:4px; padding-top:4px; border-top:1px solid #334155;">
+            {sec_items}
+            <div style="margin-top:4px; padding-top:4px; border-top:1px solid #334155;">
+                <div style="display:flex; align-items:center; gap:5px; margin:2px 0;">
+                    <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#0EA5E9; border:1px solid #fff;"></span>
+                    <span>Sensor · &#9888; Quarantined</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:5px; margin:2px 0;">
+                    <span style="display:inline-block; width:8px; height:8px; background:#16A34A; border:1px solid #fff;"></span>
+                    <span>Valve OPEN · <span style="color:#EF4444;">&#9632;</span> CLOSED</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:5px; margin:2px 0;">
+                    <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#EF4444; border:1px solid #FCA5A5;"></span>
+                    <span>Active Leak</span>
+                </div>
+            </div>
         </div>
-        {sec_items}
-        <div style="margin-top:5px; padding-top:4px; border-top:1px solid #334155;">
-            <div style="display:flex; align-items:center; gap:6px; margin:2px 0;">
-                <span style="display:inline-block; width:9px; height:9px; border-radius:50%; background:#0EA5E9; border:1px solid #fff;"></span>
-                <span>Sensor (Active) · &#9888; Quarantined</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:6px; margin:2px 0;">
-                <span style="display:inline-block; width:9px; height:9px; background:#16A34A; border:1px solid #fff;"></span>
-                <span>Valve OPEN · <span style="color:#EF4444;">&#9632;</span> CLOSED</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:6px; margin:2px 0;">
-                <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF4444; border:2px solid #FCA5A5;"></span>
-                <span>Active Leak &amp; Zone</span>
-            </div>
-        </div>
-    </div>
+    </details>
     {{% endmacro %}}
     """
 
@@ -180,10 +192,10 @@ def build_leak_folium_map(
     show_valves: bool = True,
     highlight_sector: str | None = None,
     valve_statuses: dict[str, str] | None = None,
-    basemap: str = "CartoDB Positron",
+    basemap: str = "OpenStreetMap",
     fit_bounds: bool = True,
 ) -> folium.Map:
-    """Construct interactive Leaflet map with buffered convex-hull sector boundaries, pipes, valves, sensors, leaks & legend."""
+    """Construct interactive OpenStreetMap Leaflet map with buffered (~500m) sector boundaries, pipes, valves, sensors, leaks & collapsible legend."""
     if selected_leak:
         center = [float(selected_leak["latitude"]), float(selected_leak["longitude"])]
         zoom = max(int(REGION_CONFIG["map_zoom"]) + 2, 14)
@@ -191,12 +203,9 @@ def build_leak_folium_map(
         center = list(REGION_CONFIG["map_center"])
         zoom = int(REGION_CONFIG["map_zoom"])
 
-    if basemap == "OpenStreetMap":
-        tiles = REGION_CONFIG["osm_tiles"]
-        attr = REGION_CONFIG["osm_attribution"]
-    else:
-        tiles = REGION_CONFIG["positron_tiles"]
-        attr = REGION_CONFIG["positron_attribution"]
+    # Always use standard OpenStreetMap tiles (CARTO removed completely)
+    tiles = REGION_CONFIG["osm_tiles"]
+    attr = REGION_CONFIG["osm_attribution"]
 
     fmap = folium.Map(
         location=center,
@@ -206,20 +215,29 @@ def build_leak_folium_map(
         control_scale=True,
     )
 
-    boundaries = compute_sector_boundaries(segments, buffer_meters=300.0)
+    boundaries = compute_sector_boundaries(segments, buffer_meters=500.0)
     hl_norm = highlight_sector.strip().lower() if highlight_sector else None
 
-    # 1. Sector Boundaries Layer (buffered convex hull per sector + centre label)
+    # 1. Sector Boundaries Layer (500 m buffered convex hull per sector + clean non-overlapping text labels)
     if show_boundaries and boundaries:
         boundary_group = folium.FeatureGroup(name="Sector Boundaries")
-        for sec, binfo in boundaries.items():
+        # Order so highlighted sector gets label placement priority if any centroids are close
+        ordered_secs = list(boundaries.keys())
+        if hl_norm is not None:
+            ordered_secs.sort(key=lambda s: 0 if s.lower() == hl_norm else 1)
+
+        placed_label_centroids: list[list[float]] = []
+        min_label_sep_m = 1600.0
+
+        for sec in ordered_secs:
+            binfo = boundaries[sec]
             color = SECTOR_COLORS.get(sec, "#2563EB")
             color_name = SECTOR_COLOR_NAMES.get(sec, "blue")
             is_hl = hl_norm is not None and sec.lower() == hl_norm
             is_dim = hl_norm is not None and sec.lower() != hl_norm
 
             weight = 4.5 if is_hl else (1.5 if is_dim else 3.0)
-            opacity = 0.95 if is_hl else (0.35 if is_dim else 0.88)
+            opacity = 0.95 if is_hl else (0.30 if is_dim else 0.90)
             fill_opacity = 0.22 if is_hl else (0.04 if is_dim else 0.12)
 
             folium.Polygon(
@@ -233,22 +251,28 @@ def build_leak_folium_map(
                 tooltip=f"{sec} ({color_name} boundary)",
             ).add_to(boundary_group)
 
-            # Label at sector centroid
-            label_opacity = "0.45" if is_dim else "1.0"
-            folium.Marker(
-                location=binfo["centroid"],
-                icon=folium.DivIcon(
-                    html=(
-                        f'<div style="opacity:{label_opacity}; white-space:nowrap; '
-                        f'background:rgba(15,23,42,0.85); color:#FFFFFF; '
-                        f'border:2px solid {color}; border-radius:999px; '
-                        f'padding:2px 8px; font-size:11px; font-weight:700; '
-                        f'transform:translate(-50%,-50%); box-shadow:0 1px 4px rgba(0,0,0,0.35);">'
-                        f'{html.escape(sec)}</div>'
+            # Clean transparent text label at centroid only if it won't overlap another placed label
+            centroid = binfo["centroid"]
+            overlaps = any(_centroid_distance_m(centroid, prev) < min_label_sep_m for prev in placed_label_centroids)
+            if not overlaps:
+                placed_label_centroids.append(centroid)
+                label_opacity = "0.40" if is_dim else "1.0"
+                folium.Marker(
+                    location=centroid,
+                    icon=folium.DivIcon(
+                        html=(
+                            f'<div style="opacity:{label_opacity}; white-space:nowrap; '
+                            f'background:transparent; border:none; color:{color}; '
+                            f'font-family:system-ui,-apple-system,sans-serif; '
+                            f'font-size:11px; font-weight:700; letter-spacing:0.2px; '
+                            f'text-shadow:-1px -1px 0 rgba(255,255,255,0.92),1px -1px 0 rgba(255,255,255,0.92),'
+                            f'-1px 1px 0 rgba(255,255,255,0.92),1px 1px 0 rgba(255,255,255,0.92),0 0 3px #fff; '
+                            f'transform:translate(-50%,-50%); pointer-events:none;">'
+                            f'{html.escape(sec)}</div>'
+                        ),
+                        icon_size=(0, 0),
                     ),
-                    icon_size=(0, 0),
-                ),
-            ).add_to(boundary_group)
+                ).add_to(boundary_group)
         boundary_group.add_to(fmap)
 
     # 2. Pipe Network Layer
@@ -373,14 +397,18 @@ def build_leak_folium_map(
     fmap.get_root().add_child(legend)
     folium.LayerControl(collapsed=True).add_to(fmap)
 
-    # 7. Fit map bounds cleanly to highlighted sector or full network
-    if fit_bounds and boundaries:
-        if hl_norm is not None:
+    # 7. Always fit map bounds with padding to what is shown (selected sector, leak, or all 6 sectors)
+    if fit_bounds:
+        if hl_norm is not None and boundaries:
             for sec, binfo in boundaries.items():
                 if sec.lower() == hl_norm:
                     fmap.fit_bounds(binfo["bounds"], padding=(25, 25))
                     break
-        elif selected_leak is None:
+        elif selected_leak is not None:
+            lat = float(selected_leak["latitude"])
+            lon = float(selected_leak["longitude"])
+            fmap.fit_bounds([[lat - 0.008, lon - 0.010], [lat + 0.008, lon + 0.010]], padding=(25, 25))
+        elif boundaries:
             all_lats = [b["bounds"][0][0] for b in boundaries.values()] + [b["bounds"][1][0] for b in boundaries.values()]
             all_lons = [b["bounds"][0][1] for b in boundaries.values()] + [b["bounds"][1][1] for b in boundaries.values()]
             if all_lats and all_lons:

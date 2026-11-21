@@ -757,7 +757,7 @@ def _convex_hull_2d(points: list[tuple[float, float]]) -> list[tuple[float, floa
 
 def _buffer_convex_hull_xy(
     hull: list[tuple[float, float]],
-    buffer_m: float = 300.0,
+    buffer_m: float = 500.0,
     arc_steps: int = 6,
 ) -> list[tuple[float, float]]:
     """Expand a CCW 2D convex hull outward by buffer_m meters (Minkowski sum with a disk)."""
@@ -821,10 +821,10 @@ def point_in_polygon(lat: float, lon: float, polygon: Sequence[Sequence[float]])
 
 def compute_sector_boundaries(
     segments: Sequence[dict] | None = None,
-    buffer_meters: float = 300.0,
+    buffer_meters: float = 500.0,
 ) -> dict[str, dict]:
     """
-    Compute a buffered convex-hull boundary polygon (~300 m buffer) for each of Sectors 1-6
+    Compute a buffered convex-hull boundary polygon (~500 m buffer) for each of Sectors 1-6
     from that sector's own pipes, valves, sensors, and junctions.
     """
     import json

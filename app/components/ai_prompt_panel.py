@@ -1,31 +1,98 @@
-"""Ask AquaGrid — Full-width multi-turn AI Chat Assistant with inline visual widgets & 'How I got this'."""
+"""Ask AquaGrid — Full-width multi-turn AI Chat Assistant with live Thinking status, streaming, inline widgets & 'How I got this'."""
 import html
+import logging
+import re
+import time
 import streamlit as st
 
-from agent.chat_assistant import EXAMPLE_QUESTIONS, run_chat_turn
+from agent.chat_assistant import EXAMPLE_QUESTIONS, run_chat_turn, run_scenario_for_chat
+from agent.llm_factory import provider_supports_streaming
 from config.constants import DEFAULT_SCADA_HOUR
 from config.settings import settings
 from simulator import get_simulator, simulator_step_lock
 from components.badges import status_badge
 from components.chat_widgets import render_chat_widget
 
+logger = logging.getLogger("aquagrid.ui.chat")
 
-def _handle_user_prompt(prompt_text: str, display_hour: int) -> None:
-    """Append operator message, run multi-turn chat assistant through live tools & guards, append reply."""
-    messages = st.session_state.setdefault("ask_aquagrid_messages", [])
-    prior_history = [{"role": m["role"], "content": m.get("content", "")} for m in messages if m.get("role") in ("user", "assistant")]
 
-    messages.append({"role": "user", "content": prompt_text})
+def is_chat_generating(session_state: dict) -> bool:
+    """Return True while an answer or scenario is currently being generated."""
+    return bool(session_state.get("_chat_generating", False))
 
-    sim = get_simulator()
-    with simulator_step_lock(sim):
-        reply = run_chat_turn(
-            user_message=prompt_text,
-            history=prior_history,
-            current_hour=display_hour,
-        )
 
-    # Sync scenario session state if the user typed "Run scenario X"
+def queue_chat_request(session_state: dict, prompt_text: str, display_hour: int = DEFAULT_SCADA_HOUR) -> bool:
+    """
+    Append the operator's message to conversation history BEFORE calling the LLM and mark generation active.
+    Returns False (ignoring double submit) if a reply is already being generated.
+    """
+    cleaned = (prompt_text or "").strip()
+    if not cleaned:
+        return False
+    if session_state.get("_chat_generating", False):
+        session_state["_chat_busy_notice"] = "Please wait for the current answer"
+        return False
+
+    messages = session_state.setdefault("ask_aquagrid_messages", [])
+    prior_history = [
+        {"role": m["role"], "content": m.get("content", "")}
+        for m in messages
+        if m.get("role") in ("user", "assistant")
+    ]
+    # Append user message BEFORE the LLM call
+    messages.append({"role": "user", "content": cleaned})
+    session_state["_chat_generating"] = True
+    session_state["_pending_chat_request"] = {
+        "kind": "chat",
+        "text": cleaned,
+        "display_hour": display_hour,
+        "prior_history": prior_history,
+    }
+    session_state.pop("_chat_busy_notice", None)
+    return True
+
+
+def queue_scenario_request(
+    session_state: dict,
+    scenario_id: str,
+    title: str,
+    display_hour: int = DEFAULT_SCADA_HOUR,
+) -> bool:
+    """
+    Append a scenario run user message BEFORE executing the scenario and mark generation active.
+    Returns False (ignoring double submit) if a reply is already being generated.
+    """
+    if session_state.get("_chat_generating", False):
+        session_state["_chat_busy_notice"] = "Please wait for the current answer"
+        return False
+
+    messages = session_state.setdefault("ask_aquagrid_messages", [])
+    messages.append({"role": "user", "content": f"Run {scenario_id}: {title}"})
+    session_state["_chat_generating"] = True
+    session_state["_pending_chat_request"] = {
+        "kind": "scenario",
+        "scenario_id": scenario_id,
+        "title": title,
+        "display_hour": display_hour,
+    }
+    session_state.pop("_chat_busy_notice", None)
+    return True
+
+
+def word_stream_generator(text: str, max_total_seconds: float = 0.6):
+    """Yield text word-by-word (preserving markdown spacing/newlines) for st.write_stream."""
+    if not text:
+        return
+    tokens = re.findall(r"\S+\s*|\n+", str(text))
+    delay = min(0.015, max_total_seconds / max(1, len(tokens))) if max_total_seconds > 0 else 0.0
+    for tok in tokens:
+        yield tok
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _sync_scenario_state(reply: dict) -> None:
+    """Sync scenario metadata into st.session_state when a scenario completes."""
     meta = reply.get("scenario_meta")
     if meta:
         st.session_state["active_scenario"] = meta.get("scenario_num")
@@ -36,7 +103,27 @@ def _handle_user_prompt(prompt_text: str, display_hour: int) -> None:
         st.session_state["last_bypass_result"] = meta.get("bypass_result")
         st.session_state["last_pre_approved_refusal"] = meta.get("pre_approved_refusal")
 
-    messages.append(reply)
+
+def _handle_user_prompt(prompt_text: str, display_hour: int) -> bool:
+    """Backward-compatible helper: queue user prompt (before LLM), run chat turn, append reply. Ignores double submits."""
+    if not queue_chat_request(st.session_state, prompt_text, display_hour):
+        return False
+    pending = st.session_state.get("_pending_chat_request")
+    try:
+        sim = get_simulator()
+        with simulator_step_lock(sim):
+            reply = run_chat_turn(
+                user_message=pending["text"],
+                history=pending.get("prior_history") or [],
+                current_hour=display_hour,
+            )
+    finally:
+        st.session_state["_pending_chat_request"] = None
+        st.session_state["_chat_generating"] = False
+
+    _sync_scenario_state(reply)
+    st.session_state.setdefault("ask_aquagrid_messages", []).append(reply)
+    return True
 
 
 def build_how_i_got_this_summary(msg: dict) -> dict:
@@ -82,13 +169,180 @@ def build_how_i_got_this_summary(msg: dict) -> dict:
     }
 
 
-def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: dict | None = None) -> None:
-    """Render full-width Ask AquaGrid chat interface with inline maps, charts, tables, and approval cards."""
+def _render_assistant_message_contents(
+    msg: dict,
+    msg_idx: int,
+    snapshot: dict,
+    show_tech: bool,
+    stream_text: bool = False,
+) -> None:
+    """Render an assistant message's text (streamed when supported), inline widgets, provider line, and 'How I got this'."""
+    kind = msg.get("kind", "text")
+    content = msg.get("content", "")
+    provider = msg.get("provider", "System")
+
+    if kind == "alert":
+        alert_code = msg.get("alert_code", "ALERT")
+        alert_title = msg.get("alert_title") or "ALERT"
+        raw_body = msg.get("alert_body") or content
+        clean_body = str(raw_body).replace("**", "").replace("`", "")
+        st.markdown(
+            f'<div class="scada-card-alert">'
+            f'{status_badge(alert_code)} '
+            f'<strong>{html.escape(str(alert_title))}:</strong> '
+            f'{html.escape(clean_body)}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif stream_text and kind == "text" and provider_supports_streaming(str(provider)) and hasattr(st, "write_stream"):
+        st.write_stream(word_stream_generator(content))
+    else:
+        st.markdown(content)
+
+    # Render any inline visual components attached to this message
+    for w_idx, widget in enumerate(msg.get("widgets") or []):
+        render_chat_widget(widget, widget_key=f"m{msg_idx}_w{w_idx}", snapshot=snapshot)
+
+    st.markdown(
+        f'<div style="font-size:0.75rem; color:#64748B; margin-top:0.25rem;">Provider: {html.escape(str(provider))}</div>',
+        unsafe_allow_html=True,
+    )
+
+    hgt = build_how_i_got_this_summary(msg)
+    tool_bullets = hgt["tool_bullets"]
+    fallback_notes = hgt["fallback_notes"]
+    code_checks = msg.get("code_checks") or []
+    staged = msg.get("staged_action")
+    providers_tried = msg.get("providers_tried") or []
+    error_detail = msg.get("error_detail") or ""
+
+    if tool_bullets or code_checks or staged or error_detail or fallback_notes or show_tech:
+        with st.expander("How I got this", expanded=show_tech):
+            if tool_bullets:
+                st.markdown("**Tools called:**\n" + "\n".join(tool_bullets))
+            if code_checks:
+                checks_lines = []
+                for chk in code_checks:
+                    st_tag = chk.get("status", "PASS")
+                    badge = status_badge("VALID" if st_tag == "PASS" else "BLOCKED").replace("VALID", "PASS")
+                    code_val = str(chk.get("code") or "").strip()
+                    code_html = f' <span class="ag-mono">({html.escape(code_val)})</span>' if code_val else ""
+                    checks_lines.append(
+                        f'<div style="margin:0.2rem 0;">{badge} '
+                        f'<strong>{html.escape(str(chk.get("check", "")))}</strong>{code_html}: '
+                        f'{html.escape(str(chk.get("detail", "")))}</div>'
+                    )
+                st.markdown("**Code checks:**", unsafe_allow_html=False)
+                st.markdown("".join(checks_lines), unsafe_allow_html=True)
+            if staged:
+                st.markdown(
+                    f"**Gateway result:** `{staged.get('status')}` — "
+                    f"{staged.get('action_type', '')} {staged.get('target_id', '')} "
+                    f"({staged.get('reason') or staged.get('details') or staged.get('message') or ''})"
+                )
+            if fallback_notes:
+                st.markdown("**Model fallback:**\n" + "\n".join(fallback_notes))
+            if show_tech and error_detail:
+                st.error(f"**Technical Error:** `{error_detail}`")
+            if show_tech and providers_tried:
+                all_pt = [
+                    f"- `{pt.get('provider')}`: `{pt.get('status')}`" + (f" — {pt['error']}" if pt.get("error") else "")
+                    for pt in providers_tried
+                    if isinstance(pt, dict) and pt.get("provider")
+                ]
+                if all_pt:
+                    st.markdown("**All providers tried:**\n" + "\n".join(all_pt))
+            st.caption(f"Answered by: {provider} · LLM_MODE: {settings.LLM_MODE}")
+
+
+def _execute_pending_request(pending: dict, snapshot: dict, show_tech: bool) -> bool:
+    """Run a queued chat or scenario request inside an assistant message with live st.status('Thinking...') feedback."""
+    steps_logged: list[str] = []
+
+    with st.chat_message("assistant"):
+        with st.status("Thinking...", expanded=True) as status_box:
+            def _on_status(step_msg: str) -> None:
+                if step_msg:
+                    steps_logged.append(step_msg)
+                    status_box.write(step_msg)
+                    status_box.update(label=step_msg, state="running")
+
+            try:
+                sim = get_simulator()
+                if pending.get("kind") == "scenario":
+                    sc_id = pending["scenario_id"]
+                    if sc_id != "U-5.5" and sim is not None and hasattr(sim, "resume_feed"):
+                        sim.resume_feed()
+                    with simulator_step_lock(sim):
+                        reply = run_scenario_for_chat(
+                            sc_id,
+                            current_hour=pending.get("display_hour", DEFAULT_SCADA_HOUR),
+                            status_callback=_on_status,
+                        )
+                else:
+                    with simulator_step_lock(sim):
+                        reply = run_chat_turn(
+                            user_message=pending["text"],
+                            history=pending.get("prior_history") or [],
+                            current_hour=pending.get("display_hour", DEFAULT_SCADA_HOUR),
+                            status_callback=_on_status,
+                        )
+                status_box.update(label="Done", state="complete", expanded=False)
+            except Exception as exc:
+                logger.exception("Live chat request failed unexpectedly")
+                status_box.update(label="Done", state="error", expanded=False)
+                reply = {
+                    "role": "assistant",
+                    "kind": "error",
+                    "content": f"Sorry, an unexpected error occurred ({type(exc).__name__}). All safety guards remain active.",
+                    "provider": "Error Handler",
+                    "tools_called": [],
+                    "code_checks": [],
+                    "widgets": [],
+                    "staged_action": None,
+                    "error_detail": f"{type(exc).__name__}: {exc}",
+                }
+            finally:
+                st.session_state["_pending_chat_request"] = None
+                st.session_state["_chat_generating"] = False
+
+        reply["thinking_steps"] = steps_logged
+        _sync_scenario_state(reply)
+
+        messages = st.session_state.setdefault("ask_aquagrid_messages", [])
+        new_msg_idx = len(messages)
+        messages.append(reply)
+
+        _render_assistant_message_contents(
+            msg=reply,
+            msg_idx=new_msg_idx,
+            snapshot=snapshot,
+            show_tech=show_tech,
+            stream_text=True,
+        )
+
+    return True
+
+
+def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: dict | None = None) -> bool:
+    """
+    Render full-width Ask AquaGrid chat interface with immediate user messages, live Thinking status,
+    word-by-word streaming, inline maps/charts/tables, and button-only approvals.
+    Returns True if a new chat/scenario turn was executed during this render pass.
+    """
     snapshot = snapshot or {}
     show_tech = bool(st.session_state.get("show_tech_details", False))
     messages = st.session_state.setdefault("ask_aquagrid_messages", [])
+    executed_turn = False
 
-    # Welcome prompt & quick-ask buttons when conversation is empty
+    # Surface busy notice if operator clicked while another reply was still generating
+    busy_notice = st.session_state.pop("_chat_busy_notice", None)
+    if busy_notice:
+        st.warning(busy_notice)
+    elif is_chat_generating(st.session_state) and not st.session_state.get("_pending_chat_request"):
+        st.warning("Please wait for the current answer")
+
+    # Welcome prompt when conversation is empty
     if not messages:
         st.markdown(
             """
@@ -103,94 +357,40 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
             unsafe_allow_html=True,
         )
 
-    # Compact example question buttons
+    # Compact example question buttons (ignored when an answer is already generating)
     ex_cols = st.columns(len(EXAMPLE_QUESTIONS))
     for idx, q_text in enumerate(EXAMPLE_QUESTIONS):
         with ex_cols[idx]:
             if st.button(q_text, key=f"btn_example_q_{idx}", width="stretch"):
-                _handle_user_prompt(q_text, display_hour)
-                st.rerun()
+                if not queue_chat_request(st.session_state, q_text, display_hour):
+                    st.warning("Please wait for the current answer")
 
-    # Render conversation history
+    # Render full conversation history (includes any newly queued user message BEFORE calling the LLM!)
     for msg_idx, msg in enumerate(messages):
         role = msg.get("role", "assistant")
         kind = msg.get("kind", "text")
         avatar = "🚨" if kind == "alert" else None
 
         with st.chat_message(role, avatar=avatar):
-            if kind == "alert":
-                alert_code = msg.get("alert_code", "ALERT")
-                alert_title = msg.get("alert_title") or "ALERT"
-                raw_body = msg.get("alert_body") or msg.get("content", "")
-                # Strip any stray markdown asterisks/backticks so raw syntax never appears in HTML alert cards
-                clean_body = str(raw_body).replace("**", "").replace("`", "")
-                st.markdown(
-                    f'<div class="scada-card-alert">'
-                    f'{status_badge(alert_code)} '
-                    f'<strong>{html.escape(str(alert_title))}:</strong> '
-                    f'{html.escape(clean_body)}'
-                    f'</div>',
-                    unsafe_allow_html=True,
+            if role == "assistant":
+                _render_assistant_message_contents(
+                    msg=msg,
+                    msg_idx=msg_idx,
+                    snapshot=snapshot,
+                    show_tech=show_tech,
+                    stream_text=False,
                 )
             else:
                 st.markdown(msg.get("content", ""))
 
-            # Render any inline visual components attached to this message
-            for w_idx, widget in enumerate(msg.get("widgets") or []):
-                render_chat_widget(widget, widget_key=f"m{msg_idx}_w{w_idx}", snapshot=snapshot)
+    # Container right below conversation history for the active turn (live user bubble + live Thinking assistant)
+    live_turn_container = st.container()
 
-            if role == "assistant":
-                provider = msg.get("provider", "System")
-                st.markdown(
-                    f'<div style="font-size:0.75rem; color:#64748B; margin-top:0.25rem;">Provider: {html.escape(str(provider))}</div>',
-                    unsafe_allow_html=True,
-                )
-
-                hgt = build_how_i_got_this_summary(msg)
-                tool_bullets = hgt["tool_bullets"]
-                fallback_notes = hgt["fallback_notes"]
-                code_checks = msg.get("code_checks") or []
-                staged = msg.get("staged_action")
-                providers_tried = msg.get("providers_tried") or []
-                error_detail = msg.get("error_detail") or ""
-
-                if tool_bullets or code_checks or staged or error_detail or fallback_notes or show_tech:
-                    with st.expander("How I got this", expanded=show_tech):
-                        if tool_bullets:
-                            st.markdown("**Tools called:**\n" + "\n".join(tool_bullets))
-                        if code_checks:
-                            checks_lines = []
-                            for chk in code_checks:
-                                st_tag = chk.get("status", "PASS")
-                                badge = status_badge("VALID" if st_tag == "PASS" else "BLOCKED").replace("VALID", "PASS")
-                                code_val = str(chk.get("code") or "").strip()
-                                code_html = f' <span class="ag-mono">({html.escape(code_val)})</span>' if code_val else ""
-                                checks_lines.append(
-                                    f'<div style="margin:0.2rem 0;">{badge} '
-                                    f'<strong>{html.escape(str(chk.get("check", "")))}</strong>{code_html}: '
-                                    f'{html.escape(str(chk.get("detail", "")))}</div>'
-                                )
-                            st.markdown("**Code checks:**", unsafe_allow_html=False)
-                            st.markdown("".join(checks_lines), unsafe_allow_html=True)
-                        if staged:
-                            st.markdown(
-                                f"**Gateway result:** `{staged.get('status')}` — "
-                                f"{staged.get('action_type', '')} {staged.get('target_id', '')} "
-                                f"({staged.get('reason') or staged.get('details') or staged.get('message') or ''})"
-                            )
-                        if fallback_notes:
-                            st.markdown("**Model fallback:**\n" + "\n".join(fallback_notes))
-                        if show_tech and error_detail:
-                            st.error(f"**Technical Error:** `{error_detail}`")
-                        if show_tech and providers_tried:
-                            all_pt = [
-                                f"- `{pt.get('provider')}`: `{pt.get('status')}`" + (f" — {pt['error']}" if pt.get("error") else "")
-                                for pt in providers_tried
-                                if isinstance(pt, dict) and pt.get("provider")
-                            ]
-                            if all_pt:
-                                st.markdown("**All providers tried:**\n" + "\n".join(all_pt))
-                        st.caption(f"Answered by: {provider} · LLM_MODE: {settings.LLM_MODE}")
+    # If a sidebar Scenario Run or quick-question button queued a pending request, run it now with live status!
+    pending_top = st.session_state.get("_pending_chat_request")
+    if pending_top:
+        with live_turn_container:
+            executed_turn = _execute_pending_request(pending_top, snapshot, show_tech)
 
     # Chat input bar at bottom
     user_typed = st.chat_input(
@@ -198,8 +398,22 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
         key="ask_aquagrid_chat_input",
     )
     if user_typed and user_typed.strip():
-        _handle_user_prompt(user_typed.strip(), display_hour)
-        st.rerun()
+        cleaned_typed = user_typed.strip()
+        if queue_chat_request(st.session_state, cleaned_typed, display_hour):
+            with live_turn_container:
+                # Immediately show user message BEFORE calling the LLM
+                with st.chat_message("user"):
+                    st.markdown(cleaned_typed)
+                executed_turn = _execute_pending_request(
+                    st.session_state["_pending_chat_request"],
+                    snapshot,
+                    show_tech,
+                )
+        else:
+            with live_turn_container:
+                st.warning("Please wait for the current answer")
+
+    return executed_turn
 
 
 # Backward-compatible alias

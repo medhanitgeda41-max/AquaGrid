@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import traceback
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("aquagrid.chat")
 
@@ -50,7 +50,7 @@ STRICT RULES:
 4. Answer ANY operator question clearly and concisely: plant status, leaks, quarantined sensors, reservoir & dynamic emergency floor, electricity tariffs, hourly production plans, past actions in the Audit Log, why a plan was rejected, what any technical status code means, and next steps.
 5. Use prior conversation messages naturally for follow-up questions (e.g. "Why?", "What about Sector 2?", "And if demand rises?").
 6. Use DISPLAY TOOLS to render helpful visuals inside your reply whenever relevant:
-   - show_map(sector, leak_id, show_boundaries): sector="all" for all 6 sectors, "Sector N" to highlight/zoom one sector, or leak_id like "LEAK-001"; show_boundaries defaults to true.
+   - show_map(sector, leak_id, show_boundaries): sector="all" for all 6 sectors, "Sector N" to highlight/zoom one sector, or leak_id like "LEAK-001"; show_boundaries defaults to true. If the operator asks to "show the sectors" or "show the map" without naming a sector, call show_map(sector="all", show_boundaries=true) directly instead of asking which sector.
    - show_chart(metric, asset, hours): metric in ["pressure", "flow", "reservoir", "tariff"].
    - show_table(what): what in ["leaks", "sensors", "schedule", "audit", "valves"].
    - show_schedule_validation(plan): validating a production schedule.
@@ -259,6 +259,51 @@ _BOUNDARY_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ASKING_WHICH_SECTOR_RE = re.compile(
+    r"\b(?:which\s+sector|specify\s+(?:a\s+)?sector|please\s+tell\s+me\s+which\s+sector)\b",
+    re.IGNORECASE,
+)
+
+
+def _emit_status(status_callback: Optional[Callable[[str], None]], message: str) -> None:
+    """Safely send a live progress step to the UI status widget."""
+    if callable(status_callback):
+        try:
+            status_callback(message)
+        except Exception:
+            pass
+
+
+def _accepted_chat_optional_kwargs(fn: Any) -> tuple[bool, bool]:
+    """Inspect fn (or its mock side_effect) to check whether fallback_context_builder and status_callback are accepted."""
+    target = getattr(fn, "side_effect", None)
+    check_fn = target if callable(target) else fn
+    try:
+        params = inspect.signature(check_fn).parameters
+    except (TypeError, ValueError):
+        return False, False
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return (
+        ("fallback_context_builder" in params or has_var_kw),
+        ("status_callback" in params or has_var_kw),
+    )
+
+
+def _is_map_request(text: str) -> bool:
+    """Return True when the operator asks to show the map or sectors (including 'show the sectors' without naming one)."""
+    lower = (text or "").strip().lower()
+    if not lower:
+        return False
+    if "map" in lower:
+        return True
+    if "where" in lower and "leak" in lower:
+        return True
+    if ("sectors" in lower or "all sector" in lower) and any(
+        k in lower for k in ("show", "display", "draw", "view", "border", "boundar", "outline", "see")
+    ):
+        return True
+    return False
+
 
 def build_map_render_summary(
     sector: str = "all",
@@ -299,7 +344,7 @@ def build_map_render_summary(
     tel = read_network_telemetry(current_hour=DEFAULT_SCADA_HOUR, db_path=db_path, log_audit=False)
     quarantined = tel.get("quarantined_sensors") or []
 
-    boundaries = compute_sector_boundaries(segs, buffer_meters=300.0)
+    boundaries = compute_sector_boundaries(segs, buffer_meters=500.0)
     boundaries_drawn = len(boundaries) if show_boundaries else 0
 
     layers_drawn: list[str] = []
@@ -361,14 +406,14 @@ def build_map_render_summary(
             f"Map zoomed to **{highlight_sector}** with {b_phrase}, "
             f"{info.get('pipes', 0)} pipe(s), {info.get('valves', 0)} valve(s), "
             f"{info.get('sensors', 0)} sensor(s), and {info.get('leaks', 0)} active leak(s) "
-            f"(layers: {', '.join(layers_drawn)}; basemap: CartoDB Positron)."
+            f"(layers: {', '.join(layers_drawn)}; basemap: OpenStreetMap)."
         )
     else:
         b_phrase = f"{boundaries_drawn} buffered sector boundary polygons ({colors_desc})" if show_boundaries else "no sector boundaries drawn"
         summary_text = (
             f"Map fitted to **{zoom_target}** showing {b_phrase}, "
             f"{len(segs)} pipes, {len(valves)} valves, sensors, and {len(matched_leaks)} tracked leak(s) "
-            f"(layers: {', '.join(layers_drawn)}; basemap: CartoDB Positron)."
+            f"(layers: {', '.join(layers_drawn)}; basemap: OpenStreetMap)."
         )
 
     return {
@@ -388,7 +433,7 @@ def build_map_render_summary(
         "leaks": matched_leaks[:5],
         "zoom_target": zoom_target,
         "zoom_bounds": zoom_bounds,
-        "basemap": "CartoDB Positron (light_all)",
+        "basemap": "OpenStreetMap",
         "summary_text": summary_text,
     }
 
@@ -615,6 +660,7 @@ def run_production_planner_for_chat(
     snapshot: dict,
     current_hour: int = DEFAULT_SCADA_HOUR,
     db_path: Optional[str] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
     Real N-hour production planner flow:
@@ -716,22 +762,18 @@ def run_production_planner_for_chat(
         ]
         try:
             chat_fn = active_llm_client.chat_with_tools
-            sig_params = inspect.signature(chat_fn).parameters
-            if "fallback_context_builder" in sig_params:
-                raw_reply, prov, _ = chat_fn(
-                    messages=planner_msgs,
-                    tools=[],
-                    tool_executor=lambda n, a: {},
-                    max_tool_steps=1,
-                    fallback_context_builder=lambda: _compact_snapshot_json(snapshot),
-                )
-            else:
-                raw_reply, prov, _ = chat_fn(
-                    messages=planner_msgs,
-                    tools=[],
-                    tool_executor=lambda n, a: {},
-                    max_tool_steps=1,
-                )
+            accepts_ctx, accepts_status = _accepted_chat_optional_kwargs(chat_fn)
+            call_kwargs: dict[str, Any] = {
+                "messages": planner_msgs,
+                "tools": [],
+                "tool_executor": lambda n, a: {},
+                "max_tool_steps": 1,
+            }
+            if accepts_ctx:
+                call_kwargs["fallback_context_builder"] = lambda: _compact_snapshot_json(snapshot)
+            if accepts_status:
+                call_kwargs["status_callback"] = status_callback
+            raw_reply, prov, _ = chat_fn(**call_kwargs)
             providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
             if raw_reply:
                 parsed = _parse_llm_hourly_plan(raw_reply, current_hour, horizon_hours)
@@ -752,6 +794,7 @@ def run_production_planner_for_chat(
             if provider_used == "Deterministic Offline Engine":
                 provider_used = "Deterministic Offline Engine"
 
+        _emit_status(status_callback, "Validating the plan hour by hour...")
         schedule_str = _format_hourly_blocks(current_hour, proposed_outputs)
         validation = validate_production_schedule(
             proposed_schedule=schedule_str,
@@ -827,6 +870,7 @@ def run_production_planner_for_chat(
     )
 
     # Stage first-hour SET_PLANT_OUTPUT through write gateway (suggest-only!)
+    _emit_status(status_callback, "Running safety checks...")
     first_mld = float(best_outputs[0])
     gw_resp = stage_gated_valve_or_setpoint_action(
         action_type="SET_PLANT_OUTPUT",
@@ -962,8 +1006,10 @@ def run_scenario_for_chat(
     scenario_key: str,
     current_hour: int = DEFAULT_SCADA_HOUR,
     db_path: Optional[str] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Execute a Round 1 or Round 2 scenario and return a rich chat message dict with result card & widgets."""
+    _emit_status(status_callback, "Checking your request (injection filter)...")
     entry = get_scenario_by_id(scenario_key)
     if not entry or not entry.get("enabled") or not callable(entry.get("injector")):
         return {
@@ -977,11 +1023,13 @@ def run_scenario_for_chat(
             "staged_action": None,
         }
 
+    _emit_status(status_callback, "Reading live plant data...")
     reset_database(db_path)
     info = entry["injector"](db_path) if db_path else entry["injector"]()
 
     scenario_num = entry.get("scenario_num")
     agent_scenario_id = scenario_num if scenario_num is not None else entry["id"]
+    _emit_status(status_callback, "Running safety checks...")
     result = run_agent(scenario_id=agent_scenario_id, current_hour=current_hour)
 
     bypass_result = None
@@ -1015,8 +1063,10 @@ def run_scenario_for_chat(
 
     # Attach helpful contextual visuals right in the chat!
     if entry["id"] in ("R1-S1", "R1-S3"):
+        _emit_status(status_callback, "Drawing the map...")
         widgets.append({"type": "map", "sector": "Sector 4", "leak_id": None})
     elif entry["id"] in ("R1-S2", "U-5.2"):
+        _emit_status(status_callback, "Validating the plan hour by hour...")
         widgets.append({"type": "chart", "metric": "reservoir", "asset": "RES-01", "hours": 24})
         if result.get("schedule_validation"):
             widgets.append(
@@ -1315,8 +1365,8 @@ def _offline_chat_fallback(
         loss_banner = (tel.get("telemetry_freshness") or {}).get("banner", "TELEMETRY LOSS")
         loss_suffix = f"\n\n*Note: `{loss_banner}` (`TELEMETRY_LOSS`) — new change proposals are blocked until the feed is restored.*"
 
-    # 3. Map display requests ("Show Sector 4 on the map", "Show all sectors with separate borders", "Where are the leaks?")
-    if "map" in lower or ("where" in lower and "leak" in lower) or ("all sectors" in lower and any(k in lower for k in ("show", "border", "boundar", "display"))):
+    # 3. Map display requests ("Show Sector 4 on the map", "show the sectors", "show the map", "Where are the leaks?")
+    if _is_map_request(text):
         m_sec = re.search(r"sector\s*([1-6])", text, re.IGNORECASE)
         sec_arg = f"Sector {m_sec.group(1)}" if m_sec else "all"
         m_lid = re.search(r"(LEAK-\d+)", text, re.IGNORECASE)
@@ -1471,10 +1521,11 @@ def run_chat_turn(
     history: Optional[list[dict]] = None,
     current_hour: int = DEFAULT_SCADA_HOUR,
     db_path: Optional[str] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
     Process one operator chat message with injection filtering, multi-turn history, live read & display tools,
-    and stage-gated write proposals.
+    and stage-gated write proposals. Emits live progress updates via status_callback.
     """
     cleaned = (user_message or "").strip()
     prior = list(history or [])
@@ -1494,6 +1545,7 @@ def run_chat_turn(
     _audit("CHAT_QUESTION", "ASK_AQUAGRID", "ALLOWED", f"Operator asked: {cleaned[:300]}", actor="HUMAN_OPERATOR", db_path=db_path)
 
     # ── SAFETY 1: Prompt Injection Filter ─────────────────────────────────────
+    _emit_status(status_callback, "Checking your request (injection filter)...")
     is_inj, patterns = detect_injection(cleaned)
     if is_inj:
         _audit(
@@ -1598,9 +1650,10 @@ def run_chat_turn(
     # ── SCENARIO COMMAND: "Run scenario 2" / "Run U-5.1" ──────────────────────
     sc_id = parse_scenario_command(cleaned)
     if sc_id:
-        return run_scenario_for_chat(sc_id, current_hour=current_hour, db_path=db_path)
+        return run_scenario_for_chat(sc_id, current_hour=current_hour, db_path=db_path, status_callback=status_callback)
 
     # ── ALWAYS PRE-FETCH LIVE SCADA SNAPSHOT BEFORE CALLING THE LLM ───────────
+    _emit_status(status_callback, "Reading live plant data...")
     live_snapshot = build_live_scada_snapshot(current_hour=current_hour, db_path=db_path)
 
     # ── PRODUCTION PLANNER FLOW: "make a 5-hour plan", "plan next N hours", "plan for tomorrow"
@@ -1612,6 +1665,7 @@ def run_chat_turn(
             snapshot=live_snapshot,
             current_hour=current_hour,
             db_path=db_path,
+            status_callback=status_callback,
         )
 
     # ── LIVE TOOL EXECUTOR (read-only + display + single gated stage tool) ────
@@ -1692,6 +1746,7 @@ def run_chat_turn(
             out = {"count": len(entries), "entries": entries}
 
         elif tool_name == "show_map":
+            _emit_status(status_callback, "Drawing the map...")
             sector = str(args.get("sector") or "all").strip()
             leak_id = str(args.get("leak_id") or "").strip() or None
             show_b = bool(args.get("show_boundaries", True))
@@ -1756,6 +1811,7 @@ def run_chat_turn(
             out = {"displayed": True, "what": what, "row_count": cnt}
 
         elif tool_name == "show_schedule_validation":
+            _emit_status(status_callback, "Validating the plan hour by hour...")
             plan = str(args.get("plan") or "").strip()
             h = int(args.get("current_hour", current_hour))
             feeds_now = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=h, db_path=db_path, log_audit=False)
@@ -1790,6 +1846,7 @@ def run_chat_turn(
             out = {"displayed": True, "pending_count": len(snap["pending_actions"]), "pending_actions": snap["pending_actions"]}
 
         elif tool_name == "propose_gated_action":
+            _emit_status(status_callback, "Running safety checks...")
             a_type = str(args.get("action_type") or "").upper()
             target = str(args.get("target_id") or "").upper()
             try:
@@ -1892,35 +1949,25 @@ def run_chat_turn(
     providers_tried: list[dict] = []
     try:
         chat_fn = active_llm_client.chat_with_tools
-        try:
-            sig = inspect.signature(chat_fn)
-            accepts_ctx = "fallback_context_builder" in sig.parameters
-        except (TypeError, ValueError):
-            accepts_ctx = False
+        accepts_ctx, accepts_status = _accepted_chat_optional_kwargs(chat_fn)
 
+        chat_kwargs: dict[str, Any] = {
+            "messages": llm_messages,
+            "tools": CHAT_TOOLS_SCHEMA,
+            "tool_executor": _execute_tool,
+            "max_tool_steps": MAX_CHAT_TOOL_STEPS,
+        }
         if accepts_ctx:
-            answer_text, provider_used, _ = chat_fn(
-                messages=llm_messages,
-                tools=CHAT_TOOLS_SCHEMA,
-                tool_executor=_execute_tool,
-                max_tool_steps=MAX_CHAT_TOOL_STEPS,
-                fallback_context_builder=_build_live_fallback_context,
-            )
-        else:
-            answer_text, provider_used, _ = chat_fn(
-                messages=llm_messages,
-                tools=CHAT_TOOLS_SCHEMA,
-                tool_executor=_execute_tool,
-                max_tool_steps=MAX_CHAT_TOOL_STEPS,
-            )
+            chat_kwargs["fallback_context_builder"] = _build_live_fallback_context
+        if accepts_status:
+            chat_kwargs["status_callback"] = status_callback
+
+        answer_text, provider_used, _ = chat_fn(**chat_kwargs)
 
         providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
-        # If the user asked for a map and the LLM skipped calling show_map, invoke show_map so the map truly renders
+        # If the user asked for a map or "show the sectors" and the LLM skipped calling show_map, invoke show_map directly
         lower_q = cleaned.lower()
-        asked_for_map = (
-            "map" in lower_q
-            or ("all sectors" in lower_q and any(k in lower_q for k in ("show", "border", "boundar", "display")))
-        )
+        asked_for_map = _is_map_request(cleaned)
         if asked_for_map and not map_results_holder:
             m_sec = re.search(r"sector\s*([1-6])", cleaned, re.IGNORECASE)
             sec_arg = f"Sector {m_sec.group(1)}" if m_sec else "all"
@@ -1941,6 +1988,10 @@ def run_chat_turn(
             )
             if not provider_used or provider_used == "Deterministic Offline Engine":
                 provider_used = "Deterministic Offline Engine"
+
+        # If the operator asked to "show the sectors" / "show the map" and the LLM asked "which sector?", answer directly using the map summary
+        if map_results_holder and _ASKING_WHICH_SECTOR_RE.search(answer_text):
+            answer_text = map_results_holder[-1]["summary_text"]
 
         # Truthfulness check: if AI claims boundaries/borders were drawn when show_map did NOT draw them, replace with exact tool summary!
         if map_results_holder:

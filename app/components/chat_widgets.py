@@ -73,8 +73,8 @@ def render_inline_map(
     else:
         highlight_sector = norm_sector
 
-    # Compact layer + basemap toggles
-    t1, t2, t3, t4, t5, t6 = st.columns([1.3, 0.85, 0.95, 0.85, 0.85, 1.2])
+    # Compact layer toggles (OpenStreetMap is the only basemap)
+    t1, t2, t3, t4, t5 = st.columns([1.3, 0.9, 1.0, 0.9, 0.9])
     with t1:
         show_boundaries = st.checkbox("Boundaries", value=bool(show_boundaries_default), key=f"map_b_{widget_key}")
     with t2:
@@ -85,10 +85,6 @@ def render_inline_map(
         show_valves = st.checkbox("Valves", value=True, key=f"map_v_{widget_key}")
     with t5:
         show_leaks = st.checkbox("Leaks", value=True, key=f"map_l_{widget_key}")
-    with t6:
-        use_std_osm = st.checkbox("Standard OSM", value=False, key=f"map_osm_{widget_key}")
-
-    basemap = "OpenStreetMap" if use_std_osm else "CartoDB Positron"
 
     matched_leaks = [
         lk for lk in all_leaks
@@ -111,13 +107,12 @@ def render_inline_map(
         show_valves=show_valves,
         highlight_sector=highlight_sector,
         valve_statuses=valve_statuses,
-        basemap=basemap,
         fit_bounds=True,
     )
     st_folium(fmap, height=380, width=None, returned_objects=[], key=f"map_{widget_key}")
 
     scope_lbl = leak_id or highlight_sector or "All 6 Sectors (Dubai Network)"
-    st.caption(f"Map: {scope_lbl} · Basemap: {basemap} (© OpenStreetMap contributors{' © CARTO' if basemap != 'OpenStreetMap' else ''})")
+    st.caption(f"Map: {scope_lbl} · Basemap: OpenStreetMap (© OpenStreetMap contributors)")
 
     # Small summary table under the map when focused on a single sector
     if highlight_sector:

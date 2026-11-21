@@ -28,14 +28,18 @@ _ensure_module_attr("simulator", "simulator_step_lock")
 _ensure_module_attr("simulator", "STEP_LOCK")
 _ensure_module_attr("guards.telemetry_freshness", "refresh_baseline_timestamps")
 _lf_cached = sys.modules.get("agent.llm_factory")
-if _lf_cached is not None and not hasattr(getattr(_lf_cached, "llm_client", None), "chat_with_tools"):
+if _lf_cached is not None and (
+    not hasattr(getattr(_lf_cached, "llm_client", None), "chat_with_tools")
+    or not hasattr(_lf_cached, "provider_supports_streaming")
+):
     importlib.reload(_lf_cached)
 _ensure_module_attr("agent.chat_assistant", "collect_system_alerts")
 _ensure_module_attr("components.badges", "get_sim_step_lock")
 _ensure_module_attr("components.chat_widgets", "render_chat_widget")
 _ensure_module_attr("components.header", "render_header")
-_ensure_module_attr("components.sidebar", "render_sidebar")
+_ensure_module_attr("components.ai_prompt_panel", "queue_scenario_request")
 _ensure_module_attr("components.ai_prompt_panel", "render_ask_aquagrid_chat")
+_ensure_module_attr("components.sidebar", "render_sidebar")
 
 import streamlit as st
 from agent.chat_assistant import collect_system_alerts
@@ -86,8 +90,10 @@ def main() -> None:
     else:
         display_hour = DEFAULT_SCADA_HOUR
 
-    # 1. Thin always-visible 1-line status bar at top
-    snapshot = render_header(display_hour=display_hour)
+    # 1. Thin always-visible 1-line status bar at top (placeholder allows live refresh after a chat/scenario turn)
+    header_placeholder = st.empty()
+    with header_placeholder.container():
+        snapshot = render_header(display_hour=display_hour)
 
     # 2. Compact sidebar: Live Simulation, Scenarios (Round 1 & 2), Open Audit Log, Tech Details, Clear Chat
     render_sidebar()
@@ -106,7 +112,11 @@ def main() -> None:
         st.session_state.setdefault("ask_aquagrid_messages", []).extend(new_alert_msgs)
 
     # 4. Full-width "Ask AquaGrid" multi-turn chat with inline visual widgets & button-only approvals
-    render_ask_aquagrid_chat(display_hour=display_hour, snapshot=snapshot)
+    turn_ran = render_ask_aquagrid_chat(display_hour=display_hour, snapshot=snapshot)
+    if turn_ran:
+        # Refresh top status bar in place (preserving st.status('Done') & streamed output)
+        with header_placeholder.container():
+            render_header(display_hour=display_hour)
 
 
 if __name__ == "__main__":

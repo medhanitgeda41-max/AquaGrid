@@ -2,7 +2,8 @@
 import html
 import streamlit as st
 
-from agent.chat_assistant import collect_system_alerts, run_scenario_for_chat
+from agent.chat_assistant import collect_system_alerts
+from components.ai_prompt_panel import queue_scenario_request
 from config.constants import DEFAULT_SCADA_HOUR
 from config.region_config import REGION_CONFIG
 from database.scenarios import get_scenarios_by_round, reset_database
@@ -64,6 +65,8 @@ def _on_sidebar_reset() -> None:
     st.session_state["active_scenario_name"] = "Clean Baseline"
     st.session_state["last_agent_result"] = None
     st.session_state["_seen_alert_keys"] = set()
+    st.session_state["_chat_generating"] = False
+    st.session_state["_pending_chat_request"] = None
     st.session_state.setdefault("ask_aquagrid_messages", []).append(
         {
             "role": "assistant",
@@ -209,21 +212,5 @@ def _render_sidebar_scenario_row(entry: dict) -> None:
         )
     with c_btn:
         if st.button("Run", key=btn_key, type="primary" if is_active else "secondary", width="stretch"):
-            sim = get_simulator()
-            if sc_id != "U-5.5" and sim is not None and hasattr(sim, "resume_feed"):
-                sim.resume_feed()
-            with simulator_step_lock(sim):
-                msg = run_scenario_for_chat(sc_id, current_hour=DEFAULT_SCADA_HOUR)
-            meta = msg.get("scenario_meta") or {}
-            st.session_state["active_scenario"] = meta.get("scenario_num")
-            st.session_state["active_scenario_id"] = sc_id
-            st.session_state["active_scenario_name"] = meta.get("name", sc_id)
-            st.session_state["last_agent_result"] = meta.get("result")
-            st.session_state["last_scenario_info"] = meta.get("info")
-            st.session_state["last_bypass_result"] = meta.get("bypass_result")
-            st.session_state["last_pre_approved_refusal"] = meta.get("pre_approved_refusal")
-            st.session_state.setdefault("ask_aquagrid_messages", []).append(
-                {"role": "user", "content": f"Run {sc_id}: {entry['title']}"}
-            )
-            st.session_state["ask_aquagrid_messages"].append(msg)
-            st.rerun()
+            if not queue_scenario_request(st.session_state, sc_id, entry["title"], display_hour=DEFAULT_SCADA_HOUR):
+                st.warning("Please wait for the current answer")
