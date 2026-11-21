@@ -3,14 +3,21 @@ from datetime import datetime, timedelta, timezone
 import html
 import json
 import altair as alt
+from branca.element import MacroElement, Template
 import folium
 import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
-from config.region_config import LEAK_SEVERITY_COLORS, REGION_CONFIG, SECTOR_COLORS
+from config.region_config import LEAK_SEVERITY_COLORS, REGION_CONFIG, SECTOR_COLOR_NAMES, SECTOR_COLORS
 from database.connection import get_db_connection
-from database.dubai_network import JUNCTION_COORDINATES
+from database.dubai_network import (
+    JUNCTION_COORDINATES,
+    JUNCTION_SECTOR_MAP,
+    VALVE_COORDINATES,
+    VALVE_SECTOR_MAP,
+    compute_sector_boundaries,
+)
 from tools.write_gateway import (
     execute_human_approval,
     execute_human_rejection,
@@ -110,6 +117,55 @@ def _build_segment_history_charts(segment_id: str) -> tuple[alt.Chart | None, al
     return p_chart, f_chart
 
 
+def _build_map_legend_html() -> str:
+    """Build floating bottom-left Leaflet legend HTML listing Sectors 1-6 colors + symbols for sensors, valves, leaks."""
+    sec_items = "".join(
+        f'<div style="display:flex; align-items:center; gap:6px; margin:2px 0;">'
+        f'<span style="display:inline-block; width:13px; height:13px; border-radius:3px; '
+        f'background:{SECTOR_COLORS[s]}33; border:2px solid {SECTOR_COLORS[s]};"></span>'
+        f'<span><strong>{s}</strong> ({SECTOR_COLOR_NAMES[s]})</span></div>'
+        for s in ("Sector 1", "Sector 2", "Sector 3", "Sector 4", "Sector 5", "Sector 6")
+    )
+    return f"""
+    {{% macro html(this, kwargs) %}}
+    <div style="
+        position: fixed;
+        bottom: 18px;
+        left: 14px;
+        z-index: 9999;
+        background: rgba(17, 24, 39, 0.92);
+        color: #F8FAFC;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 8px 11px;
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 11px;
+        line-height: 1.35;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+    ">
+        <div style="font-weight:700; margin-bottom:4px; color:#E2E8F0; border-bottom:1px solid #334155; padding-bottom:2px;">
+            Sectors &amp; Assets
+        </div>
+        {sec_items}
+        <div style="margin-top:5px; padding-top:4px; border-top:1px solid #334155;">
+            <div style="display:flex; align-items:center; gap:6px; margin:2px 0;">
+                <span style="display:inline-block; width:9px; height:9px; border-radius:50%; background:#0EA5E9; border:1px solid #fff;"></span>
+                <span>Sensor (Active) · &#9888; Quarantined</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px; margin:2px 0;">
+                <span style="display:inline-block; width:9px; height:9px; background:#16A34A; border:1px solid #fff;"></span>
+                <span>Valve OPEN · <span style="color:#EF4444;">&#9632;</span> CLOSED</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px; margin:2px 0;">
+                <span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF4444; border:2px solid #FCA5A5;"></span>
+                <span>Active Leak &amp; Zone</span>
+            </div>
+        </div>
+    </div>
+    {{% endmacro %}}
+    """
+
+
 def build_leak_folium_map(
     segments: list[dict],
     leaks: list[dict],
@@ -120,8 +176,14 @@ def build_leak_folium_map(
     pipe_color_mode: str = "Sector",
     show_leaks: bool = True,
     show_sensors: bool = True,
+    show_boundaries: bool = True,
+    show_valves: bool = True,
+    highlight_sector: str | None = None,
+    valve_statuses: dict[str, str] | None = None,
+    basemap: str = "CartoDB Positron",
+    fit_bounds: bool = True,
 ) -> folium.Map:
-    """Construct the interactive Leaflet/OpenStreetMap Folium map centered on the configured region."""
+    """Construct interactive Leaflet map with buffered convex-hull sector boundaries, pipes, valves, sensors, leaks & legend."""
     if selected_leak:
         center = [float(selected_leak["latitude"]), float(selected_leak["longitude"])]
         zoom = max(int(REGION_CONFIG["map_zoom"]) + 2, 14)
@@ -129,25 +191,79 @@ def build_leak_folium_map(
         center = list(REGION_CONFIG["map_center"])
         zoom = int(REGION_CONFIG["map_zoom"])
 
+    if basemap == "OpenStreetMap":
+        tiles = REGION_CONFIG["osm_tiles"]
+        attr = REGION_CONFIG["osm_attribution"]
+    else:
+        tiles = REGION_CONFIG["positron_tiles"]
+        attr = REGION_CONFIG["positron_attribution"]
+
     fmap = folium.Map(
         location=center,
         zoom_start=zoom,
-        tiles=REGION_CONFIG["osm_tiles"],
-        attr=REGION_CONFIG["osm_attribution"],
+        tiles=tiles,
+        attr=attr,
         control_scale=True,
     )
 
+    boundaries = compute_sector_boundaries(segments, buffer_meters=300.0)
+    hl_norm = highlight_sector.strip().lower() if highlight_sector else None
+
+    # 1. Sector Boundaries Layer (buffered convex hull per sector + centre label)
+    if show_boundaries and boundaries:
+        boundary_group = folium.FeatureGroup(name="Sector Boundaries")
+        for sec, binfo in boundaries.items():
+            color = SECTOR_COLORS.get(sec, "#2563EB")
+            color_name = SECTOR_COLOR_NAMES.get(sec, "blue")
+            is_hl = hl_norm is not None and sec.lower() == hl_norm
+            is_dim = hl_norm is not None and sec.lower() != hl_norm
+
+            weight = 4.5 if is_hl else (1.5 if is_dim else 3.0)
+            opacity = 0.95 if is_hl else (0.35 if is_dim else 0.88)
+            fill_opacity = 0.22 if is_hl else (0.04 if is_dim else 0.12)
+
+            folium.Polygon(
+                locations=binfo["polygon"],
+                color=color,
+                weight=weight,
+                opacity=opacity,
+                fill=True,
+                fill_color=color,
+                fill_opacity=fill_opacity,
+                tooltip=f"{sec} ({color_name} boundary)",
+            ).add_to(boundary_group)
+
+            # Label at sector centroid
+            label_opacity = "0.45" if is_dim else "1.0"
+            folium.Marker(
+                location=binfo["centroid"],
+                icon=folium.DivIcon(
+                    html=(
+                        f'<div style="opacity:{label_opacity}; white-space:nowrap; '
+                        f'background:rgba(15,23,42,0.85); color:#FFFFFF; '
+                        f'border:2px solid {color}; border-radius:999px; '
+                        f'padding:2px 8px; font-size:11px; font-weight:700; '
+                        f'transform:translate(-50%,-50%); box-shadow:0 1px 4px rgba(0,0,0,0.35);">'
+                        f'{html.escape(sec)}</div>'
+                    ),
+                    icon_size=(0, 0),
+                ),
+            ).add_to(boundary_group)
+        boundary_group.add_to(fmap)
+
+    # 2. Pipe Network Layer
     if show_pipes:
         pipe_group = folium.FeatureGroup(name="Pipe Network")
         for seg in segments:
-            coords = json.loads(seg["geometry_json"])
+            coords = json.loads(seg["geometry_json"]) if seg.get("geometry_json") else seg.get("geometry", [])
             seg_pressure = latest_pressures.get(seg["segment_id"])
             color = (
                 _pressure_color(seg_pressure)
                 if pipe_color_mode == "Pressure Status"
-                else SECTOR_COLORS.get(seg["sector"], "#38BDF8")
+                else SECTOR_COLORS.get(seg["sector"], "#2563EB")
             )
             is_selected_seg = selected_leak and selected_leak["pipe_segment_id"] == seg["segment_id"]
+            is_dim = hl_norm is not None and str(seg.get("sector", "")).lower() != hl_norm
             tooltip_txt = (
                 f"{seg['segment_id']} — {seg['name']} | {seg['sector']} | "
                 f"{seg['diameter_mm']}mm {seg['material']} ({seg['install_year']}) | "
@@ -156,38 +272,70 @@ def build_leak_folium_map(
             folium.PolyLine(
                 locations=coords,
                 color=color,
-                weight=6 if is_selected_seg else 4,
-                opacity=0.95 if is_selected_seg else 0.78,
+                weight=6 if is_selected_seg else (2.5 if is_dim else 4),
+                opacity=0.95 if is_selected_seg else (0.30 if is_dim else 0.85),
                 tooltip=tooltip_txt,
             ).add_to(pipe_group)
         pipe_group.add_to(fmap)
 
+    # 3. Valves Layer (V-01..V-20)
+    if show_valves:
+        v_map = valve_statuses or {}
+        valve_group = folium.FeatureGroup(name="Valves")
+        for v_id, (v_lat, v_lon) in VALVE_COORDINATES.items():
+            v_sec = VALVE_SECTOR_MAP.get(v_id, "")
+            if hl_norm is not None and v_sec.lower() != hl_norm:
+                continue
+            v_status = str(v_map.get(v_id, "OPEN")).upper()
+            v_color = "#16A34A" if v_status == "OPEN" else "#DC2626"
+            folium.RegularPolygonMarker(
+                location=[v_lat, v_lon],
+                number_of_sides=4,
+                rotation=45,
+                radius=6,
+                color="#FFFFFF",
+                weight=1.5,
+                fill=True,
+                fill_color=v_color,
+                fill_opacity=0.95,
+                tooltip=f"Valve {v_id} ({v_sec}) — {v_status}",
+            ).add_to(valve_group)
+        valve_group.add_to(fmap)
+
+    # 4. Sensors Layer
     if show_sensors:
         sensor_group = folium.FeatureGroup(name="Sensors")
         for j_id, (lat, lon) in JUNCTION_COORDINATES.items():
+            j_sec = JUNCTION_SECTOR_MAP.get(j_id, "")
+            if hl_norm is not None and j_sec.lower() != hl_norm:
+                continue
             p_id = j_id.replace("J-", "P-") if j_id.startswith("J-") else ("T-INTAKE-1" if j_id == "INTAKE-01" else "T-INTAKE-2")
             is_quarantined = p_id in quarantined_ids
             if is_quarantined:
                 folium.Marker(
                     location=[lat, lon],
-                    tooltip=f"QUARANTINED SENSOR: {p_id} ({j_id})",
+                    tooltip=f"QUARANTINED SENSOR: {p_id} ({j_id}, {j_sec})",
                     icon=folium.Icon(color="orange", icon="exclamation-triangle", prefix="fa"),
                 ).add_to(sensor_group)
             else:
                 folium.CircleMarker(
                     location=[lat, lon],
-                    radius=4,
-                    color="#0EA5E9",
+                    radius=4.5,
+                    color="#FFFFFF",
+                    weight=1.2,
                     fill=True,
-                    fill_color="#38BDF8",
-                    fill_opacity=0.9,
-                    tooltip=f"Sensor {p_id} ({j_id}) — ACTIVE",
+                    fill_color="#0EA5E9",
+                    fill_opacity=0.92,
+                    tooltip=f"Sensor {p_id} ({j_id}, {j_sec}) — ACTIVE",
                 ).add_to(sensor_group)
         sensor_group.add_to(fmap)
 
+    # 5. Leaks Layer
     if show_leaks:
         leak_group = folium.FeatureGroup(name="Leaks")
         for lk in leaks:
+            if hl_norm is not None and str(lk.get("sector", "")).lower() != hl_norm:
+                continue
             lat = float(lk["latitude"])
             lon = float(lk["longitude"])
             loss = float(lk["estimated_loss_m3_per_hour"])
@@ -218,6 +366,25 @@ def build_leak_folium_map(
                 tooltip=marker_tooltip,
             ).add_to(leak_group)
         leak_group.add_to(fmap)
+
+    # 6. Floating Legend Box & Native Leaflet Layer Control
+    legend = MacroElement()
+    legend._template = Template(_build_map_legend_html())
+    fmap.get_root().add_child(legend)
+    folium.LayerControl(collapsed=True).add_to(fmap)
+
+    # 7. Fit map bounds cleanly to highlighted sector or full network
+    if fit_bounds and boundaries:
+        if hl_norm is not None:
+            for sec, binfo in boundaries.items():
+                if sec.lower() == hl_norm:
+                    fmap.fit_bounds(binfo["bounds"], padding=(25, 25))
+                    break
+        elif selected_leak is None:
+            all_lats = [b["bounds"][0][0] for b in boundaries.values()] + [b["bounds"][1][0] for b in boundaries.values()]
+            all_lons = [b["bounds"][0][1] for b in boundaries.values()] + [b["bounds"][1][1] for b in boundaries.values()]
+            if all_lats and all_lons:
+                fmap.fit_bounds([[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]], padding=(20, 20))
 
     return fmap
 

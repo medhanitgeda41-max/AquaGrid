@@ -666,3 +666,215 @@ JUNCTION_COORDINATES: dict[str, tuple[float, float]] = {
     "INTAKE-01": (25.0590, 55.1180),  # Jebel Ali / Marina Coastal Intake 01
     "INTAKE-02": (25.0535, 55.1125),  # Jebel Ali / Marina Coastal Intake 02
 }
+
+# Geographic sector for each junction (matches its snapped pipe segment in DUBAI_PIPE_SEGMENTS)
+JUNCTION_SECTOR_MAP: dict[str, str] = {
+    "J-01": "Sector 1",
+    "J-02": "Sector 1",
+    "J-03": "Sector 1",
+    "J-04": "Sector 1",
+    "J-05": "Sector 1",
+    "J-06": "Sector 2",
+    "J-07": "Sector 2",
+    "J-08": "Sector 2",
+    "J-09": "Sector 2",
+    "J-10": "Sector 2",
+    "J-11": "Sector 3",
+    "J-12": "Sector 3",
+    "J-13": "Sector 3",
+    "J-14": "Sector 4",
+    "J-15": "Sector 4",
+    "J-16": "Sector 4",
+    "J-17": "Sector 4",
+    "J-18": "Sector 4",
+    "J-19": "Sector 5",
+    "J-20": "Sector 6",
+    "INTAKE-01": "Sector 6",
+    "INTAKE-02": "Sector 6",
+}
+
+# Isolation valve coordinates (V-01..V-20) snapped onto their respective sector pipe segments
+VALVE_COORDINATES: dict[str, tuple[float, float]] = {
+    "V-01": point_on_polyline(DUBAI_PIPE_SEGMENTS[0]["geometry"], 0.25),
+    "V-02": point_on_polyline(DUBAI_PIPE_SEGMENTS[2]["geometry"], 0.35),
+    "V-03": point_on_polyline(DUBAI_PIPE_SEGMENTS[4]["geometry"], 0.35),
+    "V-04": point_on_polyline(DUBAI_PIPE_SEGMENTS[5]["geometry"], 0.30),
+    "V-05": point_on_polyline(DUBAI_PIPE_SEGMENTS[7]["geometry"], 0.35),
+    "V-06": point_on_polyline(DUBAI_PIPE_SEGMENTS[9]["geometry"], 0.35),
+    "V-07": point_on_polyline(DUBAI_PIPE_SEGMENTS[10]["geometry"], 0.30),
+    "V-08": point_on_polyline(DUBAI_PIPE_SEGMENTS[11]["geometry"], 0.35),
+    "V-09": point_on_polyline(DUBAI_PIPE_SEGMENTS[13]["geometry"], 0.35),
+    "V-10": point_on_polyline(DUBAI_PIPE_SEGMENTS[16]["geometry"], 0.30),
+    "V-11": point_on_polyline(DUBAI_PIPE_SEGMENTS[17]["geometry"], 0.35),
+    "V-12": point_on_polyline(DUBAI_PIPE_SEGMENTS[15]["geometry"], 0.30),  # Sector 4 Main (Al Wasl Rd)
+    "V-13": point_on_polyline(DUBAI_PIPE_SEGMENTS[20]["geometry"], 0.35),
+    "V-14": point_on_polyline(DUBAI_PIPE_SEGMENTS[21]["geometry"], 0.35),
+    "V-15": point_on_polyline(DUBAI_PIPE_SEGMENTS[22]["geometry"], 0.35),
+    "V-16": point_on_polyline(DUBAI_PIPE_SEGMENTS[23]["geometry"], 0.35),
+    "V-17": point_on_polyline(DUBAI_PIPE_SEGMENTS[24]["geometry"], 0.30),
+    "V-18": point_on_polyline(DUBAI_PIPE_SEGMENTS[25]["geometry"], 0.35),
+    "V-19": point_on_polyline(DUBAI_PIPE_SEGMENTS[26]["geometry"], 0.35),
+    "V-20": point_on_polyline(DUBAI_PIPE_SEGMENTS[27]["geometry"], 0.35),
+}
+
+VALVE_SECTOR_MAP: dict[str, str] = {
+    f"V-{i:02d}": (f"Sector {(i - 1) // 3 + 1}" if i <= 12 else ("Sector 5" if i <= 16 else "Sector 6"))
+    for i in range(1, 21)
+}
+
+
+def _local_m_to_deg(x: float, y: float, ref_lat: float) -> tuple[float, float]:
+    """Inverse of _deg_to_local_m: convert local planar meters back to (lat, lon)."""
+    lat = y / 111_320.0
+    cos_lat = max(1e-6, math.cos(math.radians(ref_lat)))
+    lon = x / (111_320.0 * cos_lat)
+    return round(lat, 6), round(lon, 6)
+
+
+def _convex_hull_2d(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Pure-Python Andrew's monotone chain 2D convex hull returning vertices in counter-clockwise order."""
+    pts = sorted(set((round(float(x), 4), round(float(y), 4)) for x, y in points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: list[tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    return lower[:-1] + upper[:-1]
+
+
+def _buffer_convex_hull_xy(
+    hull: list[tuple[float, float]],
+    buffer_m: float = 300.0,
+    arc_steps: int = 6,
+) -> list[tuple[float, float]]:
+    """Expand a CCW 2D convex hull outward by buffer_m meters (Minkowski sum with a disk)."""
+    if not hull:
+        return []
+    r = max(10.0, float(buffer_m))
+    if len(hull) == 1:
+        cx, cy = hull[0]
+        return [
+            (cx + r * math.cos(2.0 * math.pi * k / 24), cy + r * math.sin(2.0 * math.pi * k / 24))
+            for k in range(24)
+        ]
+
+    n = len(hull)
+    # Outward unit normal for each CCW edge (x_i -> x_{i+1}): (dy/L, -dx/L)
+    normals: list[tuple[float, float]] = []
+    for i in range(n):
+        ax, ay = hull[i]
+        bx, by = hull[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            normals.append((1.0, 0.0))
+        else:
+            normals.append((dy / length, -dx / length))
+
+    buffered: list[tuple[float, float]] = []
+    for i in range(n):
+        vx, vy = hull[i]
+        n_prev = normals[(i - 1) % n]
+        n_curr = normals[i]
+        a_start = math.atan2(n_prev[1], n_prev[0])
+        a_end = math.atan2(n_curr[1], n_curr[0])
+        # Sweep counter-clockwise from a_start to a_end
+        delta = (a_end - a_start) % (2.0 * math.pi)
+        if delta < 1e-6:
+            buffered.append((vx + r * math.cos(a_start), vy + r * math.sin(a_start)))
+        else:
+            steps = max(2, int(arc_steps))
+            for s in range(steps + 1):
+                ang = a_start + delta * (s / steps)
+                buffered.append((vx + r * math.cos(ang), vy + r * math.sin(ang)))
+    return buffered
+
+
+def point_in_polygon(lat: float, lon: float, polygon: Sequence[Sequence[float]]) -> bool:
+    """Pure-Python ray-casting test returning True if (lat, lon) is inside or on the boundary of polygon."""
+    n = len(polygon)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        yi, xi = float(polygon[i][0]), float(polygon[i][1])
+        yj, xj = float(polygon[j][0]), float(polygon[j][1])
+        if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi + 1e-18) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def compute_sector_boundaries(
+    segments: Sequence[dict] | None = None,
+    buffer_meters: float = 300.0,
+) -> dict[str, dict]:
+    """
+    Compute a buffered convex-hull boundary polygon (~300 m buffer) for each of Sectors 1-6
+    from that sector's own pipes, valves, sensors, and junctions.
+    """
+    import json
+
+    segs = list(segments) if segments is not None else DUBAI_PIPE_SEGMENTS
+    points_by_sector: dict[str, list[tuple[float, float]]] = {f"Sector {i}": [] for i in range(1, 7)}
+
+    # 1. Pipe vertices
+    for seg in segs:
+        sec = seg.get("sector")
+        if sec not in points_by_sector:
+            continue
+        geom = seg.get("geometry")
+        if geom is None and seg.get("geometry_json"):
+            geom = json.loads(seg["geometry_json"])
+        for pt in (geom or []):
+            points_by_sector[sec].append((float(pt[0]), float(pt[1])))
+
+    # 2. Junctions & sensors
+    for j_id, (lat, lon) in JUNCTION_COORDINATES.items():
+        sec = JUNCTION_SECTOR_MAP.get(j_id)
+        if sec in points_by_sector:
+            points_by_sector[sec].append((float(lat), float(lon)))
+
+    # 3. Valves (V-01..V-20)
+    for v_id, (lat, lon) in VALVE_COORDINATES.items():
+        sec = VALVE_SECTOR_MAP.get(v_id)
+        if sec in points_by_sector:
+            points_by_sector[sec].append((float(lat), float(lon)))
+
+    boundaries: dict[str, dict] = {}
+    for sec, latlon_pts in points_by_sector.items():
+        if not latlon_pts:
+            continue
+        ref_lat = sum(p[0] for p in latlon_pts) / len(latlon_pts)
+        xy_pts = [_deg_to_local_m(lat, lon, ref_lat) for lat, lon in latlon_pts]
+        hull_xy = _convex_hull_2d(xy_pts)
+        buf_xy = _buffer_convex_hull_xy(hull_xy, buffer_m=buffer_meters, arc_steps=6)
+        poly_latlon = [list(_local_m_to_deg(x, y, ref_lat)) for x, y in buf_xy]
+        if poly_latlon and poly_latlon[0] != poly_latlon[-1]:
+            poly_latlon.append(list(poly_latlon[0]))
+
+        lats = [p[0] for p in poly_latlon]
+        lons = [p[1] for p in poly_latlon]
+        centroid = [round(sum(lats[:-1]) / max(1, len(lats) - 1), 6), round(sum(lons[:-1]) / max(1, len(lons) - 1), 6)]
+        boundaries[sec] = {
+            "sector": sec,
+            "polygon": poly_latlon,
+            "centroid": centroid,
+            "bounds": [[min(lats), min(lons)], [max(lats), max(lons)]],
+            "asset_points": [[p[0], p[1]] for p in latlon_pts],
+        }
+    return boundaries

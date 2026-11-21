@@ -23,12 +23,29 @@ def _format_val(action_type: str, value: float) -> str:
     return f"{float(value):.1f} MLD"
 
 
-def render_inline_map(sector: str | None, leak_id: str | None, widget_key: str, snapshot: dict) -> None:
-    """Render interactive Leaflet map zoomed to a sector or leak_id inside chat."""
+def render_inline_map(
+    sector: str | None,
+    leak_id: str | None,
+    widget_key: str,
+    snapshot: dict,
+    show_boundaries_default: bool = True,
+) -> None:
+    """Render interactive Leaflet map with sector boundaries, layer toggles, English basemap toggle, and single-sector summary table."""
+    from config.region_config import SECTOR_COLOR_NAMES
+    from database.dubai_network import JUNCTION_SECTOR_MAP, VALVE_SECTOR_MAP
+
     conn = get_db_connection()
     try:
         seg_rows = conn.execute("SELECT * FROM pipe_segments ORDER BY sector, segment_id;").fetchall()
         leak_rows = conn.execute("SELECT * FROM leaks ORDER BY detected_at DESC;").fetchall()
+        valve_rows = conn.execute("SELECT valve_id, sector, status FROM valves ORDER BY valve_id ASC;").fetchall()
+        wq_rows = conn.execute(
+            """
+            SELECT sector, chlorine_mg_l
+            FROM sector_water_quality
+            WHERE id IN (SELECT MAX(id) FROM sector_water_quality GROUP BY sector);
+            """
+        ).fetchall()
         p_rows = conn.execute(
             """
             SELECT pipe_segment_id, pressure_psi
@@ -41,35 +58,102 @@ def render_inline_map(sector: str | None, leak_id: str | None, widget_key: str, 
 
     segments = [dict(r) for r in seg_rows]
     all_leaks = [dict(r) for r in leak_rows]
+    valve_statuses = {r["valve_id"]: r["status"] for r in valve_rows}
+    wq_by_sector = {r["sector"]: float(r["chlorine_mg_l"]) for r in wq_rows}
     latest_pressures = {r["pipe_segment_id"]: float(r["pressure_psi"]) for r in p_rows if r["pressure_psi"] is not None}
-    quarantined_ids = {s["sensor_id"] for s in (snapshot.get("telemetry_data") or {}).get("quarantined_sensors", [])}
+    quarantined_list = (snapshot.get("telemetry_data") or {}).get("quarantined_sensors", [])
+    quarantined_ids = {s["sensor_id"] for s in quarantined_list}
 
-    filtered_segments = (
-        [s for s in segments if s["sector"].lower() == sector.lower()]
-        if sector
-        else segments
-    ) or segments
-    filtered_leaks = [
+    norm_sector = (sector or "").strip()
+    if norm_sector.lower() in ("", "all", "all sectors"):
+        highlight_sector = None
+    elif norm_sector.upper().startswith("LEAK-"):
+        leak_id = norm_sector.upper()
+        highlight_sector = None
+    else:
+        highlight_sector = norm_sector
+
+    # Compact layer + basemap toggles
+    t1, t2, t3, t4, t5, t6 = st.columns([1.3, 0.85, 0.95, 0.85, 0.85, 1.2])
+    with t1:
+        show_boundaries = st.checkbox("Boundaries", value=bool(show_boundaries_default), key=f"map_b_{widget_key}")
+    with t2:
+        show_pipes = st.checkbox("Pipes", value=True, key=f"map_p_{widget_key}")
+    with t3:
+        show_sensors = st.checkbox("Sensors", value=True, key=f"map_s_{widget_key}")
+    with t4:
+        show_valves = st.checkbox("Valves", value=True, key=f"map_v_{widget_key}")
+    with t5:
+        show_leaks = st.checkbox("Leaks", value=True, key=f"map_l_{widget_key}")
+    with t6:
+        use_std_osm = st.checkbox("Standard OSM", value=False, key=f"map_osm_{widget_key}")
+
+    basemap = "OpenStreetMap" if use_std_osm else "CartoDB Positron"
+
+    matched_leaks = [
         lk for lk in all_leaks
-        if (not sector or lk["sector"].lower() == sector.lower())
+        if (not highlight_sector or lk["sector"].lower() == highlight_sector.lower())
         and (not leak_id or lk["leak_id"].upper() == leak_id.upper())
     ]
+    selected_leak = matched_leaks[0] if (leak_id and matched_leaks) else None
 
-    selected_leak = filtered_leaks[0] if filtered_leaks else (all_leaks[0] if leak_id else None)
     fmap = build_leak_folium_map(
-        segments=filtered_segments,
-        leaks=filtered_leaks or all_leaks,
+        segments=segments,
+        leaks=all_leaks,
         quarantined_ids=quarantined_ids,
         latest_pressures=latest_pressures,
         selected_leak=selected_leak,
-        show_pipes=True,
+        show_pipes=show_pipes,
         pipe_color_mode="Sector",
-        show_leaks=True,
-        show_sensors=True,
+        show_leaks=show_leaks,
+        show_sensors=show_sensors,
+        show_boundaries=show_boundaries,
+        show_valves=show_valves,
+        highlight_sector=highlight_sector,
+        valve_statuses=valve_statuses,
+        basemap=basemap,
+        fit_bounds=True,
     )
-    st_folium(fmap, height=340, width=None, returned_objects=[], key=f"map_{widget_key}")
-    caption_scope = leak_id or sector or "Dubai Network"
-    st.caption(f"Live Leaflet Map — {caption_scope} ({len(filtered_leaks)} matching leak(s), {len(quarantined_ids)} quarantined sensor(s))")
+    st_folium(fmap, height=380, width=None, returned_objects=[], key=f"map_{widget_key}")
+
+    scope_lbl = leak_id or highlight_sector or "All 6 Sectors (Dubai Network)"
+    st.caption(f"Map: {scope_lbl} · Basemap: {basemap} (© OpenStreetMap contributors{' © CARTO' if basemap != 'OpenStreetMap' else ''})")
+
+    # Small summary table under the map when focused on a single sector
+    if highlight_sector:
+        sec_pipes = [s for s in segments if s["sector"].lower() == highlight_sector.lower()]
+        sec_valves = [v for v in valve_rows if v["sector"].lower() == highlight_sector.lower()]
+        sec_juncs = [j for j, sc in JUNCTION_SECTOR_MAP.items() if sc.lower() == highlight_sector.lower()]
+        sec_quar = [q for q in quarantined_list if str(q.get("sector", "")).lower() == highlight_sector.lower()]
+        sec_active_leaks = [l for l in matched_leaks if str(l.get("status", "")).lower() != "resolved"]
+        cl_val = wq_by_sector.get(highlight_sector)
+        if cl_val is None:
+            for k, v in wq_by_sector.items():
+                if k.lower() == highlight_sector.lower():
+                    cl_val = v
+                    break
+        cl_str = f"{cl_val:.2f} mg/L" if cl_val is not None else "-"
+        sec_status = "NON_COMPLIANT" if (cl_val is not None and cl_val < 0.20) else ("ALERT" if sec_active_leaks else "NOMINAL")
+        open_v = sum(1 for v in sec_valves if v["status"] == "OPEN")
+        closed_v = len(sec_valves) - open_v
+        color_nm = SECTOR_COLOR_NAMES.get(highlight_sector, "-")
+
+        sec_df = pd.DataFrame(
+            [
+                {
+                    "Sector": highlight_sector,
+                    "Color": color_nm,
+                    "Pipes": len(sec_pipes),
+                    "Valves": f"{len(sec_valves)} ({open_v} OPEN / {closed_v} CLOSED)",
+                    "Sensors": len(sec_juncs) * 2,
+                    "Active Leaks": len(sec_active_leaks),
+                    "Quarantined": len(sec_quar),
+                    "Chlorine": cl_str,
+                    "Status": sec_status,
+                }
+            ]
+        )
+        st.dataframe(sec_df, width="stretch", hide_index=True)
 
 
 def render_inline_chart(metric: str, asset: str | None, hours: int, snapshot: dict) -> None:
@@ -539,7 +623,13 @@ def render_chat_widget(widget: dict, widget_key: str, snapshot: dict) -> None:
     """Dispatch a single chat widget spec to its inline renderer."""
     w_type = widget.get("type")
     if w_type == "map":
-        render_inline_map(widget.get("sector"), widget.get("leak_id"), widget_key, snapshot)
+        render_inline_map(
+            widget.get("sector"),
+            widget.get("leak_id"),
+            widget_key,
+            snapshot,
+            show_boundaries_default=bool(widget.get("show_boundaries", True)),
+        )
     elif w_type == "chart":
         render_inline_chart(widget.get("metric", "reservoir"), widget.get("asset"), int(widget.get("hours", 24)), snapshot)
     elif w_type == "table":

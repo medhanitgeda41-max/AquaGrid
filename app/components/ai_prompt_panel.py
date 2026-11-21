@@ -39,6 +39,49 @@ def _handle_user_prompt(prompt_text: str, display_hour: int) -> None:
     messages.append(reply)
 
 
+def build_how_i_got_this_summary(msg: dict) -> dict:
+    """Build guaranteed non-empty bullets and fallback summary for the 'How I got this' expander."""
+    tool_bullets: list[str] = []
+    for tc in (msg.get("tools_called") or []):
+        if not isinstance(tc, dict):
+            continue
+        t_name = str(tc.get("tool") or "").strip()
+        t_sum = str(tc.get("summary") or "").strip()
+        if not t_name and not t_sum:
+            continue
+        if not t_name:
+            t_name = "tool"
+        if not t_sum:
+            t_sum = "Executed successfully"
+        tool_bullets.append(f"- `{t_name}` — {t_sum}")
+
+    provider = str(msg.get("provider") or "System").strip() or "System"
+    providers_tried = msg.get("providers_tried") or []
+    fallback_notes: list[str] = []
+    failed_providers = [
+        pt for pt in providers_tried
+        if isinstance(pt, dict) and str(pt.get("status", "")).upper().startswith("FAILED")
+    ]
+    retry_providers = [
+        pt for pt in providers_tried
+        if isinstance(pt, dict) and "retried" in str(pt.get("status", "")).lower() and pt.get("error")
+    ]
+    for fp in failed_providers:
+        fp_name = str(fp.get("provider") or "Primary model").strip()
+        fp_err = str(fp.get("error") or "unavailable").strip()
+        fallback_notes.append(f"- `{fp_name}` failed ({fp_err}) -> fell back to `{provider}`")
+    for rp in retry_providers:
+        rp_name = str(rp.get("provider") or provider).strip()
+        rp_err = str(rp.get("error") or "retried without tools").strip()
+        fallback_notes.append(f"- `{rp_name}`: {rp_err}")
+
+    return {
+        "tool_bullets": tool_bullets,
+        "fallback_notes": fallback_notes,
+        "provider": provider,
+    }
+
+
 def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: dict | None = None) -> None:
     """Render full-width Ask AquaGrid chat interface with inline maps, charts, tables, and approval cards."""
     snapshot = snapshot or {}
@@ -103,45 +146,51 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
                     unsafe_allow_html=True,
                 )
 
-                tools_called = msg.get("tools_called") or []
+                hgt = build_how_i_got_this_summary(msg)
+                tool_bullets = hgt["tool_bullets"]
+                fallback_notes = hgt["fallback_notes"]
                 code_checks = msg.get("code_checks") or []
                 staged = msg.get("staged_action")
                 providers_tried = msg.get("providers_tried") or []
                 error_detail = msg.get("error_detail") or ""
 
-                if tools_called or code_checks or staged or error_detail or providers_tried or show_tech:
+                if tool_bullets or code_checks or staged or error_detail or fallback_notes or show_tech:
                     with st.expander("How I got this", expanded=show_tech):
-                        if tools_called:
-                            st.markdown("**Tools called:**")
-                            for tc in tools_called:
-                                st.markdown(f"- `{tc.get('tool')}` — {tc.get('summary', '')}")
+                        if tool_bullets:
+                            st.markdown("**Tools called:**\n" + "\n".join(tool_bullets))
                         if code_checks:
-                            st.markdown("**Code checks:**")
+                            checks_lines = []
                             for chk in code_checks:
                                 st_tag = chk.get("status", "PASS")
-                                badge = status_badge("VALID" if st_tag == "PASS" else "BLOCKED")
-                                badge = badge.replace("VALID", "PASS")
-                                code_str = f" (`{chk.get('code')}`)" if chk.get("code") else ""
-                                st.markdown(
-                                    f'{badge} **{html.escape(str(chk.get("check", "")))}**{code_str}: {html.escape(str(chk.get("detail", "")))}',
-                                    unsafe_allow_html=True,
+                                badge = status_badge("VALID" if st_tag == "PASS" else "BLOCKED").replace("VALID", "PASS")
+                                code_val = str(chk.get("code") or "").strip()
+                                code_html = f' <span class="ag-mono">({html.escape(code_val)})</span>' if code_val else ""
+                                checks_lines.append(
+                                    f'<div style="margin:0.2rem 0;">{badge} '
+                                    f'<strong>{html.escape(str(chk.get("check", "")))}</strong>{code_html}: '
+                                    f'{html.escape(str(chk.get("detail", "")))}</div>'
                                 )
+                            st.markdown("**Code checks:**", unsafe_allow_html=False)
+                            st.markdown("".join(checks_lines), unsafe_allow_html=True)
                         if staged:
                             st.markdown(
                                 f"**Gateway result:** `{staged.get('status')}` — "
                                 f"{staged.get('action_type', '')} {staged.get('target_id', '')} "
                                 f"({staged.get('reason') or staged.get('details') or staged.get('message') or ''})"
                             )
+                        if fallback_notes:
+                            st.markdown("**Model fallback:**\n" + "\n".join(fallback_notes))
                         if show_tech and error_detail:
                             st.error(f"**Technical Error:** `{error_detail}`")
-                        if providers_tried and (show_tech or any(pt.get("error") for pt in providers_tried)):
-                            st.markdown("**Provider chain notes:**")
-                            for pt in providers_tried:
-                                if not show_tech and not pt.get("error"):
-                                    continue
-                                err_suffix = f" — {pt['error']}" if pt.get("error") else ""
-                                st.markdown(f"- `{pt.get('provider')}`: `{pt.get('status')}`{err_suffix}")
-                        st.caption(f"Provider: {provider} · LLM_MODE: {settings.LLM_MODE}")
+                        if show_tech and providers_tried:
+                            all_pt = [
+                                f"- `{pt.get('provider')}`: `{pt.get('status')}`" + (f" — {pt['error']}" if pt.get("error") else "")
+                                for pt in providers_tried
+                                if isinstance(pt, dict) and pt.get("provider")
+                            ]
+                            if all_pt:
+                                st.markdown("**All providers tried:**\n" + "\n".join(all_pt))
+                        st.caption(f"Answered by: {provider} · LLM_MODE: {settings.LLM_MODE}")
 
     # Chat input bar at bottom
     user_typed = st.chat_input(

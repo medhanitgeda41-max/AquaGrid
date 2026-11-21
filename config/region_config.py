@@ -29,6 +29,9 @@ REGION_CONFIG: dict = {
     "map_zoom": settings.MAP_DEFAULT_ZOOM,
     "osm_tiles": "OpenStreetMap",
     "osm_attribution": "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors",
+    "positron_tiles": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+    "positron_attribution": "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors &copy; <a href='https://carto.com/attributions'>CARTO</a>",
+    "default_basemap": "CartoDB Positron",
     "live_interval_seconds": settings.LIVE_INTERVAL_SECONDS,
     "demo_accelerated_interval_seconds": settings.DEMO_ACCELERATED_INTERVAL_SECONDS,
     "ui_refresh_seconds": settings.UI_REFRESH_SECONDS,
@@ -38,14 +41,23 @@ REGION_CONFIG: dict = {
     "usd_to_aed": 3.6725,
 }
 
-# Distinct high-contrast map colors for Sectors 1-6
+# Fixed distinct map colors for Sectors 1-6 (used everywhere: boundaries, pipes, legend, AI summaries)
 SECTOR_COLORS: dict[str, str] = {
-    "Sector 1": "#38BDF8",  # Sky Blue (Deira / Al Rigga)
-    "Sector 2": "#A78BFA",  # Violet (Bur Dubai / Karama)
-    "Sector 3": "#2DD4BF",  # Teal (Downtown / Business Bay)
-    "Sector 4": "#F59E0B",  # Amber (Jumeirah / Al Wasl — Sector 4 Main)
-    "Sector 5": "#FB7185",  # Rose (Al Barsha / Umm Suqeim)
-    "Sector 6": "#34D399",  # Emerald (Dubai Marina / JLT)
+    "Sector 1": "#2563EB",  # Blue (Deira / Al Rigga)
+    "Sector 2": "#16A34A",  # Green (Bur Dubai / Karama)
+    "Sector 3": "#EA580C",  # Orange (Downtown / Business Bay)
+    "Sector 4": "#9333EA",  # Purple (Jumeirah / Al Wasl — Sector 4 Main)
+    "Sector 5": "#0D9488",  # Teal (Al Barsha / Umm Suqeim)
+    "Sector 6": "#DC2626",  # Red (Dubai Marina / JLT)
+}
+
+SECTOR_COLOR_NAMES: dict[str, str] = {
+    "Sector 1": "blue",
+    "Sector 2": "green",
+    "Sector 3": "orange",
+    "Sector 4": "purple",
+    "Sector 5": "teal",
+    "Sector 6": "red",
 }
 
 # Severity marker colors per specification

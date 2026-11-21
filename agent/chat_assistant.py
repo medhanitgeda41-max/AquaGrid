@@ -50,11 +50,12 @@ STRICT RULES:
 4. Answer ANY operator question clearly and concisely: plant status, leaks, quarantined sensors, reservoir & dynamic emergency floor, electricity tariffs, hourly production plans, past actions in the Audit Log, why a plan was rejected, what any technical status code means, and next steps.
 5. Use prior conversation messages naturally for follow-up questions (e.g. "Why?", "What about Sector 2?", "And if demand rises?").
 6. Use DISPLAY TOOLS to render helpful visuals inside your reply whenever relevant:
-   - show_map(sector, leak_id): map locations, leaks, or a sector.
+   - show_map(sector, leak_id, show_boundaries): sector="all" for all 6 sectors, "Sector N" to highlight/zoom one sector, or leak_id like "LEAK-001"; show_boundaries defaults to true.
    - show_chart(metric, asset, hours): metric in ["pressure", "flow", "reservoir", "tariff"].
    - show_table(what): what in ["leaks", "sensors", "schedule", "audit", "valves"].
    - show_schedule_validation(plan): validating a production schedule.
    - show_pending_approvals(): showing pending actions awaiting operator signoff.
+   Never describe map or chart features that are not listed in the tool result. Only cite layers, sector colours, counts, and zoom targets returned by the tool.
 7. If the operator asks for a physical change (e.g. "reduce output to 70 MLD", "close V-12", "isolate and flush Sector 2"), you may ONLY call propose_gated_action. All Python safety guards run automatically inside the gateway. State the exact gateway status code (STAGED_PENDING_APPROVAL or REJECTED_* + reason) and remind the operator to click the Approve or Reject button on the approval card.
 8. You can NEVER execute, auto-approve, or bypass operator approval. Keep exact technical status codes unchanged (STAGED_PENDING_APPROVAL, REJECTED_BY_SAFETY_GUARD, REJECTED_WATER_QUALITY, CANCELLED_BY_SAFETY_RECHECK, REJECTED_UNAUTHORIZED_APPROVAL_CLAIM, REJECTED_APPROVAL_MISMATCH, REJECTED_APPROVAL_ALREADY_USED, REJECTED_APPROVAL_EXPIRED, TELEMETRY_LOSS, REJECTED_STALE_TELEMETRY, CANCELLED_STALE_TELEMETRY, NON_COMPLIANT, UNTRUSTED_TEXT, VALID, GAP).
 """
@@ -116,12 +117,19 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "show_map",
-            "description": "Display the interactive Leaflet pipe & leak map inside this chat reply, optionally focused on a sector or leak_id.",
+            "description": "Display the interactive Leaflet map with sector boundary polygons, pipes, valves, sensors, and leaks inside this chat reply. Returns exact layers, colours, asset counts, and zoom target drawn.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "sector": {"type": "string", "description": "Optional sector name like 'Sector 4'."},
-                    "leak_id": {"type": "string", "description": "Optional leak ID like 'LEAK-001'."},
+                    "sector": {
+                        "type": "string",
+                        "description": "'all' for all 6 sectors, a sector name like 'Sector 4', or a leak ID like 'LEAK-001'.",
+                    },
+                    "leak_id": {"type": "string", "description": "Optional explicit leak ID like 'LEAK-001'."},
+                    "show_boundaries": {
+                        "type": "boolean",
+                        "description": "Draw buffered convex-hull sector boundary polygons (default true).",
+                    },
                 },
                 "required": [],
             },
@@ -245,6 +253,144 @@ _TOOL_BEGGING_RE = re.compile(
     r"let\s+me\s+know\s+when\s+you(?:'d| would)\s+like\s+me\s+to\s+run|don't\s+have\s+access\s+to\s+live)",
     re.IGNORECASE,
 )
+
+_BOUNDARY_CLAIM_RE = re.compile(
+    r"\b(?:boundar(?:y|ies)|border(?:s)?|polygon(?:s)?|distinct\s+colo(?:u)?r\s+(?:line|outline|border))\b",
+    re.IGNORECASE,
+)
+
+
+def build_map_render_summary(
+    sector: str = "all",
+    leak_id: Optional[str] = None,
+    show_boundaries: bool = True,
+    db_path: Optional[str] = None,
+) -> dict:
+    """Compute the exact structured summary of what show_map renders (layers, colours, counts, zoom target)."""
+    from config.region_config import SECTOR_COLOR_NAMES, SECTOR_COLORS
+    from database.dubai_network import JUNCTION_SECTOR_MAP, VALVE_SECTOR_MAP, compute_sector_boundaries
+
+    raw_sec = (sector or "all").strip()
+    norm_leak = (leak_id or "").strip().upper() or None
+    highlight_sector: Optional[str] = None
+    if raw_sec.upper().startswith("LEAK-"):
+        norm_leak = raw_sec.upper()
+    elif raw_sec.lower() not in ("", "all", "all sectors"):
+        # Normalize e.g. "sector 4" -> "Sector 4"
+        m_s = re.search(r"([1-6])", raw_sec)
+        highlight_sector = f"Sector {m_s.group(1)}" if m_s else raw_sec
+
+    conn = get_db_connection(db_path)
+    try:
+        segs = [dict(r) for r in conn.execute("SELECT segment_id, sector, geometry_json FROM pipe_segments;").fetchall()]
+        valves = [dict(r) for r in conn.execute("SELECT valve_id, sector, status FROM valves;").fetchall()]
+        leaks = [dict(r) for r in conn.execute("SELECT leak_id, sector, location_name, severity, status FROM leaks;").fetchall()]
+        wq_rows = conn.execute(
+            """
+            SELECT sector, chlorine_mg_l
+            FROM sector_water_quality
+            WHERE id IN (SELECT MAX(id) FROM sector_water_quality GROUP BY sector);
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    wq_by_sec = {r["sector"]: float(r["chlorine_mg_l"]) for r in wq_rows}
+    tel = read_network_telemetry(current_hour=DEFAULT_SCADA_HOUR, db_path=db_path, log_audit=False)
+    quarantined = tel.get("quarantined_sensors") or []
+
+    boundaries = compute_sector_boundaries(segs, buffer_meters=300.0)
+    boundaries_drawn = len(boundaries) if show_boundaries else 0
+
+    layers_drawn: list[str] = []
+    if show_boundaries:
+        layers_drawn.append("Sector boundaries")
+    layers_drawn.extend(["Pipes", "Sensors", "Valves", "Leaks"])
+
+    per_sector: dict[str, dict] = {}
+    sector_colors: dict[str, str] = {}
+    for i in range(1, 7):
+        sec_name = f"Sector {i}"
+        cname = SECTOR_COLOR_NAMES[sec_name]
+        chex = SECTOR_COLORS[sec_name]
+        sector_colors[sec_name] = f"{cname} ({chex})"
+        s_pipes = sum(1 for s in segs if s["sector"] == sec_name)
+        s_valves = sum(1 for v in valves if v["sector"] == sec_name)
+        s_juncs = sum(1 for _, sc in JUNCTION_SECTOR_MAP.items() if sc == sec_name)
+        s_sensors = s_juncs * 2
+        s_leaks = sum(1 for l in leaks if l["sector"] == sec_name and str(l.get("status", "")).lower() != "resolved")
+        s_quar = sum(1 for q in quarantined if q.get("sector") == sec_name)
+        cl_val = wq_by_sec.get(sec_name)
+        s_status = "NON_COMPLIANT" if (cl_val is not None and cl_val < 0.20) else ("ALERT" if s_leaks > 0 else "NOMINAL")
+        per_sector[sec_name] = {
+            "color": cname,
+            "hex": chex,
+            "pipes": s_pipes,
+            "sensors": s_sensors,
+            "valves": s_valves,
+            "leaks": s_leaks,
+            "quarantined": s_quar,
+            "chlorine_mg_l": round(cl_val, 3) if cl_val is not None else None,
+            "status": s_status,
+            "boundary_drawn": bool(show_boundaries and sec_name in boundaries),
+        }
+
+    matched_leaks = [
+        l for l in leaks
+        if (not highlight_sector or l["sector"] == highlight_sector)
+        and (not norm_leak or l["leak_id"].upper() == norm_leak)
+    ]
+
+    if norm_leak:
+        zoom_target = norm_leak
+        zoom_bounds = None
+    elif highlight_sector and highlight_sector in boundaries:
+        zoom_target = highlight_sector
+        zoom_bounds = boundaries[highlight_sector]["bounds"]
+    else:
+        zoom_target = "All sectors (Sectors 1-6)"
+        all_lats = [b["bounds"][0][0] for b in boundaries.values()] + [b["bounds"][1][0] for b in boundaries.values()]
+        all_lons = [b["bounds"][0][1] for b in boundaries.values()] + [b["bounds"][1][1] for b in boundaries.values()]
+        zoom_bounds = [[min(all_lats), min(all_lons)], [max(all_lats), max(all_lons)]] if all_lats else None
+
+    colors_desc = ", ".join(f"{s} ({SECTOR_COLOR_NAMES[s]})" for s in ("Sector 1", "Sector 2", "Sector 3", "Sector 4", "Sector 5", "Sector 6"))
+    if highlight_sector:
+        info = per_sector.get(highlight_sector, {})
+        b_phrase = f"highlighted {info.get('color', '')} sector boundary (other sectors dimmed)" if show_boundaries else "no sector boundaries drawn"
+        summary_text = (
+            f"Map zoomed to **{highlight_sector}** with {b_phrase}, "
+            f"{info.get('pipes', 0)} pipe(s), {info.get('valves', 0)} valve(s), "
+            f"{info.get('sensors', 0)} sensor(s), and {info.get('leaks', 0)} active leak(s) "
+            f"(layers: {', '.join(layers_drawn)}; basemap: CartoDB Positron)."
+        )
+    else:
+        b_phrase = f"{boundaries_drawn} buffered sector boundary polygons ({colors_desc})" if show_boundaries else "no sector boundaries drawn"
+        summary_text = (
+            f"Map fitted to **{zoom_target}** showing {b_phrase}, "
+            f"{len(segs)} pipes, {len(valves)} valves, sensors, and {len(matched_leaks)} tracked leak(s) "
+            f"(layers: {', '.join(layers_drawn)}; basemap: CartoDB Positron)."
+        )
+
+    return {
+        "displayed": True,
+        "sector": highlight_sector or "all",
+        "highlight_sector": highlight_sector,
+        "leak_id": norm_leak,
+        "show_boundaries": bool(show_boundaries),
+        "boundaries_drawn": boundaries_drawn,
+        "layers_drawn": layers_drawn,
+        "sector_colors": sector_colors,
+        "per_sector": per_sector,
+        "total_pipes": len(segs),
+        "total_valves": len(valves),
+        "total_sensors": sum(v["sensors"] for v in per_sector.values()),
+        "matched_leaks": len(matched_leaks),
+        "leaks": matched_leaks[:5],
+        "zoom_target": zoom_target,
+        "zoom_bounds": zoom_bounds,
+        "basemap": "CartoDB Positron (light_all)",
+        "summary_text": summary_text,
+    }
 
 
 def parse_planning_horizon_hours(text: str) -> Optional[int]:
@@ -1021,7 +1167,13 @@ def _summarize_tool_output(tool_name: str, result: Any) -> str:
         entries = result.get("entries") or []
         return f"Read {len(entries)} recent audit log entries"
     if tool_name == "show_map":
-        return f"Displayed map (sector={result.get('sector') or 'All'}, leaks={result.get('matched_leaks', 0)})"
+        b_cnt = result.get("boundaries_drawn", 0)
+        layers = ", ".join(result.get("layers_drawn") or [])
+        return (
+            f"Zoom: {result.get('zoom_target', result.get('sector', 'All'))} · "
+            f"boundaries={b_cnt} · layers=[{layers}] · "
+            f"pipes={result.get('total_pipes', 0)}, valves={result.get('total_valves', 0)}, leaks={result.get('matched_leaks', 0)}"
+        )
     if tool_name == "show_chart":
         return f"Displayed {result.get('metric')} chart (asset={result.get('asset') or 'Grid'}, hours={result.get('hours')})"
     if tool_name == "show_table":
@@ -1163,15 +1315,15 @@ def _offline_chat_fallback(
         loss_banner = (tel.get("telemetry_freshness") or {}).get("banner", "TELEMETRY LOSS")
         loss_suffix = f"\n\n*Note: `{loss_banner}` (`TELEMETRY_LOSS`) — new change proposals are blocked until the feed is restored.*"
 
-    # 3. Map display requests ("Show Sector 4 on the map", "Show map", "Where are the leaks?")
-    if "map" in lower or ("where" in lower and "leak" in lower):
+    # 3. Map display requests ("Show Sector 4 on the map", "Show all sectors with separate borders", "Where are the leaks?")
+    if "map" in lower or ("where" in lower and "leak" in lower) or ("all sectors" in lower and any(k in lower for k in ("show", "border", "boundar", "display"))):
         m_sec = re.search(r"sector\s*([1-6])", text, re.IGNORECASE)
-        sec_arg = f"Sector {m_sec.group(1)}" if m_sec else ""
+        sec_arg = f"Sector {m_sec.group(1)}" if m_sec else "all"
         m_lid = re.search(r"(LEAK-\d+)", text, re.IGNORECASE)
         lid_arg = m_lid.group(1).upper() if m_lid else ""
-        mp = tool_executor("show_map", {"sector": sec_arg, "leak_id": lid_arg})
-        scope = sec_arg or lid_arg or "Dubai network"
-        return f"Here is the live pipe & leak map for **{scope}** ({mp.get('matched_leaks', 0)} tracked leak(s), {len(quarantined)} quarantined sensor(s)).{loss_suffix}"
+        show_b = not ("without boundar" in lower or "no boundar" in lower or "hide boundar" in lower)
+        mp = tool_executor("show_map", {"sector": sec_arg, "leak_id": lid_arg, "show_boundaries": show_b})
+        return f"{mp.get('summary_text', 'Displayed live map.')}{loss_suffix}"
 
     # 3b. Direct reservoir level question ("what is the reservoir level")
     if ("reservoir" in lower or "res-01" in lower) and not any(k in lower for k in ("plan", "schedule", "optim", "tariff", "pressure", "flow")):
@@ -1474,6 +1626,7 @@ def run_chat_turn(
         }
     ]
     staged_action_holder: list[dict] = []
+    map_results_holder: list[dict] = []
 
     def _record_check(name: str, passed: bool, code: str, detail: str) -> None:
         for existing in code_checks:
@@ -1539,17 +1692,25 @@ def run_chat_turn(
             out = {"count": len(entries), "entries": entries}
 
         elif tool_name == "show_map":
-            sector = str(args.get("sector") or "").strip()
-            leak_id = str(args.get("leak_id") or "").strip()
-            _append_unique_widget(widgets, {"type": "map", "sector": sector or None, "leak_id": leak_id or None})
-            snap = _read_valves_and_pending_snapshot(db_path=db_path)
-            leaks_all = snap.get("tracked_leaks", [])
-            matched = [
-                l for l in leaks_all
-                if (not sector or l["sector"].lower() == sector.lower())
-                and (not leak_id or l["leak_id"].upper() == leak_id.upper())
-            ]
-            out = {"displayed": True, "sector": sector or "All", "leak_id": leak_id or None, "matched_leaks": len(matched), "leaks": matched[:5]}
+            sector = str(args.get("sector") or "all").strip()
+            leak_id = str(args.get("leak_id") or "").strip() or None
+            show_b = bool(args.get("show_boundaries", True))
+            out = build_map_render_summary(
+                sector=sector,
+                leak_id=leak_id,
+                show_boundaries=show_b,
+                db_path=db_path,
+            )
+            map_results_holder.append(out)
+            _append_unique_widget(
+                widgets,
+                {
+                    "type": "map",
+                    "sector": out["highlight_sector"] or "all",
+                    "leak_id": out["leak_id"],
+                    "show_boundaries": out["show_boundaries"],
+                },
+            )
 
         elif tool_name == "show_chart":
             metric = str(args.get("metric") or "reservoir").lower()
@@ -1693,6 +1854,17 @@ def run_chat_turn(
         "All 6 sectors >= 0.20 mg/L chlorine." if not excl_snap else f"NON_COMPLIANT: {', '.join(excl_snap)}",
     )
     snapshot_json = _compact_snapshot_json(live_snapshot)
+    tools_called_summary.append(
+        {
+            "tool": "live_scada_snapshot",
+            "args": {"current_hour": current_hour},
+            "summary": (
+                f"RES-01 {res_snap['level_percent']:.1f}% (floor {res_snap['safety_floor_percent']:.1f}%), "
+                f"DESAL-01 {live_snapshot['desal_01']['current_output_mld']:.0f} MLD (cap {live_snapshot['desal_01']['algae_cap_mld']:.0f} MLD), "
+                f"{len(live_snapshot['active_leaks'])} leak(s), {len(live_snapshot['pending_actions'])} pending"
+            ),
+        }
+    )
 
     # Build multi-turn message list for the LLM WITH live SCADA snapshot always pre-loaded!
     llm_messages: list[dict] = [
@@ -1743,6 +1915,20 @@ def run_chat_turn(
             )
 
         providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
+        # If the user asked for a map and the LLM skipped calling show_map, invoke show_map so the map truly renders
+        lower_q = cleaned.lower()
+        asked_for_map = (
+            "map" in lower_q
+            or ("all sectors" in lower_q and any(k in lower_q for k in ("show", "border", "boundar", "display")))
+        )
+        if asked_for_map and not map_results_holder:
+            m_sec = re.search(r"sector\s*([1-6])", cleaned, re.IGNORECASE)
+            sec_arg = f"Sector {m_sec.group(1)}" if m_sec else "all"
+            m_lid = re.search(r"(LEAK-\d+)", cleaned, re.IGNORECASE)
+            lid_arg = m_lid.group(1).upper() if m_lid else None
+            show_b = not ("without boundar" in lower_q or "no boundar" in lower_q or "hide boundar" in lower_q)
+            _execute_tool("show_map", {"sector": sec_arg, "leak_id": lid_arg or "", "show_boundaries": show_b})
+
         # Safety net: never return a response begging the operator to enable tools or run live queries!
         if not answer_text or _TOOL_BEGGING_RE.search(answer_text):
             if answer_text and _TOOL_BEGGING_RE.search(answer_text):
@@ -1755,6 +1941,15 @@ def run_chat_turn(
             )
             if not provider_used or provider_used == "Deterministic Offline Engine":
                 provider_used = "Deterministic Offline Engine"
+
+        # Truthfulness check: if AI claims boundaries/borders were drawn when show_map did NOT draw them, replace with exact tool summary!
+        if map_results_holder:
+            last_map = map_results_holder[-1]
+            if _BOUNDARY_CLAIM_RE.search(answer_text) and int(last_map.get("boundaries_drawn", 0)) == 0:
+                logger.warning("Replaced untruthful map boundary description with exact show_map tool summary")
+                answer_text = last_map["summary_text"]
+        elif _BOUNDARY_CLAIM_RE.search(answer_text) and asked_for_map:
+            answer_text = "No map was rendered for this reply."
     except Exception as exc:
         logger.exception("Ask AquaGrid chat turn failed for message: %s", cleaned[:160])
         providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
