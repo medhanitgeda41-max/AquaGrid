@@ -54,6 +54,7 @@ _ensure_callable_param("agent.chat_assistant", "run_chat_turn", "status_callback
 _ensure_callable_param("agent.chat_assistant", "run_scenario_for_chat", "status_callback")
 _ensure_callable_param("agent.chat_assistant", "run_production_planner_for_chat", "status_callback")
 _ensure_module_attr("components.badges", "get_sim_step_lock")
+_ensure_module_attr("components.digital_twin_3d", "render_3d_digital_twin")
 _ensure_module_attr("components.chat_widgets", "render_chat_widget")
 _ensure_module_attr("components.header", "render_header")
 _ensure_module_attr("components.ai_prompt_panel", "queue_scenario_request")

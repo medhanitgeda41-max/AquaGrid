@@ -11,6 +11,7 @@ from database.connection import get_db_connection
 from guards.injection_filter import detect_injection
 from tools.write_gateway import execute_human_approval, execute_human_rejection
 from components.badges import format_dubai_time, status_badge
+from components.digital_twin_3d import render_3d_digital_twin
 from components.leak_map_view import build_leak_folium_map
 from components.telemetry_view import _build_reservoir_chart
 
@@ -72,6 +73,27 @@ def render_inline_map(
         highlight_sector = None
     else:
         highlight_sector = norm_sector
+
+    # "2D Map / 3D View" toggle so operators can inspect either the 2D OSM map or the 3D digital twin
+    view_mode = st.radio(
+        "Map View",
+        options=["2D Map", "3D View"],
+        index=0,
+        horizontal=True,
+        key=f"map_view_mode_{widget_key}",
+        label_visibility="collapsed",
+    )
+
+    if view_mode == "3D View":
+        focus_arg = leak_id or highlight_sector or "all"
+        render_3d_digital_twin(
+            focus=focus_arg,
+            widget_key=f"inline3d_{widget_key}",
+            height=430,
+            current_hour=DEFAULT_SCADA_HOUR,
+            show_controls=True,
+        )
+        return
 
     # Compact layer toggles (OpenStreetMap is the only basemap)
     t1, t2, t3, t4, t5 = st.columns([1.3, 0.9, 1.0, 0.9, 0.9])
