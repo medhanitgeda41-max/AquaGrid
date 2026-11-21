@@ -12,7 +12,7 @@ from digital_twin.hydraulics import simulate_valve_change_impact
 from guards.injection_filter import detect_injection
 from tools.write_gateway import execute_human_approval, execute_human_rejection
 from components.badges import format_dubai_time, status_badge
-from components.digital_twin_3d import render_3d_digital_twin
+from components.digital_twin_3d import render_3d_digital_twin, set_twin_view
 from components.leak_map_view import build_leak_folium_map
 from components.telemetry_view import _build_reservoir_chart
 
@@ -562,20 +562,12 @@ def render_inline_approvals(widget_key: str) -> None:
                 <div style="margin-top:0.2rem; font-size:0.8rem; color:#94A3B8;">
                     Safety check: PASS at staging · Clicking Approve re-checks safety floor, water quality &amp; freshness and consumes a single-use token.
                 </div>
+                <div style="margin-top:0.25rem; font-size:0.79rem; color:#38BDF8;">
+                    &rarr; {html.escape(preview['focus'])} &amp; affected downstream pipes shown in the 3D view above
+                </div>
             </div>
             """,
             unsafe_allow_html=True,
-        )
-
-        # Compact 3D preview showing affected valve / asset and highlighted downstream pipes
-        render_3d_digital_twin(
-            focus=preview["focus"],
-            widget_key=f"ap_prev_{widget_key}_{action_id}",
-            height=240,
-            current_hour=DEFAULT_SCADA_HOUR,
-            highlight_pipe_ids=preview["highlight_pipe_ids"],
-            show_controls=False,
-            preserve_camera=False,
         )
 
         c1, c2, _ = st.columns([1.0, 1.0, 2.5])
@@ -585,8 +577,28 @@ def render_inline_approvals(widget_key: str) -> None:
                 st_code = res.get("status", "UNKNOWN")
                 decision_widgets: list[dict] = []
                 if st_code == "EXECUTED":
-                    impact_note = f" ({'; '.join(flow_lines[:2])})" if flow_lines else ""
-                    msg_txt = f"**Action #{action_id} ({action_type} {target_id}) `EXECUTED`** by `{res.get('approver')}`: {res.get('details', '')}{impact_note}"
+                    if action_type == "CLOSE_VALVE":
+                        evt_type = "valve_close"
+                        short_ev = f"{target_id} closed — {flow_lines[0]}" if flow_lines else f"{target_id} closed"
+                    elif action_type == "OPEN_VALVE":
+                        evt_type = "valve_open"
+                        short_ev = f"{target_id} opened — {flow_lines[0]}" if flow_lines else f"{target_id} opened"
+                    elif action_type == "SET_PLANT_OUTPUT":
+                        evt_type = "plant_change"
+                        short_ev = f"DESAL-01 output set to {prop_fmt}"
+                    else:
+                        evt_type = "isolate_flush"
+                        short_ev = f"{target_id} isolated and flushed"
+
+                    set_twin_view(
+                        st.session_state,
+                        focus=preview["focus"],
+                        event_type=evt_type,
+                        note=short_ev,
+                        highlight_pipe_ids=preview["highlight_pipe_ids"],
+                    )
+                    impact_note = f" — {'; '.join(flow_lines[:2])}" if flow_lines else ""
+                    msg_txt = f"**{short_ev}** (Action #{action_id} `{st_code}` by `{res.get('approver')}`{impact_note})"
                     decision_widgets.append({"type": "twin_3d", "focus": preview["focus"]})
                 else:
                     msg_txt = f"**Action #{action_id} `{st_code}`:** {res.get('reason') or res.get('message', '')}"
@@ -617,11 +629,17 @@ def render_inline_approvals(widget_key: str) -> None:
                     rejection_reason="Operator declined via chat approval card",
                     approver=operator_name,
                 )
+                set_twin_view(
+                    st.session_state,
+                    focus=preview["focus"],
+                    event_type="valve_reject",
+                    note="Rejected — no change",
+                )
                 st.session_state.setdefault("ask_aquagrid_messages", []).append(
                     {
                         "role": "assistant",
                         "kind": "decision",
-                        "content": f"**Action #{action_id} ({action_type} {target_id}) `REJECTED`** by `{res.get('approver')}`. No physical change made.",
+                        "content": f"**Action #{action_id} ({action_type} {target_id}) `REJECTED`** by `{res.get('approver')}`. Rejected — no change.",
                         "provider": f"HUMAN_OPERATOR ({operator_name})",
                         "tools_called": [],
                         "code_checks": [],
@@ -734,21 +752,15 @@ def render_inline_plan_table(horizon_hours: int, rows: list[dict]) -> None:
 
 
 def render_chat_widget(widget: dict, widget_key: str, snapshot: dict) -> None:
-    """Dispatch a single chat widget spec to its inline renderer."""
+    """Dispatch a single chat widget spec. 3D/2D spatial views render in the persistent top twin, with a short note in chat."""
     w_type = widget.get("type")
-    if w_type == "twin_3d":
-        render_inline_3d(
-            focus=widget.get("focus", "all"),
-            widget_key=widget_key,
-            snapshot=snapshot,
-        )
-    elif w_type == "map":
-        render_inline_map(
-            widget.get("sector"),
-            widget.get("leak_id"),
-            widget_key,
-            snapshot,
-            show_boundaries_default=bool(widget.get("show_boundaries", True)),
+    if w_type in ("twin_3d", "map"):
+        target_lbl = widget.get("focus") or widget.get("leak_id") or widget.get("sector") or "All 6 Sectors"
+        st.markdown(
+            f'<div style="font-size:0.82rem; color:#38BDF8; margin:0.2rem 0;">'
+            f'&rarr; shown in the 3D view above (<span class="ag-mono">{html.escape(str(target_lbl))}</span>)'
+            f'</div>',
+            unsafe_allow_html=True,
         )
     elif w_type == "chart":
         render_inline_chart(widget.get("metric", "reservoir"), widget.get("asset"), int(widget.get("hours", 24)), snapshot)

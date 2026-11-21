@@ -16,6 +16,7 @@ from config.settings import settings
 from simulator import get_simulator, simulator_step_lock
 from components.badges import status_badge
 from components.chat_widgets import render_chat_widget
+from components.digital_twin_3d import set_twin_view
 
 logger = logging.getLogger("aquagrid.ui.chat")
 
@@ -387,6 +388,18 @@ def _execute_pending_request(pending: dict, snapshot: dict, show_tech: bool) -> 
         reply["thinking_steps"] = steps_logged
         _sync_scenario_state(reply)
 
+        # If this reply updated the 3D digital twin view target, apply it to st.session_state["twin_view"]
+        tv = reply.get("twin_view")
+        if isinstance(tv, dict):
+            set_twin_view(
+                st.session_state,
+                focus=str(tv.get("focus") or "all"),
+                event_type=str(tv.get("event_type") or "focus"),
+                note=str(tv.get("note") or ""),
+                highlight_pipe_ids=tv.get("highlight_pipe_ids") or [],
+            )
+            st.session_state["_twin_needs_rerun"] = True
+
         messages = st.session_state.setdefault("ask_aquagrid_messages", [])
         new_msg_idx = len(messages)
         messages.append(reply)
@@ -402,10 +415,15 @@ def _execute_pending_request(pending: dict, snapshot: dict, show_tech: bool) -> 
     return True
 
 
-def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: dict | None = None) -> bool:
+def render_ask_aquagrid_chat(
+    display_hour: int = DEFAULT_SCADA_HOUR,
+    snapshot: dict | None = None,
+    chat_height: int = 360,
+) -> bool:
     """
-    Render full-width Ask AquaGrid chat interface with immediate user messages, live Thinking status,
-    word-by-word streaming, inline maps/charts/tables, and button-only approvals.
+    Render scrollable Ask AquaGrid chat below the persistent top 3D digital twin,
+    with immediate user messages, live Thinking status, word-by-word streaming,
+    inline charts/tables/approvals, and pinned chat input at the bottom.
     Returns True if a new chat/scenario turn was executed during this render pass.
     """
     snapshot = snapshot or {}
@@ -420,22 +438,7 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
     elif is_chat_generating(st.session_state) and not st.session_state.get("_pending_chat_request"):
         st.warning("Please wait for the current answer")
 
-    # Welcome prompt when conversation is empty
-    if not messages:
-        st.markdown(
-            """
-            <div class="scada-card" style="text-align:center; padding:1.25rem;">
-                <div style="font-size:1.15rem; font-weight:700; color:#F8FAFC;">Ask AquaGrid</div>
-                <div style="font-size:0.86rem; color:#94A3B8; margin-top:0.3rem;">
-                    Ask about live plant status, leaks, pressures, tariffs, schedules, past rejections, or propose a change.
-                    Physical actions are always checked by Python safety guards and staged for your button approval.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    # Compact example question buttons (ignored when an answer is already generating)
+    # Compact example question buttons
     ex_cols = st.columns(len(EXAMPLE_QUESTIONS))
     for idx, q_text in enumerate(EXAMPLE_QUESTIONS):
         with ex_cols[idx]:
@@ -443,43 +446,55 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
                 if not queue_chat_request(st.session_state, q_text, display_hour):
                     st.warning("Please wait for the current answer")
 
-    # Render full conversation history (includes any newly queued user message BEFORE calling the LLM!)
-    for msg_idx, msg in enumerate(messages):
-        role = msg.get("role", "assistant")
-        kind = msg.get("kind", "text")
-        avatar = "🚨" if kind == "alert" else None
+    # Scrollable chat history container so the persistent top 3D digital twin stays visible while chat scrolls
+    with st.container(height=chat_height):
+        if not messages:
+            st.markdown(
+                """
+                <div class="scada-card" style="text-align:center; padding:0.9rem;">
+                    <div style="font-size:1.05rem; font-weight:700; color:#F8FAFC;">Ask AquaGrid</div>
+                    <div style="font-size:0.84rem; color:#94A3B8; margin-top:0.2rem;">
+                        Ask about any sector, leak, valve, reservoir, desalination plant, tariff, or schedule — the 3D twin above responds automatically.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        with st.chat_message(role, avatar=avatar):
-            if role == "assistant":
-                _render_assistant_message_contents(
-                    msg=msg,
-                    msg_idx=msg_idx,
-                    snapshot=snapshot,
-                    show_tech=show_tech,
-                    stream_text=False,
-                )
-            else:
-                st.markdown(msg.get("content", ""))
+        for msg_idx, msg in enumerate(messages):
+            role = msg.get("role", "assistant")
+            kind = msg.get("kind", "text")
+            avatar = "🚨" if kind == "alert" else None
 
-    # Container right below conversation history for the active turn (live user bubble + live Thinking assistant)
-    live_turn_container = st.container()
+            with st.chat_message(role, avatar=avatar):
+                if role == "assistant":
+                    _render_assistant_message_contents(
+                        msg=msg,
+                        msg_idx=msg_idx,
+                        snapshot=snapshot,
+                        show_tech=show_tech,
+                        stream_text=False,
+                    )
+                else:
+                    st.markdown(msg.get("content", ""))
 
-    # If a sidebar Scenario Run or quick-question button queued a pending request, run it now with live status!
-    pending_top = st.session_state.get("_pending_chat_request")
-    if pending_top:
-        with live_turn_container:
-            executed_turn = _execute_pending_request(pending_top, snapshot, show_tech)
+        # Active turn container right at the bottom of the scrollable chat
+        live_turn_container = st.container()
 
-    # Chat input bar at bottom
+        pending_top = st.session_state.get("_pending_chat_request")
+        if pending_top:
+            with live_turn_container:
+                executed_turn = _execute_pending_request(pending_top, snapshot, show_tech)
+
+    # Chat input bar pinned at bottom
     user_typed = st.chat_input(
-        "Ask AquaGrid anything (e.g. 'Show Sector 4 on the map', 'Close V-12', 'Run scenario 2')...",
+        "Ask AquaGrid anything (e.g. 'show Sector 4', 'look inside the reservoir', 'show the desalination plant', 'close V-12')...",
         key="ask_aquagrid_chat_input",
     )
     if user_typed and user_typed.strip():
         cleaned_typed = user_typed.strip()
         if queue_chat_request(st.session_state, cleaned_typed, display_hour):
             with live_turn_container:
-                # Immediately show user message BEFORE calling the LLM
                 with st.chat_message("user"):
                     st.markdown(cleaned_typed)
                 executed_turn = _execute_pending_request(
@@ -488,8 +503,12 @@ def render_ask_aquagrid_chat(display_hour: int = DEFAULT_SCADA_HOUR, snapshot: d
                     show_tech,
                 )
         else:
-            with live_turn_container:
-                st.warning("Please wait for the current answer")
+            st.warning("Please wait for the current answer")
+
+    # If the completed turn updated the top 3D twin view (or DB state via scenario), rerun once so the
+    # persistent fixed-key twin at the top updates smoothly in place (no reload!).
+    if st.session_state.pop("_twin_needs_rerun", False):
+        st.rerun()
 
     return executed_turn
 

@@ -4,6 +4,7 @@ import streamlit as st
 
 from agent.chat_assistant import collect_system_alerts
 from components.ai_prompt_panel import queue_scenario_request
+from components.digital_twin_3d import set_twin_view
 from config.constants import DEFAULT_SCADA_HOUR
 from config.region_config import REGION_CONFIG
 from database.scenarios import get_scenarios_by_round, reset_database
@@ -45,6 +46,15 @@ def _render_sidebar_live_ticker() -> None:
         if new_msgs:
             st.session_state["_seen_alert_keys"] = updated
             st.session_state.setdefault("ask_aquagrid_messages", []).extend(new_msgs)
+            for am in new_msgs:
+                tv = am.get("twin_view")
+                if isinstance(tv, dict):
+                    set_twin_view(
+                        st.session_state,
+                        focus=str(tv.get("focus") or "all"),
+                        event_type=str(tv.get("event_type") or "live_alert"),
+                        note=str(tv.get("note") or ""),
+                    )
             st.rerun()
 
 
@@ -67,6 +77,7 @@ def _on_sidebar_reset() -> None:
     st.session_state["_seen_alert_keys"] = set()
     st.session_state["_chat_generating"] = False
     st.session_state["_pending_chat_request"] = None
+    set_twin_view(st.session_state, focus="all", event_type="reset", note="Database reset to baseline")
     st.session_state.setdefault("ask_aquagrid_messages", []).append(
         {
             "role": "assistant",
@@ -166,21 +177,8 @@ def render_sidebar() -> None:
 
         st.divider()
 
-        # ── 3D Digital Twin, Audit Log, Technical Details, Clear Chat ─────────
-        if st.button("Open 3D Digital Twin", key="btn_open_3d_twin", width="stretch"):
-            st.session_state.setdefault("ask_aquagrid_messages", []).append(
-                {
-                    "role": "assistant",
-                    "kind": "text",
-                    "content": "**3D Digital Twin** — Dubai Water Network (drag to rotate, scroll to zoom, hover assets for live values):",
-                    "provider": "3D Digital Twin",
-                    "tools_called": [{"tool": "show_3d", "args": {"focus": "all"}, "summary": "3D overview of all 6 sectors"}],
-                    "code_checks": [],
-                    "widgets": [{"type": "twin_3d", "focus": "all"}],
-                    "staged_action": None,
-                }
-            )
-            st.rerun()
+        # ── 2D Map toggle, Audit Log, Technical Details, Clear Chat ───────────
+        st.toggle("2D map", value=False, key="twin_show_2d_map")
 
         if st.button("Open Audit Log", key="btn_open_audit_log", width="stretch"):
             st.session_state.setdefault("ask_aquagrid_messages", []).append(

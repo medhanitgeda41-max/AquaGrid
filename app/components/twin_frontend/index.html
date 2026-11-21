@@ -1,0 +1,1851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AquaGrid Realistic 3D Digital Twin</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0B1220;
+    color: #F8FAFC;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  #ag-root {
+    position: relative;
+    width: 100%;
+    height: 450px;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #1E293B;
+    background: #0B1220;
+    transition: filter 0.35s ease;
+  }
+  #ag-root.telemetry-loss #ag-canvas-wrap {
+    filter: grayscale(0.92) brightness(0.68);
+  }
+  #ag-canvas-wrap {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+  #ag-labels {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: hidden;
+    z-index: 12;
+  }
+  .ag-label {
+    position: absolute;
+    transform: translate(-50%, -100%);
+    white-space: nowrap;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.84);
+    border: 1px solid rgba(148, 163, 184, 0.4);
+    color: #F8FAFC;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    user-select: none;
+  }
+  .ag-label-valve {
+    font-size: 9px;
+    padding: 1px 4px;
+    background: rgba(15, 23, 42, 0.78);
+  }
+  .ag-label-part {
+    font-size: 9.5px;
+    padding: 1px 5px;
+    background: rgba(15, 23, 42, 0.82);
+    border-color: #38BDF8;
+    color: #E0F2FE;
+  }
+  .ag-label-warn {
+    font-size: 10px;
+    padding: 1px 5px;
+    background: rgba(245, 158, 11, 0.94);
+    color: #0F172A;
+    border-color: #FEF3C7;
+  }
+  .ag-label-danger {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: rgba(220, 38, 38, 0.94);
+    color: #FFFFFF;
+    border-color: #FECACA;
+  }
+  #ag-hud-top {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    right: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    pointer-events: none;
+    z-index: 20;
+    gap: 8px;
+  }
+  .ag-pill {
+    pointer-events: auto;
+    background: rgba(15, 23, 42, 0.86);
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 11px;
+    color: #E2E8F0;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    backdrop-filter: blur(4px);
+  }
+  #ag-event-toast {
+    display: none;
+    position: absolute;
+    top: 46px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 28;
+    background: rgba(15, 23, 42, 0.94);
+    border: 1px solid #F59E0B;
+    color: #FEF3C7;
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.45);
+    pointer-events: none;
+  }
+  #ag-telemetry-overlay {
+    display: none;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 29;
+    background: rgba(127, 29, 29, 0.92);
+    border: 2px solid #EF4444;
+    color: #FEF2F2;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+    pointer-events: none;
+    text-align: center;
+  }
+  #ag-tooltip {
+    position: absolute;
+    display: none;
+    pointer-events: none;
+    z-index: 32;
+    max-width: 270px;
+    background: rgba(15, 23, 42, 0.95);
+    border: 1px solid #38BDF8;
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #F8FAFC;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+  }
+  #ag-legend {
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+    z-index: 20;
+    background: rgba(15, 23, 42, 0.88);
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 10px;
+    max-width: 205px;
+    color: #E2E8F0;
+  }
+  #ag-legend summary {
+    cursor: pointer;
+    font-weight: 700;
+    user-select: none;
+  }
+  .ag-leg-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 2px 0;
+  }
+  .ag-swatch {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+  #ag-fallback {
+    display: none;
+    position: absolute;
+    inset: 0;
+    flex-direction: column;
+    background: #0F172A;
+    z-index: 40;
+  }
+  #ag-fallback-banner {
+    padding: 8px 12px;
+    background: #1E293B;
+    border-bottom: 1px solid #334155;
+    font-size: 12px;
+    color: #FDE68A;
+  }
+  #ag-fallback-map {
+    flex: 1;
+    width: 100%;
+    height: 100%;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="ag-root">
+  <div id="ag-canvas-wrap"></div>
+  <div id="ag-labels"></div>
+  <div id="ag-hud-top">
+    <div class="ag-pill" id="ag-status-pill">
+      <strong>AquaGrid 3D Twin</strong> · <span id="ag-focus-label">Initializing...</span>
+    </div>
+    <div class="ag-pill" id="ag-meta-pill" style="font-size:10px; color:#94A3B8;">
+      Drag: rotate · Scroll: zoom · Right-drag: pan
+    </div>
+  </div>
+  <div id="ag-event-toast"></div>
+  <div id="ag-telemetry-overlay">TELEMETRY LOSS — holding last safe state</div>
+  <div id="ag-tooltip"></div>
+  <details id="ag-legend">
+    <summary>3D Legend</summary>
+    <div style="margin-top:4px; padding-top:4px; border-top:1px solid #334155;" id="ag-legend-body"></div>
+  </details>
+  <div id="ag-fallback">
+    <div id="ag-fallback-banner">
+      WebGL is unavailable in this browser — showing the 2D OpenStreetMap fallback view.
+    </div>
+    <div id="ag-fallback-map"></div>
+  </div>
+</div>
+
+<script>
+// ── Bidirectional Streamlit Component v1 Wire Protocol (zero reload across reruns) ──
+window.__AQUAGRID_LAST_ARGS__ = null;
+window.__AQUAGRID_RENDER_COUNT__ = 0;
+window.__AQUAGRID_ENGINE_READY__ = false;
+window.__AQUAGRID_PENDING_ARGS__ = null;
+
+function sendToStreamlit(type, data) {
+  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+}
+
+function detectWebGL(forceNoWebgl) {
+  if (forceNoWebgl) return false;
+  try {
+    const c = document.createElement('canvas');
+    return !!(window.WebGLRenderingContext && (c.getContext('webgl2') || c.getContext('webgl')));
+  } catch (e) {
+    return false;
+  }
+}
+
+let fallbackMounted = false;
+let fallbackLeafletMap = null;
+function render2DFallback(reasonMsg, sceneState) {
+  const fb = document.getElementById('ag-fallback');
+  const banner = document.getElementById('ag-fallback-banner');
+  if (reasonMsg) banner.textContent = reasonMsg;
+  fb.style.display = 'flex';
+  if (fallbackMounted) return;
+  fallbackMounted = true;
+
+  const state = sceneState || (window.__AQUAGRID_LAST_ARGS__ && window.__AQUAGRID_LAST_ARGS__.scene_state) || {};
+  const center = state.center_latlon || [25.1972, 55.2744];
+
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css';
+  document.head.appendChild(link);
+
+  const script = document.createElement('script');
+  script.src = 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js';
+  script.onload = () => {
+    try {
+      fallbackLeafletMap = L.map('ag-fallback-map').setView(center, 11);
+      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 18
+      }).addTo(fallbackLeafletMap);
+      const refLat = center[0], refLon = center[1];
+      const cosLat = Math.cos(refLat * Math.PI / 180);
+      const xzToLatLon = (x, z) => [refLat - z / 111320.0, refLon + x / (111320.0 * cosLat)];
+      const bounds = [];
+      (state.sectors || []).forEach(sec => {
+        const latlngs = (sec.polygon_xz || []).map(p => xzToLatLon(p[0], p[1]));
+        if (latlngs.length >= 3) {
+          L.polygon(latlngs, { color: sec.color, weight: 2.5, fillOpacity: 0.14 }).bindTooltip(sec.name).addTo(fallbackLeafletMap);
+          latlngs.forEach(ll => bounds.push(ll));
+        }
+      });
+      (state.pipes || []).forEach(pipe => {
+        const latlngs = (pipe.points_xz || []).map(p => xzToLatLon(p[0], p[1]));
+        if (latlngs.length >= 2) {
+          L.polyline(latlngs, { color: pipe.color, weight: pipe.is_trunk ? 4 : 2.5 }).bindTooltip(pipe.segment_id + ' (' + pipe.flow_lps + ' L/s)').addTo(fallbackLeafletMap);
+        }
+      });
+      if (bounds.length > 0) fallbackLeafletMap.fitBounds(bounds, { padding: [18, 18] });
+    } catch (err) {
+      banner.textContent = 'WebGL is unavailable; toggle "2D map" in the sidebar to inspect the network.';
+    }
+  };
+  document.head.appendChild(script);
+}
+window.render2DFallback = render2DFallback;
+
+window.addEventListener("message", (event) => {
+  if (!event.data || event.data.type !== "streamlit:render") return;
+  const args = event.data.args || {};
+  window.__AQUAGRID_LAST_ARGS__ = args;
+  window.__AQUAGRID_RENDER_COUNT__ += 1;
+
+  const h = Number(args.height || 450);
+  document.getElementById('ag-root').style.height = h + 'px';
+  sendToStreamlit("streamlit:setFrameHeight", { height: h + 2 });
+
+  if (!detectWebGL(!!args.force_no_webgl)) {
+    render2DFallback('WebGL is unavailable in this browser — showing the 2D OpenStreetMap fallback view.', args.scene_state);
+    return;
+  }
+  if (window.__AQUAGRID_APPLY_UPDATE__) {
+    window.__AQUAGRID_APPLY_UPDATE__(args);
+  } else {
+    window.__AQUAGRID_PENDING_ARGS__ = args;
+  }
+});
+
+// Signal readiness to Streamlit host
+sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+sendToStreamlit("streamlit:setFrameHeight", { height: 452 });
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+import { Water } from 'three/addons/objects/Water.js';
+
+// ── Procedural Canvas Textures (zero external texture URLs needed) ──
+function createWaterNormalsTexture() {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = (x / size) * Math.PI * 2;
+      const v = (y / size) * Math.PI * 2;
+      const dx = Math.cos(u * 4 + Math.sin(v * 3)) * 0.45 + Math.cos(u * 9 - v * 5) * 0.2;
+      const dy = Math.sin(v * 5 + Math.cos(u * 4)) * 0.45 + Math.sin(v * 8 + u * 6) * 0.2;
+      const idx = (y * size + x) * 4;
+      img.data[idx]     = Math.floor((dx * 0.5 + 0.5) * 255);
+      img.data[idx + 1] = Math.floor((dy * 0.5 + 0.5) * 255);
+      img.data[idx + 2] = 255;
+      img.data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+function createBuildingWindowTexture(isEvening) {
+  const w = 128, h = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = isEvening ? '#1E293B' : '#94A3B8';
+  ctx.fillRect(0, 0, w, h);
+  let seed = isEvening ? 1337 : 4242;
+  const nextRand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+  for (let row = 6; row < h - 8; row += 14) {
+    for (let col = 6; col < w - 8; col += 12) {
+      const r = nextRand();
+      if (isEvening) {
+        ctx.fillStyle = r < 0.58 ? '#FDE68A' : (r < 0.72 ? '#BAE6FD' : '#0F172A');
+      } else {
+        ctx.fillStyle = r < 0.65 ? '#CBD5E1' : '#334155';
+      }
+      ctx.fillRect(col, row, 7, 9);
+    }
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+// ── Persistent Scene Engine (mounted ONCE, updated in place forever!) ──
+const engine = {
+  initialized: false,
+  renderer: null,
+  scene: null,
+  camera: null,
+  controls: null,
+  sunLight: null,
+  hemiLight: null,
+  sky: null,
+  seaWater: null,
+  simpleSea: null,
+  waterNormals: null,
+  dayWinTex: null,
+  eveWinTex: null,
+  buildingInst: null,
+  buildingMat: null,
+  treeTrunksInst: null,
+  treeCrownsInst: null,
+  staticCityBuiltQuality: null,
+  lastHourEvening: null,
+  lastCommandSeq: -1,
+  lastQuality: 'High',
+  scale: 0.01,
+  hoverables: [],
+  labelAnchors: [],
+  // Dynamic registries updated in place without reload
+  sectorMap: {},     // name -> { zoneMesh, borderLine, labelEl, fireGroup, fireLblEl, baseColor, nonCompliant }
+  pipeMap: {},       // segment_id -> { tube, mat, curve, activeColor, dryColor, prevFlow, targetFlow, currentFlow, animStart, particles }
+  flowInst: null,
+  flowTracks: [],
+  valveMap: {},      // valve_id -> { group, wheelGroup, wheelMat, hit, labelEl, status, anim }
+  sensorMap: {},     // sensor_id -> { mesh, warnLabelEl }
+  leakMap: {},       // leak_id -> { group, core, ring, puddle, puddleMat, sprayDrops, labelEl, isActive, isolatedAt }
+  plantRig: null,    // detailed DESAL-01 rig
+  resRig: null,      // detailed RES-01 Look-Inside rig
+  supplyTrack: null,
+  flyAnim: null,
+  toastTimeout: null,
+  clock: new THREE.Clock(),
+  prevTime: 0,
+  prevState: null,
+};
+
+function showEventToast(text, durationMs = 3400) {
+  const el = document.getElementById('ag-event-toast');
+  if (!text) return;
+  el.textContent = text;
+  el.style.display = 'block';
+  if (engine.toastTimeout) clearTimeout(engine.toastTimeout);
+  engine.toastTimeout = setTimeout(() => { el.style.display = 'none'; }, durationMs);
+}
+
+function registerLabel(text, worldPos, clsName = 'ag-label', borderColor = null, maxDist = Infinity) {
+  const el = document.createElement('div');
+  el.className = clsName;
+  el.textContent = text;
+  if (borderColor) el.style.borderColor = borderColor;
+  document.getElementById('ag-labels').appendChild(el);
+  const rec = { el, pos: worldPos.clone(), visible: true, maxDist: maxDist, alwaysShow: false };
+  engine.labelAnchors.push(rec);
+  return rec;
+}
+
+function easeOutCubic(x) {
+  const c = Math.max(0, Math.min(1, x));
+  return 1 - Math.pow(1 - c, 3);
+}
+
+function initEngine(state, quality) {
+  const container = document.getElementById('ag-canvas-wrap');
+  const lowQ = quality === 'Low';
+  engine.scale = 1.0 / (state.scale_m_per_unit || 100.0);
+  const S = engine.scale;
+
+  // Renderer
+  const renderer = new THREE.WebGLRenderer({ antialias: !lowQ, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, lowQ ? 1.2 : 1.85));
+  renderer.setSize(container.clientWidth || 800, container.clientHeight || 450);
+  renderer.shadowMap.enabled = !lowQ;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 0.65;
+  container.appendChild(renderer.domElement);
+  engine.renderer = renderer;
+
+  // Scene & Fog (coastal sky-blue haze)
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color('#1B365D');
+  scene.fog = new THREE.FogExp2('#23426B', 0.00085);
+  engine.scene = scene;
+
+  // Camera & OrbitControls
+  const camera = new THREE.PerspectiveCamera(44, (container.clientWidth || 800) / (container.clientHeight || 450), 0.3, 2200);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.075;
+  controls.maxPolarAngle = Math.PI * 0.49;
+  controls.minDistance = 4.5;
+  controls.maxDistance = 540;
+  engine.camera = camera;
+  engine.controls = controls;
+
+  const camSpec = state.camera_target || { target_xz: [0, 1200], target_y: 0, position_xyz: [-14500, 12800, 16200] };
+  camera.position.set(camSpec.position_xyz[0] * S, camSpec.position_xyz[1] * S, camSpec.position_xyz[2] * S);
+  controls.target.set(camSpec.target_xz[0] * S, (camSpec.target_y || 0) * S, camSpec.target_xz[1] * S);
+  controls.update();
+
+  // Lighting: DirectionalLight with soft shadows + HemisphereLight
+  const hemi = new THREE.HemisphereLight('#BAE6FD', '#334155', 0.95);
+  scene.add(hemi);
+  engine.hemiLight = hemi;
+
+  const sun = new THREE.DirectionalLight('#FFF7ED', 1.5);
+  sun.position.set(130, 190, 95);
+  sun.castShadow = !lowQ;
+  sun.shadow.mapSize.width = 1024;
+  sun.shadow.mapSize.height = 1024;
+  sun.shadow.camera.near = 20;
+  sun.shadow.camera.far = 650;
+  const d = 190;
+  sun.shadow.camera.left = -d; sun.shadow.camera.right = d;
+  sun.shadow.camera.top = d; sun.shadow.camera.bottom = -d;
+  sun.shadow.bias = -0.0005;
+  scene.add(sun);
+  engine.sunLight = sun;
+
+  // Realistic Sky addon
+  const sky = new Sky();
+  sky.scale.setScalar(2000);
+  const skyUniforms = sky.material.uniforms;
+  skyUniforms['turbidity'].value = 3.2;
+  skyUniforms['rayleigh'].value = 2.0;
+  skyUniforms['mieCoefficient'].value = 0.004;
+  skyUniforms['mieDirectionalG'].value = 0.78;
+  sky.visible = !lowQ;
+  scene.add(sky);
+  engine.sky = sky;
+
+  // Ground Plane (coastal desert-urban base)
+  const land = new THREE.Mesh(
+    new THREE.PlaneGeometry(820, 820),
+    new THREE.MeshStandardMaterial({ color: '#273549', roughness: 0.90, metalness: 0.04 })
+  );
+  land.rotation.x = -Math.PI / 2;
+  land.position.y = -0.18;
+  land.receiveShadow = true;
+  scene.add(land);
+
+  const grid = new THREE.GridHelper(520, 52, '#334E68', '#1E3148');
+  grid.position.y = -0.10;
+  scene.add(grid);
+
+  // Western Coastal Sea (Water addon with normalized UVs for smooth Gulf turquoise ripples)
+  engine.waterNormals = createWaterNormalsTexture();
+  const coastPts = (state.coastline_xz || []).map(p => [p[0] * S, p[1] * S]);
+  if (coastPts.length >= 2) {
+    const seaShape = new THREE.Shape();
+    seaShape.moveTo(-420, -coastPts[0][1]);
+    for (const [cx, cz] of coastPts) seaShape.lineTo(cx, -cz);
+    seaShape.lineTo(-420, -coastPts[coastPts.length - 1][1]);
+    seaShape.closePath();
+
+    const seaGeo = new THREE.ShapeGeometry(seaShape);
+    // Normalize ShapeGeometry UVs from world coordinates into smooth 0..1 water-tile space
+    const uvAttr = seaGeo.attributes.uv;
+    if (uvAttr) {
+      for (let i = 0; i < uvAttr.count; i++) {
+        uvAttr.setXY(i, uvAttr.getX(i) * 0.008, uvAttr.getY(i) * 0.008);
+      }
+      uvAttr.needsUpdate = true;
+    }
+    const seaWater = new Water(seaGeo, {
+      textureWidth: 256,
+      textureHeight: 256,
+      waterNormals: engine.waterNormals,
+      sunDirection: new THREE.Vector3(0.45, 0.75, 0.35).normalize(),
+      sunColor: 0xbae6fd,
+      waterColor: 0x0369a1,
+      distortionScale: 1.8,
+      alpha: 0.68,
+      fog: true
+    });
+    if (seaWater.material && seaWater.material.uniforms && seaWater.material.uniforms['size']) {
+      seaWater.material.uniforms['size'].value = 9.0;
+    }
+    seaWater.rotation.x = -Math.PI / 2;
+    seaWater.position.y = 0.01;
+    seaWater.visible = !lowQ;
+    scene.add(seaWater);
+    engine.seaWater = seaWater;
+
+    // Deep Arabian Gulf seabed under semi-transparent Water ripples (also serves as Low quality sea)
+    const simpleSea = new THREE.Mesh(
+      seaGeo,
+      new THREE.MeshStandardMaterial({ color: '#075985', roughness: 0.35, metalness: 0.25 })
+    );
+    simpleSea.rotation.x = -Math.PI / 2;
+    simpleSea.position.y = -0.04;
+    simpleSea.visible = true;
+    scene.add(simpleSea);
+    engine.simpleSea = simpleSea;
+
+    // Sandy beach / seawall promenade along coastline
+    const shoreCurve = new THREE.CatmullRomCurve3(coastPts.map(([cx, cz]) => new THREE.Vector3(cx, 0.06, cz)));
+    const shoreMesh = new THREE.Mesh(
+      new THREE.TubeGeometry(shoreCurve, 48, 0.95, 7, false),
+      new THREE.MeshStandardMaterial({ color: '#C8B088', roughness: 0.88 })
+    );
+    shoreMesh.receiveShadow = true;
+    scene.add(shoreMesh);
+  }
+
+  // Procedural window textures (day & lit evening)
+  engine.dayWinTex = createBuildingWindowTexture(false);
+  engine.eveWinTex = createBuildingWindowTexture(true);
+
+  // Build Sectors, Roads, Parks, Buildings & Trees
+  buildStaticEnvironment(state, lowQ);
+
+  // Build Detailed DESAL-01 Coastal Desalination Plant
+  buildDesalinationPlant(state);
+
+  // Build Detailed RES-01 Look-Inside Reservoir Tank
+  buildReservoirLookInside(state);
+
+  // Build Metallic Pipes with Flanges & Flow Particle Pool
+  buildPipesAndParticles(state, lowQ);
+
+  // Build Detailed Valve Bodies with Handwheels
+  buildValves(state);
+
+  // Build Sensors
+  buildSensors(state);
+
+  // Build Legend
+  const legendBody = document.getElementById('ag-legend-body');
+  legendBody.innerHTML = (state.sectors || []).map(s =>
+    `<div class="ag-leg-row"><span class="ag-swatch" style="background:${s.color}55; border:2px solid ${s.color};"></span><span><strong>${s.name}</strong> (${s.color_name})</span></div>`
+  ).join('') +
+  `<div style="margin-top:4px; padding-top:4px; border-top:1px solid #334155;">
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#22C55E; border-radius:50%;"></span><span>Valve OPEN · <span style="color:#EF4444;">●</span> CLOSED</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#38BDF8; border-radius:50%;"></span><span>Sensor · ⚠ Quarantined</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#EF4444; border-radius:50%;"></span><span>Leak Spray &amp; Puddle</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#FFFFFF;"></span><span>Tank Rings: Cur · <span style="color:#FACC15;">+5%</span> · <span style="color:#F97316;">Dyn</span> · <span style="color:#EF4444;">35%</span></span></div>
+  </div>`;
+
+  // Hover Raycaster Tooltips
+  const raycaster = new THREE.Raycaster();
+  const pointer = new THREE.Vector2(-99, -99);
+  const tooltipEl = document.getElementById('ag-tooltip');
+  renderer.domElement.addEventListener('pointermove', (ev) => {
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, camera);
+    const hits = raycaster.intersectObjects(engine.hoverables, false);
+    if (hits.length > 0 && hits[0].object.userData.tooltip) {
+      tooltipEl.innerHTML = hits[0].object.userData.tooltip;
+      tooltipEl.style.display = 'block';
+      tooltipEl.style.left = Math.min(rect.width - 275, Math.max(8, ev.clientX - rect.left + 12)) + 'px';
+      tooltipEl.style.top = Math.min(rect.height - 96, Math.max(8, ev.clientY - rect.top + 12)) + 'px';
+    } else {
+      tooltipEl.style.display = 'none';
+    }
+  });
+  renderer.domElement.addEventListener('pointerleave', () => { tooltipEl.style.display = 'none'; });
+
+  // Cancel active camera fly-to if the user manually grabs the camera
+  controls.addEventListener('start', () => { engine.flyAnim = null; });
+
+  window.addEventListener('resize', () => {
+    const w = container.clientWidth || 800;
+    const h = container.clientHeight || 450;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+  });
+
+  engine.initialized = true;
+  startAnimationLoop();
+}
+
+function buildStaticEnvironment(state, lowQ) {
+  const S = engine.scale;
+  const scene = engine.scene;
+
+  // 1. Sector zones + fire emergency beacons
+  (state.sectors || []).forEach(sec => {
+    const poly = sec.polygon_xz || [];
+    if (poly.length < 3) return;
+    const shape = new THREE.Shape();
+    shape.moveTo(poly[0][0] * S, -poly[0][1] * S);
+    for (let i = 1; i < poly.length; i++) shape.lineTo(poly[i][0] * S, -poly[i][1] * S);
+    shape.closePath();
+
+    const zoneMat = new THREE.MeshBasicMaterial({
+      color: sec.color,
+      transparent: true,
+      opacity: 0.16,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    });
+    const zoneMesh = new THREE.Mesh(new THREE.ShapeGeometry(shape), zoneMat);
+    zoneMesh.rotation.x = -Math.PI / 2;
+    zoneMesh.position.y = 0.05;
+    scene.add(zoneMesh);
+    engine.hoverables.push(zoneMesh);
+
+    const borderPts = poly.map(p => new THREE.Vector3(p[0] * S, 0.14, p[1] * S));
+    const borderMat = new THREE.LineBasicMaterial({ color: sec.color, transparent: true, opacity: 0.92 });
+    const borderLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(borderPts), borderMat);
+    scene.add(borderLine);
+
+    const cx = sec.centroid_xz[0] * S;
+    const cz = sec.centroid_xz[1] * S;
+    const lblRec = registerLabel(sec.name, new THREE.Vector3(cx, 7.0, cz), 'ag-label', sec.color);
+
+    // Fire Emergency Marker (shown in Sector 6 during U-5.2)
+    const fireGroup = new THREE.Group();
+    fireGroup.position.set(cx + 2.2, 1.5, cz - 1.5);
+    const flameOuter = new THREE.Mesh(
+      new THREE.ConeGeometry(1.4, 3.6, 12),
+      new THREE.MeshStandardMaterial({ color: '#F97316', emissive: '#EA580C', emissiveIntensity: 1.2, transparent: true, opacity: 0.9 })
+    );
+    flameOuter.position.y = 1.8;
+    const flameInner = new THREE.Mesh(
+      new THREE.ConeGeometry(0.75, 2.3, 10),
+      new THREE.MeshBasicMaterial({ color: '#FEF08A' })
+    );
+    flameInner.position.y = 1.2;
+    fireGroup.add(flameOuter, flameInner);
+    fireGroup.visible = false;
+    scene.add(fireGroup);
+    const fireLbl = registerLabel('🔥 FIRE EMERGENCY (S6)', new THREE.Vector3(cx + 2.2, 6.2, cz - 1.5), 'ag-label ag-label-danger');
+    fireLbl.visible = false;
+    fireLbl.el.style.display = 'none';
+
+    engine.sectorMap[sec.name] = {
+      zoneMesh, zoneMat, borderLine, borderMat, lblRec, fireGroup, fireLbl,
+      baseColor: new THREE.Color(sec.color),
+      nonCompliant: false,
+      hasFire: false
+    };
+  });
+
+  // 2. Roads between blocks & community parks
+  const roadMat = new THREE.MeshStandardMaterial({ color: '#1E293B', roughness: 0.95 });
+  (state.roads || []).forEach(rd => {
+    const x1 = rd.start_xz[0] * S, z1 = rd.start_xz[1] * S;
+    const x2 = rd.end_xz[0] * S, z2 = rd.end_xz[1] * S;
+    const len = Math.hypot(x2 - x1, z2 - z1);
+    if (len < 0.5) return;
+    const rMesh = new THREE.Mesh(new THREE.BoxGeometry(len, 0.06, Math.max(0.45, (rd.width_m || 60) * S)), roadMat);
+    rMesh.position.set((x1 + x2) * 0.5, 0.02, (z1 + z2) * 0.5);
+    rMesh.rotation.y = -Math.atan2(z2 - z1, x2 - x1);
+    rMesh.receiveShadow = true;
+    scene.add(rMesh);
+  });
+
+  const parkMat = new THREE.MeshStandardMaterial({ color: '#14532D', roughness: 0.95 });
+  (state.parks || []).forEach(pk => {
+    const pMesh = new THREE.Mesh(new THREE.CircleGeometry(Math.max(1.5, pk.radius_m * S), 18), parkMat);
+    pMesh.rotation.x = -Math.PI / 2;
+    pMesh.position.set(pk.x * S, 0.04, pk.z * S);
+    pMesh.receiveShadow = true;
+    scene.add(pMesh);
+  });
+
+  // 3. Instanced Procedural Buildings & Trees
+  rebuildCityInstances(state, lowQ);
+}
+
+function rebuildCityInstances(state, lowQ) {
+  const S = engine.scale;
+  const scene = engine.scene;
+  if (engine.buildingInst) { scene.remove(engine.buildingInst); engine.buildingInst.dispose(); engine.buildingInst = null; }
+  if (engine.treeTrunksInst) { scene.remove(engine.treeTrunksInst); engine.treeTrunksInst.dispose(); engine.treeTrunksInst = null; }
+  if (engine.treeCrownsInst) { scene.remove(engine.treeCrownsInst); engine.treeCrownsInst.dispose(); engine.treeCrownsInst = null; }
+
+  const isEvening = (state.current_hour >= 18 || state.current_hour < 6);
+  const buildings = state.buildings || [];
+  if (buildings.length > 0) {
+    const bMat = new THREE.MeshStandardMaterial({
+      map: isEvening ? engine.eveWinTex : engine.dayWinTex,
+      emissive: isEvening ? new THREE.Color('#F59E0B') : new THREE.Color('#000000'),
+      emissiveMap: isEvening ? engine.eveWinTex : null,
+      emissiveIntensity: isEvening ? 0.55 : 0.0,
+      roughness: 0.62,
+      metalness: 0.25
+    });
+    const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), bMat, buildings.length);
+    inst.castShadow = !lowQ;
+    inst.receiveShadow = true;
+    const dummy = new THREE.Object3D();
+    const tmpCol = new THREE.Color();
+    buildings.forEach((b, idx) => {
+      const w = Math.max(0.8, b.w * S);
+      const d = Math.max(0.8, b.d * S);
+      const h = Math.max(0.9, b.h * S);
+      dummy.position.set(b.x * S, h * 0.5, b.z * S);
+      dummy.scale.set(w, h, d);
+      dummy.updateMatrix();
+      inst.setMatrixAt(idx, dummy.matrix);
+      tmpCol.set(b.base_hex || '#475569').lerp(new THREE.Color(b.color || '#64748B'), 0.22);
+      inst.setColorAt(idx, tmpCol);
+    });
+    inst.instanceMatrix.needsUpdate = true;
+    if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+    scene.add(inst);
+    engine.buildingInst = inst;
+    engine.buildingMat = bMat;
+  }
+
+  const trees = state.trees || [];
+  if (trees.length > 0) {
+    const trunks = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(0.12, 0.16, 0.7, 6),
+      new THREE.MeshStandardMaterial({ color: '#78350F', roughness: 0.95 }),
+      trees.length
+    );
+    const crowns = new THREE.InstancedMesh(
+      new THREE.ConeGeometry(0.65, 1.5, 7),
+      new THREE.MeshStandardMaterial({ color: '#15803D', roughness: 0.85 }),
+      trees.length
+    );
+    const dummy = new THREE.Object3D();
+    trees.forEach((tr, idx) => {
+      const sc = tr.scale || 1.0;
+      dummy.position.set(tr.x * S, 0.35 * sc, tr.z * S);
+      dummy.scale.setScalar(sc);
+      dummy.updateMatrix();
+      trunks.setMatrixAt(idx, dummy.matrix);
+
+      dummy.position.set(tr.x * S, 1.35 * sc, tr.z * S);
+      dummy.updateMatrix();
+      crowns.setMatrixAt(idx, dummy.matrix);
+    });
+    trunks.instanceMatrix.needsUpdate = true;
+    crowns.instanceMatrix.needsUpdate = true;
+    scene.add(trunks, crowns);
+    engine.treeTrunksInst = trunks;
+    engine.treeCrownsInst = crowns;
+  }
+
+  engine.staticCityBuiltQuality = lowQ ? 'Low' : 'High';
+  engine.lastHourEvening = isEvening;
+}
+
+function buildDesalinationPlant(state) {
+  const S = engine.scale;
+  const pl = state.plant || { id: 'DESAL-01', pos_xz: [-13000, 11000], output_mld: 100, max_capacity_mld: 120, algae_cap_mld: 120, intakes: [] };
+  const px = pl.pos_xz[0] * S, pz = pl.pos_xz[1] * S;
+  const g = new THREE.Group();
+  g.position.set(px, 0, pz);
+
+  // Concrete coastal pad
+  const pad = new THREE.Mesh(
+    new THREE.BoxGeometry(15.5, 0.35, 11.5),
+    new THREE.MeshStandardMaterial({ color: '#334155', roughness: 0.88 })
+  );
+  pad.position.set(0.6, 0.18, 0);
+  pad.receiveShadow = true;
+  g.add(pad);
+
+  // 1. Twin Seawater Intake Pipes from West Sea (Intake 1 & Intake 2)
+  const intake1Mat = new THREE.MeshStandardMaterial({ color: '#0284C7', roughness: 0.3, metalness: 0.55 });
+  const intake1 = new THREE.Mesh(new THREE.CylinderGeometry(0.36, 0.36, 9.5, 12), intake1Mat);
+  intake1.rotation.z = Math.PI / 2;
+  intake1.position.set(-7.6, 0.65, -2.4);
+  intake1.userData.tooltip = '<strong>Intake 1 (DESAL-01)</strong><br/>Status: ACTIVE';
+  g.add(intake1);
+  engine.hoverables.push(intake1);
+
+  const intake2Mat = new THREE.MeshStandardMaterial({ color: '#0284C7', roughness: 0.3, metalness: 0.55 });
+  const intake2 = new THREE.Mesh(new THREE.CylinderGeometry(0.36, 0.36, 9.5, 12), intake2Mat);
+  intake2.rotation.z = Math.PI / 2;
+  intake2.position.set(-7.6, 0.65, 2.0);
+  intake2.userData.tooltip = '<strong>Intake 2 (DESAL-01)</strong><br/>Status: ACTIVE';
+  g.add(intake2);
+  engine.hoverables.push(intake2);
+
+  // Green algae plume patch around Intake 2 (visible during algal bloom!)
+  const algaePlume = new THREE.Mesh(
+    new THREE.CircleGeometry(3.2, 20),
+    new THREE.MeshBasicMaterial({ color: '#16A34A', transparent: true, opacity: 0.58, side: THREE.DoubleSide })
+  );
+  algaePlume.rotation.x = -Math.PI / 2;
+  algaePlume.position.set(-10.5, 0.12, 2.0);
+  algaePlume.visible = false;
+  g.add(algaePlume);
+
+  // Brine outfall pipe back to sea (south side)
+  const outfall = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.28, 0.28, 8.8, 10),
+    new THREE.MeshStandardMaterial({ color: '#64748B', roughness: 0.45, metalness: 0.6 })
+  );
+  outfall.rotation.z = Math.PI / 2;
+  outfall.position.set(-7.4, 0.42, 4.4);
+  outfall.userData.tooltip = '<strong>Brine Outfall Pipe</strong><br/>Returns concentrated brine safely offshore.';
+  g.add(outfall);
+  engine.hoverables.push(outfall);
+
+  // 2. Pre-treatment Clarifier Tanks
+  const pretreatMat = new THREE.MeshStandardMaterial({ color: '#64748B', roughness: 0.55, metalness: 0.25 });
+  [-2.2, 1.8].forEach(zOff => {
+    const tank = new THREE.Mesh(new THREE.CylinderGeometry(1.6, 1.6, 2.0, 20), pretreatMat);
+    tank.position.set(-3.6, 1.2, zOff);
+    tank.castShadow = true;
+    tank.userData.tooltip = '<strong>Pre-treatment Tanks</strong><br/>Ultrafiltration &amp; media clarifiers.';
+    g.add(tank);
+    engine.hoverables.push(tank);
+    const waterTop = new THREE.Mesh(
+      new THREE.CircleGeometry(1.42, 18),
+      new THREE.MeshStandardMaterial({ color: '#0EA5E9', roughness: 0.2, metalness: 0.2 })
+    );
+    waterTop.rotation.x = -Math.PI / 2;
+    waterTop.position.set(-3.6, 2.22, zOff);
+    g.add(waterTop);
+  });
+
+  // 3. Reverse-Osmosis (RO) Hall with visible rows of Pressure Vessels
+  const roGlassMat = new THREE.MeshPhysicalMaterial({
+    color: '#93C5FD',
+    transparent: true,
+    opacity: 0.28,
+    roughness: 0.12,
+    metalness: 0.1,
+    transmission: 0.55
+  });
+  const roShell = new THREE.Mesh(new THREE.BoxGeometry(5.6, 3.1, 6.2), roGlassMat);
+  roShell.position.set(1.0, 1.75, -0.3);
+  roShell.userData.tooltip = '<strong>RO Hall (Pressure Vessels)</strong><br/>Reverse-osmosis membrane trains.';
+  g.add(roShell);
+  engine.hoverables.push(roShell);
+
+  const vesselMat = new THREE.MeshStandardMaterial({ color: '#E2E8F0', roughness: 0.28, metalness: 0.72 });
+  for (let row = 0; row < 4; row++) {
+    for (let tier = 0; tier < 2; tier++) {
+      const pv = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 4.4, 10), vesselMat);
+      pv.rotation.z = Math.PI / 2;
+      pv.position.set(1.0, 0.95 + tier * 0.78, -2.2 + row * 1.25);
+      g.add(pv);
+    }
+  }
+
+  // 4. High-Pressure Pumps (rotating glowing pump skids; speed scales with MLD!)
+  const pumpRotors = [];
+  const pumpMat = new THREE.MeshStandardMaterial({ color: '#38BDF8', emissive: '#0284C7', emissiveIntensity: 0.75, metalness: 0.6, roughness: 0.25 });
+  for (let i = 0; i < 3; i++) {
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.95, 0.95), new THREE.MeshStandardMaterial({ color: '#1E293B', metalness: 0.65, roughness: 0.35 }));
+    body.position.set(5.0, 0.85, -2.1 + i * 1.9);
+    body.userData.tooltip = '<strong>High-Pressure RO Pumps</strong><br/>Pump speed follows DESAL-01 output (MLD).';
+    g.add(body);
+    engine.hoverables.push(body);
+
+    const rotor = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.10, 8, 16), pumpMat);
+    rotor.position.set(5.0, 1.55, -2.1 + i * 1.9);
+    g.add(rotor);
+    pumpRotors.push(rotor);
+  }
+
+  // 5. Power Substation (transformer bays + insulators)
+  const subBody = new THREE.Mesh(
+    new THREE.BoxGeometry(2.6, 1.7, 2.2),
+    new THREE.MeshStandardMaterial({ color: '#475569', roughness: 0.6, metalness: 0.4 })
+  );
+  subBody.position.set(5.2, 1.15, 3.9);
+  subBody.userData.tooltip = '<strong>Power Substation</strong><br/>Grid tariff tie-in for DESAL-01 pumping.';
+  g.add(subBody);
+  engine.hoverables.push(subBody);
+  [-0.6, 0.0, 0.6].forEach(xOff => {
+    const ins = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.14, 1.0, 8), new THREE.MeshStandardMaterial({ color: '#F59E0B', emissive: '#B45309', emissiveIntensity: 0.4 }));
+    ins.position.set(5.2 + xOff, 2.4, 3.9);
+    g.add(ins);
+  });
+
+  // 6. Output gauge bar on roof of RO hall
+  const gaugeBg = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.55, 0.8), new THREE.MeshStandardMaterial({ color: '#0F172A' }));
+  gaugeBg.position.set(1.0, 3.65, -0.3);
+  g.add(gaugeBg);
+  const gaugeMat = new THREE.MeshStandardMaterial({ color: '#38BDF8', emissive: '#0284C7', emissiveIntensity: 0.9 });
+  const gaugeBar = new THREE.Mesh(new THREE.BoxGeometry(5.0, 0.6, 0.86), gaugeMat);
+  gaugeBar.position.set(1.0, 3.65, -0.3);
+  g.add(gaugeBar);
+
+  engine.scene.add(g);
+
+  // Floating part labels
+  const mainLbl = registerLabel(pl.label || `DESAL-01 — ${pl.output_mld} MLD`, new THREE.Vector3(px + 1.0, 5.6, pz - 0.3), 'ag-label', '#38BDF8');
+  const int1Lbl = registerLabel('Intake 1', new THREE.Vector3(px - 8.5, 2.0, pz - 2.4), 'ag-label ag-label-part');
+  const int2Lbl = registerLabel('Intake 2', new THREE.Vector3(px - 8.5, 2.0, pz + 2.0), 'ag-label ag-label-part');
+  registerLabel('Pre-treatment', new THREE.Vector3(px - 3.6, 3.1, pz), 'ag-label ag-label-part');
+  registerLabel('RO Hall', new THREE.Vector3(px + 1.0, 4.4, pz - 2.6), 'ag-label ag-label-part');
+  registerLabel('HP Pumps', new THREE.Vector3(px + 5.0, 2.8, pz - 0.5), 'ag-label ag-label-part');
+  registerLabel('Substation', new THREE.Vector3(px + 5.2, 3.3, pz + 3.9), 'ag-label ag-label-part');
+  registerLabel('Brine Outfall', new THREE.Vector3(px - 8.0, 1.5, pz + 4.6), 'ag-label ag-label-part');
+
+  engine.plantRig = {
+    group: g,
+    intake1, intake1Mat,
+    intake2, intake2Mat,
+    algaePlume,
+    pumpRotors,
+    pumpMat,
+    gaugeBar, gaugeMat,
+    mainLbl, int1Lbl, int2Lbl,
+    prevOut: Number(pl.output_mld || 100),
+    targetOut: Number(pl.output_mld || 100),
+    currentOut: Number(pl.output_mld || 100),
+    maxCap: Number(pl.max_capacity_mld || 120),
+    animStart: 0
+  };
+}
+
+function buildReservoirLookInside(state) {
+  const S = engine.scale;
+  const res = state.reservoir || { id: 'RES-01', pos_xz: [-11000, 8800], level_percent: 48, base_floor_percent: 35, safety_floor_percent: 35, warning_floor_percent: 40 };
+  const rx = res.pos_xz[0] * S, rz = res.pos_xz[1] * S;
+  const R = 5.4, H = 8.0;
+  const g = new THREE.Group();
+  g.position.set(rx, 0, rz);
+
+  // Concrete base slab
+  const base = new THREE.Mesh(
+    new THREE.CylinderGeometry(R + 0.5, R + 0.65, 0.45, 36),
+    new THREE.MeshStandardMaterial({ color: '#475569', roughness: 0.85 })
+  );
+  base.position.y = 0.22;
+  base.receiveShadow = true;
+  g.add(base);
+
+  // Back concrete structural half-shell (220 deg) + Front glass cutaway window (140 deg) so operator sees right inside!
+  const concreteWall = new THREE.Mesh(
+    new THREE.CylinderGeometry(R, R, H, 32, 1, true, Math.PI * 0.72, Math.PI * 1.28),
+    new THREE.MeshStandardMaterial({ color: '#64748B', roughness: 0.78, metalness: 0.1, side: THREE.DoubleSide })
+  );
+  concreteWall.position.y = H * 0.5 + 0.4;
+  concreteWall.castShadow = true;
+  concreteWall.receiveShadow = true;
+  g.add(concreteWall);
+
+  const glassMat = new THREE.MeshPhysicalMaterial({
+    color: '#E0F2FE',
+    transparent: true,
+    opacity: 0.22,
+    transmission: 0.78,
+    roughness: 0.08,
+    metalness: 0.05,
+    side: THREE.DoubleSide,
+    depthWrite: false
+  });
+  const glassWall = new THREE.Mesh(
+    new THREE.CylinderGeometry(R, R, H, 28, 1, true, -Math.PI * 0.28, Math.PI * 1.0),
+    glassMat
+  );
+  glassWall.position.y = H * 0.5 + 0.4;
+  glassWall.userData.tooltip = `<strong>RES-01 Strategic Reservoir</strong><br/>Level: ${res.level_percent}%`;
+  g.add(glassWall);
+  engine.hoverables.push(glassWall);
+
+  // Concrete top rim ring
+  const topRim = new THREE.Mesh(
+    new THREE.TorusGeometry(R, 0.22, 10, 40),
+    new THREE.MeshStandardMaterial({ color: '#94A3B8', roughness: 0.6, metalness: 0.25 })
+  );
+  topRim.rotation.x = Math.PI / 2;
+  topRim.position.y = H + 0.4;
+  g.add(topRim);
+
+  // Animated water volume inside tank (unit height scaled dynamically on Y)
+  const waterMat = new THREE.MeshPhysicalMaterial({
+    color: '#0EA5E9',
+    emissive: '#0369A1',
+    emissiveIntensity: 0.35,
+    transparent: true,
+    opacity: 0.82,
+    roughness: 0.14,
+    metalness: 0.08
+  });
+  const waterBody = new THREE.Mesh(new THREE.CylinderGeometry(R - 0.26, R - 0.26, 1.0, 32), waterMat);
+  g.add(waterBody);
+
+  // Rippling water surface disc on top of water column
+  const surfMat = new THREE.MeshStandardMaterial({
+    color: '#7DD3FC',
+    emissive: '#0284C7',
+    emissiveIntensity: 0.5,
+    roughness: 0.15,
+    metalness: 0.25,
+    transparent: true,
+    opacity: 0.85
+  });
+  const waterSurface = new THREE.Mesh(new THREE.CircleGeometry(R - 0.24, 32), surfMat);
+  waterSurface.rotation.x = -Math.PI / 2;
+  g.add(waterSurface);
+
+  // 4 Inner-Wall Level Marker Rings:
+  // 1) Current level (white), 2) Safety floor 35% (red), 3) Dynamic floor (orange), 4) Floor + 5% warning (yellow)
+  const makeRing = (hex, radOffset = -0.18, thick = 0.09) => {
+    const m = new THREE.Mesh(
+      new THREE.TorusGeometry(R + radOffset, thick, 8, 40),
+      new THREE.MeshBasicMaterial({ color: hex })
+    );
+    m.rotation.x = Math.PI / 2;
+    g.add(m);
+    return m;
+  };
+  const currentRing = makeRing('#FFFFFF', -0.16, 0.11);
+  const baseFloorRing = makeRing('#EF4444', -0.15, 0.12);     // 35% red
+  const dynamicFloorRing = makeRing('#F97316', -0.13, 0.13);  // dynamic floor orange (fire emergency)
+  const warningFloorRing = makeRing('#FACC15', -0.15, 0.09);  // floor + 5% yellow
+
+  // Inlet pipe from DESAL-01 (entering upper side inside tank) + Outlet pipes to city (bottom east side)
+  const inletPipe = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.32, 0.32, 4.0, 10),
+    new THREE.MeshStandardMaterial({ color: '#38BDF8', metalness: 0.65, roughness: 0.25 })
+  );
+  inletPipe.rotation.z = Math.PI / 2;
+  inletPipe.position.set(-R + 1.2, H * 0.78 + 0.4, 0);
+  inletPipe.userData.tooltip = '<strong>RES-01 Inlet Pipe</strong><br/>Product water entering from DESAL-01.';
+  g.add(inletPipe);
+  engine.hoverables.push(inletPipe);
+
+  [-1.2, 1.2].forEach((zOff, idx) => {
+    const outPipe = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.36, 0.36, 4.6, 10),
+      new THREE.MeshStandardMaterial({ color: '#94A3B8', metalness: 0.7, roughness: 0.3 })
+    );
+    outPipe.rotation.z = Math.PI / 2;
+    outPipe.position.set(R + 1.4, 1.15, zOff);
+    outPipe.userData.tooltip = `<strong>RES-01 City Outlet #${idx + 1}</strong><br/>Feeds main transmission trunks to Sectors 1-6.`;
+    g.add(outPipe);
+    engine.hoverables.push(outPipe);
+  });
+
+  engine.scene.add(g);
+
+  // Labels for tank + inner marker rings
+  const resLbl = registerLabel(`RES-01 · ${Number(res.level_percent || 48).toFixed(1)}%`, new THREE.Vector3(rx, H + 2.0, rz), 'ag-label', '#0EA5E9');
+  const floorLbl = registerLabel('35% Floor (Red) · +5% Warn (Yellow)', new THREE.Vector3(rx + R + 1.2, 0.4 + H * 0.38, rz), 'ag-label ag-label-part', '#EF4444');
+  const dynLbl = registerLabel('Dynamic Floor', new THREE.Vector3(rx - R - 0.8, 0.4 + H * 0.36, rz), 'ag-label ag-label-warn');
+  dynLbl.visible = false;
+  dynLbl.el.style.display = 'none';
+
+  // Product-water transmission pipe connecting DESAL-01 -> RES-01
+  const plPos = state.plant ? state.plant.pos_xz : [-13000, 11000];
+  const supplyCurve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(plPos[0] * S + 5.6, 1.1, plPos[1] * S),
+    new THREE.Vector3(rx - R, H * 0.78 + 0.4, rz)
+  ]);
+  const supplyTube = new THREE.Mesh(
+    new THREE.TubeGeometry(supplyCurve, 18, 0.48, 10, false),
+    new THREE.MeshStandardMaterial({ color: '#38BDF8', metalness: 0.65, roughness: 0.25, emissive: '#0369A1', emissiveIntensity: 0.25 })
+  );
+  supplyTube.userData.tooltip = '<strong>Product Water Main</strong><br/>DESAL-01 &rarr; RES-01';
+  engine.scene.add(supplyTube);
+  engine.hoverables.push(supplyTube);
+
+  engine.supplyTrack = {
+    curve: supplyCurve,
+    prevFlow: Number((state.plant && state.plant.output_mld) || 100),
+    targetFlow: Number((state.plant && state.plant.output_mld) || 100),
+    currentFlow: Number((state.plant && state.plant.output_mld) || 100),
+    animStart: 0,
+    mat: null,
+    particles: Array.from({ length: 7 }, (_, i) => ({ phase: i / 7 }))
+  };
+
+  engine.resRig = {
+    group: g, R, H, rx, rz,
+    glassWall, glassMat, waterBody, waterMat, waterSurface, surfMat,
+    currentRing, baseFloorRing, dynamicFloorRing, warningFloorRing,
+    resLbl, floorLbl, dynLbl,
+    prevPct: Number(res.level_percent || 48),
+    targetPct: Number(res.level_percent || 48),
+    currentPct: Number(res.level_percent || 48),
+    baseFloorPct: Number(res.base_floor_percent || 35),
+    dynFloorPct: Number(res.safety_floor_percent || 35),
+    warnFloorPct: Number(res.warning_floor_percent || 40),
+    hasEmergency: !!res.has_active_emergency,
+    animStart: 0
+  };
+}
+
+function buildPipesAndParticles(state, lowQ) {
+  const S = engine.scale;
+  const scene = engine.scene;
+  const flangeMat = new THREE.MeshStandardMaterial({ color: '#CBD5E1', metalness: 0.8, roughness: 0.25 });
+
+  engine.flowTracks = [engine.supplyTrack];
+
+  (state.pipes || []).forEach(pipe => {
+    const pts = (pipe.points_xz || []).map(p => new THREE.Vector3(p[0] * S, 0.9, p[1] * S));
+    if (pts.length < 2) return;
+    const curve = new THREE.CatmullRomCurve3(pts);
+    const radius = pipe.is_trunk ? 0.50 : 0.28;
+    const activeColor = new THREE.Color(pipe.color || '#2563EB');
+    const dryColor = new THREE.Color('#475569');
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: pipe.flow_lps <= 0.05 ? dryColor.clone() : activeColor.clone(),
+      metalness: 0.58,
+      roughness: 0.30,
+      transparent: true,
+      opacity: 0.96
+    });
+    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, Math.max(12, pts.length * 6), radius, 10, false), mat);
+    tube.castShadow = !lowQ;
+    scene.add(tube);
+    engine.hoverables.push(tube);
+
+    // Metallic joints / flanges along pipe
+    for (const u of [0.25, 0.5, 0.75]) {
+      const pPos = curve.getPointAt(u);
+      const tan = curve.getTangentAt(u);
+      const flange = new THREE.Mesh(new THREE.TorusGeometry(radius + 0.09, 0.07, 6, 12), flangeMat);
+      flange.position.copy(pPos);
+      flange.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tan.normalize());
+      scene.add(flange);
+    }
+
+    const maxParticles = lowQ ? 4 : 8;
+    const tr = {
+      segment_id: pipe.segment_id,
+      curve,
+      mat,
+      tube,
+      activeColor,
+      dryColor,
+      prevFlow: Number(pipe.flow_lps || 0),
+      targetFlow: Number(pipe.flow_lps || 0),
+      currentFlow: Number(pipe.flow_lps || 0),
+      animStart: 0,
+      delay: 0,
+      particles: Array.from({ length: maxParticles }, (_, i) => ({ phase: i / maxParticles }))
+    };
+    engine.pipeMap[pipe.segment_id] = tr;
+    engine.flowTracks.push(tr);
+  });
+
+  const total = engine.flowTracks.reduce((a, t) => a + t.particles.length, 0);
+  if (total > 0) {
+    engine.flowInst = new THREE.InstancedMesh(
+      new THREE.SphereGeometry(0.30, 8, 8),
+      new THREE.MeshBasicMaterial({ color: '#BAE6FD' }),
+      total
+    );
+    scene.add(engine.flowInst);
+  }
+}
+
+function buildValves(state) {
+  const S = engine.scale;
+  const scene = engine.scene;
+  const bodyMat = new THREE.MeshStandardMaterial({ color: '#64748B', metalness: 0.75, roughness: 0.3 });
+
+  (state.valves || []).forEach(v => {
+    const vx = v.pos_xz[0] * S, vz = v.pos_xz[1] * S;
+    const isOpen = String(v.status).toUpperCase() === 'OPEN';
+    const col = new THREE.Color(isOpen ? '#22C55E' : '#EF4444');
+
+    const group = new THREE.Group();
+    group.position.set(vx, 1.0, vz);
+
+    // Metallic valve body housing + flange collar + stem
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 0.95, 12), bodyMat);
+    group.add(body);
+    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.9, 8), bodyMat);
+    stem.position.y = 0.72;
+    group.add(stem);
+
+    // Handwheel (torus + spokes)
+    const wheelGroup = new THREE.Group();
+    const wheelMat = new THREE.MeshStandardMaterial({
+      color: col.clone(),
+      emissive: col.clone(),
+      emissiveIntensity: 0.35,
+      metalness: 0.45,
+      roughness: 0.28
+    });
+    const wheelRing = new THREE.Mesh(new THREE.TorusGeometry(0.75, 0.15, 10, 20), wheelMat);
+    wheelRing.rotation.x = Math.PI / 2;
+    wheelGroup.add(wheelRing);
+    wheelGroup.add(new THREE.Mesh(new THREE.BoxGeometry(1.42, 0.11, 0.11), wheelMat));
+    wheelGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.11, 1.42), wheelMat));
+    wheelGroup.position.y = 1.15;
+    group.add(wheelGroup);
+
+    const hit = new THREE.Mesh(
+      new THREE.SphereGeometry(1.45, 8, 8),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.0, depthWrite: false })
+    );
+    hit.position.y = 0.8;
+    group.add(hit);
+    engine.hoverables.push(hit);
+
+    scene.add(group);
+    const lblRec = registerLabel(v.valve_id, new THREE.Vector3(vx, 3.1, vz), 'ag-label ag-label-valve', isOpen ? '#22C55E' : '#EF4444', 115);
+    lblRec.alwaysShow = !isOpen;
+    engine.valveMap[v.valve_id] = {
+      group, wheelGroup, wheelMat, hit, lblRec,
+      status: isOpen ? 'OPEN' : 'CLOSED',
+      anim: null,
+      rejectFlashUntil: 0
+    };
+  });
+}
+
+function buildSensors(state) {
+  const S = engine.scale;
+  const scene = engine.scene;
+  (state.sensors || []).forEach(s => {
+    const sx = s.pos_xz[0] * S, sz = s.pos_xz[1] * S;
+    const mat = new THREE.MeshStandardMaterial({ color: '#38BDF8', emissive: '#0EA5E9', emissiveIntensity: 0.95 });
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.42, 10, 10), mat);
+    mesh.position.set(sx, 1.65, sz);
+    scene.add(mesh);
+    engine.hoverables.push(mesh);
+
+    const warnLbl = registerLabel(`⚠ ${s.sensor_id}`, new THREE.Vector3(sx, 2.9, sz), 'ag-label ag-label-warn');
+    warnLbl.visible = false;
+    warnLbl.el.style.display = 'none';
+    engine.sensorMap[s.sensor_id] = { mesh, mat, warnLbl };
+  });
+}
+
+function syncLeaks(state, lowQ) {
+  const S = engine.scale;
+  const scene = engine.scene;
+  const now = engine.clock.getElapsedTime();
+  const seen = new Set();
+
+  (state.leaks || []).forEach(lk => {
+    const lid = lk.leak_id;
+    seen.add(lid);
+    const isActive = !!lk.active && !lk.isolated;
+    let rec = engine.leakMap[lid];
+
+    if (!rec && !isActive) return;
+
+    if (!rec) {
+      const lx = lk.pos_xz[0] * S, lz = lk.pos_xz[1] * S;
+      const group = new THREE.Group();
+      const coreMat = new THREE.MeshStandardMaterial({ color: '#EF4444', emissive: '#DC2626', emissiveIntensity: 1.0 });
+      const core = new THREE.Mesh(new THREE.SphereGeometry(0.88, 14, 14), coreMat);
+      core.position.set(lx, 1.5, lz);
+      group.add(core);
+      engine.hoverables.push(core);
+
+      const ringMat = new THREE.MeshBasicMaterial({ color: '#EF4444', transparent: true, opacity: 0.8, side: THREE.DoubleSide });
+      const ring = new THREE.Mesh(new THREE.RingGeometry(1.1, 1.85, 24), ringMat);
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(lx, 0.25, lz);
+      group.add(ring);
+
+      const puddleMat = new THREE.MeshBasicMaterial({ color: '#0EA5E9', transparent: true, opacity: 0.5, side: THREE.DoubleSide });
+      const puddle = new THREE.Mesh(new THREE.CircleGeometry(2.7, 24), puddleMat);
+      puddle.rotation.x = -Math.PI / 2;
+      puddle.position.set(lx, 0.16, lz);
+      group.add(puddle);
+
+      const dropCount = lowQ ? 8 : 18;
+      const dropGeo = new THREE.SphereGeometry(0.18, 6, 6);
+      const dropMat = new THREE.MeshBasicMaterial({ color: '#7DD3FC', transparent: true, opacity: 0.92 });
+      const sprayDrops = [];
+      for (let i = 0; i < dropCount; i++) {
+        const mesh = new THREE.Mesh(dropGeo, dropMat);
+        mesh.position.set(lx, 1.4, lz);
+        group.add(mesh);
+        sprayDrops.push({ mesh, ang: (i / dropCount) * Math.PI * 2 + (i % 3) * 0.22, speed: 1.6 + (i % 4) * 0.45, offset: i / dropCount });
+      }
+      scene.add(group);
+      const lblRec = registerLabel(`🚨 ${lid}`, new THREE.Vector3(lx, 4.1, lz), 'ag-label ag-label-danger');
+      rec = { lx, lz, group, core, coreMat, ring, ringMat, puddle, puddleMat, sprayDrops, lblRec, isActive, isolatedAt: null };
+      engine.leakMap[lid] = rec;
+    }
+
+    if (rec.isActive && !isActive) {
+      // Transitioned active -> isolated (spray will smoothly die down & stop!)
+      rec.isolatedAt = now;
+    } else if (isActive) {
+      rec.isolatedAt = null;
+    }
+    rec.isActive = isActive;
+    rec.core.userData.tooltip = `<strong>${lid}</strong> (${lk.severity} · ${isActive ? lk.status : 'ISOLATED'})<br/>${lk.location_name}<br/>Loss: <strong>${lk.estimated_loss_m3_per_hour} m³/hr</strong>`;
+    rec.lblRec.el.textContent = isActive ? `🚨 ${lid}` : `✓ ${lid} ISOLATED`;
+    rec.lblRec.el.style.background = isActive ? 'rgba(220,38,38,0.94)' : 'rgba(22,163,74,0.90)';
+    rec.lblRec.visible = true;
+  });
+
+  // Hide removed leaks (e.g., after DB reset)
+  for (const [lid, rec] of Object.entries(engine.leakMap)) {
+    if (!seen.has(lid)) {
+      rec.isActive = false;
+      rec.group.visible = false;
+      rec.lblRec.visible = false;
+      rec.lblRec.el.style.display = 'none';
+    } else {
+      rec.group.visible = true;
+    }
+  }
+}
+
+// ── In-Place State Update (runs on EVERY Streamlit rerun with ZERO reload!) ──
+function applySceneUpdate(args) {
+  const state = args.scene_state || {};
+  const viewCmd = args.view_command || {};
+  const quality = args.quality || (state.low_quality ? 'Low' : 'High');
+  const followChat = args.follow_chat !== false;
+  const lowQ = quality === 'Low';
+
+  if (!engine.initialized) {
+    initEngine(state, quality);
+  }
+
+  const now = engine.clock.getElapsedTime();
+  const S = engine.scale;
+
+  // 1. Quality switch (High vs Low) without reload
+  if (engine.lastQuality !== quality) {
+    engine.lastQuality = quality;
+    engine.renderer.shadowMap.enabled = !lowQ;
+    engine.sunLight.castShadow = !lowQ;
+    if (engine.sky) engine.sky.visible = !lowQ;
+    if (engine.seaWater) engine.seaWater.visible = !lowQ;
+    if (engine.simpleSea) engine.simpleSea.visible = true;
+    rebuildCityInstances(state, lowQ);
+  } else {
+    const isEve = (state.current_hour >= 18 || state.current_hour < 6);
+    if (engine.lastHourEvening !== isEve && engine.buildingMat) {
+      engine.lastHourEvening = isEve;
+      engine.buildingMat.map = isEve ? engine.eveWinTex : engine.dayWinTex;
+      engine.buildingMat.emissive.set(isEve ? '#F59E0B' : '#000000');
+      engine.buildingMat.emissiveMap = isEve ? engine.eveWinTex : null;
+      engine.buildingMat.emissiveIntensity = isEve ? 0.55 : 0.0;
+      engine.buildingMat.needsUpdate = true;
+    }
+  }
+
+  // Update Sky sun elevation based on simulation clock hour
+  if (engine.sky) {
+    const hr = Number(state.current_hour ?? 14);
+    const isEve = (hr >= 18 || hr < 6);
+    const elev = isEve ? 9.5 : (hr >= 11 && hr <= 15 ? 46.0 : 26.0);
+    const phi = THREE.MathUtils.degToRad(90 - elev);
+    const theta = THREE.MathUtils.degToRad(135);
+    const sunVec = new THREE.Vector3().setFromSphericalCoords(1, phi, theta);
+    engine.sky.material.uniforms['sunPosition'].value.copy(sunVec);
+    engine.sunLight.intensity = isEve ? 1.05 : 1.5;
+    engine.hemiLight.intensity = isEve ? 0.78 : 0.95;
+  }
+
+  // 2. Telemetry Loss Grey-out Overlay
+  const tf = state.telemetry_status || {};
+  const rootEl = document.getElementById('ag-root');
+  const tfOverlay = document.getElementById('ag-telemetry-overlay');
+  if (tf.is_telemetry_loss) {
+    rootEl.classList.add('telemetry-loss');
+    tfOverlay.style.display = 'block';
+  } else {
+    rootEl.classList.remove('telemetry-loss');
+    tfOverlay.style.display = 'none';
+  }
+
+  // 3. HUD Focus Pill
+  const camSpec = state.camera_target || {};
+  document.getElementById('ag-focus-label').textContent = camSpec.label || 'All 6 Sectors';
+
+  // 4. Highlighting & Sector States (chlorine NON_COMPLIANT pulse, fire emergency marker)
+  const hl = state.highlight || { type: 'all', id: null, downstream_pipe_ids: [] };
+  const isFocused = hl.type && hl.type !== 'all';
+  const dlSet = new Set(hl.downstream_pipe_ids || []);
+
+  (state.sectors || []).forEach(sec => {
+    const rec = engine.sectorMap[sec.name];
+    if (!rec) return;
+    rec.nonCompliant = sec.compliance_status === 'NON_COMPLIANT';
+    rec.hasFire = !!sec.has_fire_emergency;
+    rec.fireGroup.visible = rec.hasFire;
+    rec.fireLbl.visible = rec.hasFire;
+    if (!rec.hasFire) rec.fireLbl.el.style.display = 'none';
+
+    const secHl = !!sec.highlighted;
+    const secDim = isFocused && hl.type === 'sector' && !secHl;
+    rec.zoneMat.opacity = secHl ? 0.28 : (secDim ? 0.05 : 0.15);
+    rec.borderMat.opacity = secDim ? 0.28 : 0.95;
+    rec.lblRec.el.style.opacity = secDim ? '0.45' : '1.0';
+    if (!rec.nonCompliant) rec.zoneMat.color.copy(rec.baseColor);
+    rec.zoneMesh.userData.tooltip = `<strong>${sec.name}</strong> (${sec.color_name})<br/>Chlorine: ${sec.chlorine_mg_l} mg/L (<strong>${sec.compliance_status}</strong>)<br/>Total Flow: ${sec.total_flow_lps} L/s · Active Leaks: ${sec.active_leaks}${rec.hasFire ? '<br/><span style="color:#F97316;">🔥 FIRE EMERGENCY ACTIVE</span>' : ''}`;
+  });
+
+  // 5. Valves diff animations (wheel turns + green <-> red over ~2s; Reject highlight flash)
+  const colOpen = new THREE.Color('#22C55E');
+  const colClosed = new THREE.Color('#EF4444');
+  (state.valves || []).forEach(v => {
+    const rec = engine.valveMap[v.valve_id];
+    if (!rec) return;
+    const nextStat = String(v.status).toUpperCase();
+    const isOpen = nextStat === 'OPEN';
+    const colHex = isOpen ? '#22C55E' : '#EF4444';
+
+    if (rec.status !== nextStat) {
+      rec.anim = {
+        start: now,
+        duration: 2.0,
+        fromColor: rec.status === 'OPEN' ? colOpen.clone() : colClosed.clone(),
+        toColor: isOpen ? colOpen.clone() : colClosed.clone(),
+        spinSign: isOpen ? -1.0 : 1.0
+      };
+      rec.status = nextStat;
+    } else if (!rec.anim) {
+      rec.wheelMat.color.copy(isOpen ? colOpen : colClosed);
+      rec.wheelMat.emissive.copy(isOpen ? colOpen : colClosed);
+    }
+
+    if (viewCmd.event_type === 'valve_reject' && viewCmd.focus_id && viewCmd.focus_id.toUpperCase() === v.valve_id.toUpperCase()) {
+      rec.rejectFlashUntil = now + 2.8;
+    }
+
+    rec.lblRec.el.style.borderColor = colHex;
+    rec.lblRec.alwaysShow = (!isOpen) || !!v.highlighted;
+    rec.wheelMat.emissiveIntensity = v.highlighted ? 0.7 : 0.35;
+    rec.hit.userData.tooltip = `<strong>Valve ${v.valve_id}</strong> (${v.sector})<br/>Status: <span style="color:${colHex}; font-weight:700;">${nextStat}</span>${v.pipe_segment_id ? '<br/>Pipe: ' + v.pipe_segment_id : ''}`;
+  });
+
+  // 6. Pipes flow diffs (downstream particles slow down & stop after valve turns!)
+  (state.pipes || []).forEach(p => {
+    const tr = engine.pipeMap[p.segment_id];
+    if (!tr) return;
+    const nextFlow = Number(p.flow_lps || 0);
+    if (Math.abs(nextFlow - tr.targetFlow) > 0.3) {
+      tr.prevFlow = tr.currentFlow;
+      tr.targetFlow = nextFlow;
+      tr.animStart = now;
+      tr.delay = 0.65;
+    }
+    const pHl = !!p.highlighted || dlSet.has(p.segment_id);
+    const pDim = isFocused && !pHl && (hl.type === 'sector' || hl.type === 'valve');
+    tr.mat.opacity = pDim ? 0.26 : 0.96;
+    tr.mat.emissive.copy(pHl ? tr.activeColor : new THREE.Color('#000000'));
+    tr.mat.emissiveIntensity = pHl ? 0.55 : 0.0;
+    const rerouteTag = p.rerouted ? ' · REROUTED' : '';
+    tr.tube.userData.tooltip = `<strong>${p.segment_id}</strong> (${p.sector})<br/>${p.name}<br/>${p.diameter_mm}mm ${p.is_trunk ? 'Trunk' : 'Distribution'} · Valve: ${p.isolation_valve_id}<br/>Flow: <strong>${p.flow_lps} L/s</strong>${rerouteTag} · Pressure: ${p.pressure_psi} psi`;
+  });
+
+  // 7. Sensors
+  (state.sensors || []).forEach(s => {
+    const rec = engine.sensorMap[s.sensor_id];
+    if (!rec) return;
+    const isQ = !!s.quarantined;
+    rec.mat.color.set(isQ ? '#94A3B8' : '#38BDF8');
+    rec.mat.emissive.set(isQ ? '#475569' : '#0EA5E9');
+    rec.mat.emissiveIntensity = isQ ? 0.25 : 0.95;
+    rec.warnLbl.visible = isQ;
+    if (!isQ) rec.warnLbl.el.style.display = 'none';
+    rec.mesh.userData.tooltip = `<strong>Sensor ${s.sensor_id}</strong> (${s.junction_id}, ${s.sector})<br/>Reading: ${s.value} ${s.unit}<br/>Status: <strong>${s.status}</strong>${isQ && s.reasons && s.reasons.length ? '<br/>Reason: ' + s.reasons[0] : ''}`;
+  });
+
+  // 8. Leaks (spray + puddle; stops when isolated!)
+  syncLeaks(state, lowQ);
+
+  // 9. DESAL-01 Plant output & Intake 2 algae / ISOLATED status
+  const pl = state.plant || {};
+  if (engine.plantRig) {
+    const pr = engine.plantRig;
+    const nextOut = Number(pl.output_mld || 100);
+    if (Math.abs(nextOut - pr.targetOut) > 0.2) {
+      pr.prevOut = pr.currentOut;
+      pr.targetOut = nextOut;
+      pr.animStart = now;
+      engine.supplyTrack.prevFlow = engine.supplyTrack.currentFlow;
+      engine.supplyTrack.targetFlow = nextOut;
+      engine.supplyTrack.animStart = now;
+    }
+    pr.mainLbl.el.textContent = pl.label || `DESAL-01 — ${nextOut.toFixed(0)} MLD`;
+
+    const intakes = pl.intakes || [];
+    const int2 = intakes[1] || { status: 'ACTIVE', algae_tint: false, turbidity_ntu: 1.25 };
+    const algaeActive = !!int2.algae_tint;
+    const int2Iso = String(int2.status).toUpperCase() === 'ISOLATED';
+    pr.algaePlume.visible = algaeActive;
+    pr.intake2Mat.color.set(algaeActive ? '#22C55E' : '#0284C7');
+    pr.intake2Mat.emissive.set(algaeActive ? '#15803D' : '#000000');
+    pr.intake2Mat.emissiveIntensity = algaeActive ? 0.45 : 0.0;
+    pr.int2Lbl.el.textContent = int2Iso ? 'Intake 2 — ISOLATED' : (algaeActive ? 'Intake 2 (Algae)' : 'Intake 2');
+    pr.int2Lbl.el.style.borderColor = int2Iso ? '#EF4444' : (algaeActive ? '#22C55E' : '#38BDF8');
+    pr.intake2.userData.tooltip = `<strong>Intake 2 (DESAL-01)</strong><br/>Status: <strong>${int2.status}</strong> · Turbidity: ${int2.turbidity_ntu} NTU${algaeActive ? '<br/><span style="color:#4ADE80;">Algal bloom tint active</span>' : ''}`;
+  }
+
+  // 10. RES-01 Reservoir smooth level & floor markers
+  const res = state.reservoir || {};
+  if (engine.resRig) {
+    const rr = engine.resRig;
+    const nextPct = Number(res.level_percent || 48);
+    if (Math.abs(nextPct - rr.targetPct) > 0.05) {
+      rr.prevPct = rr.currentPct;
+      rr.targetPct = nextPct;
+      rr.animStart = now;
+    }
+    rr.baseFloorPct = Number(res.base_floor_percent || 35);
+    rr.dynFloorPct = Number(res.safety_floor_percent || 35);
+    rr.warnFloorPct = Number(res.warning_floor_percent || (rr.dynFloorPct + 5));
+    rr.hasEmergency = !!res.has_active_emergency;
+
+    // Position floor marker rings on the inner wall
+    rr.baseFloorRing.position.y = 0.4 + rr.H * (rr.baseFloorPct / 100.0);
+    rr.warningFloorRing.position.y = 0.4 + rr.H * (rr.warnFloorPct / 100.0);
+    const showDyn = rr.hasEmergency || (rr.dynFloorPct > rr.baseFloorPct + 0.05);
+    rr.dynamicFloorRing.visible = showDyn;
+    rr.dynamicFloorRing.position.y = 0.4 + rr.H * (rr.dynFloorPct / 100.0);
+    rr.dynLbl.visible = showDyn;
+    if (showDyn) {
+      rr.dynLbl.el.textContent = `Dynamic Floor ${rr.dynFloorPct.toFixed(1)}%`;
+      rr.dynLbl.pos.set(rr.rx - rr.R - 0.8, 0.4 + rr.H * (rr.dynFloorPct / 100.0) + 0.4, rr.rz);
+    } else {
+      rr.dynLbl.el.style.display = 'none';
+    }
+    rr.glassMat.opacity = res.look_inside ? 0.14 : 0.24;
+    rr.glassWall.userData.tooltip = `<strong>RES-01 Strategic Reservoir</strong><br/>Level: <strong>${nextPct.toFixed(1)}%</strong> (${res.volume_ml} / ${res.capacity_ml} ML)<br/>Safety Floor: ${rr.baseFloorPct}%${showDyn ? ' · Dynamic Floor: <strong>' + rr.dynFloorPct.toFixed(1) + '%</strong>' : ''} · Warning: ${rr.warnFloorPct.toFixed(1)}%`;
+  }
+
+  // 11. Camera fly-to ONLY when view_command.seq increments AND (followChat ON or explicit user button!)
+  const cmdSeq = Number(viewCmd.seq || 0);
+  const isManualBtn = (viewCmd.event_type === 'reset' || viewCmd.event_type === 'button_focus');
+  if (cmdSeq !== engine.lastCommandSeq) {
+    engine.lastCommandSeq = cmdSeq;
+    if (viewCmd.note) showEventToast(viewCmd.note);
+    if ((followChat || isManualBtn) && camSpec.position_xyz && camSpec.target_xz) {
+      engine.flyAnim = {
+        startPos: engine.camera.position.clone(),
+        endPos: new THREE.Vector3(camSpec.position_xyz[0] * S, camSpec.position_xyz[1] * S, camSpec.position_xyz[2] * S),
+        startTarget: engine.controls.target.clone(),
+        endTarget: new THREE.Vector3(camSpec.target_xz[0] * S, (camSpec.target_y || 0) * S, camSpec.target_xz[1] * S),
+        startTime: now,
+        duration: 1.15
+      };
+    }
+  }
+}
+
+function startAnimationLoop() {
+  const projVec = new THREE.Vector3();
+  const pDummy = new THREE.Object3D();
+  const pPos = new THREE.Vector3();
+  const colBlue = new THREE.Color('#0EA5E9');
+  const colOrange = new THREE.Color('#F97316');
+  const colRed = new THREE.Color('#EF4444');
+  const colNonComp = new THREE.Color('#F97316');
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = engine.clock.getElapsedTime();
+    const dt = Math.min(0.05, Math.max(0.001, t - engine.prevTime));
+    engine.prevTime = t;
+
+    // 1. Camera fly-to
+    if (engine.flyAnim) {
+      const u = easeOutCubic((t - engine.flyAnim.startTime) / engine.flyAnim.duration);
+      engine.camera.position.lerpVectors(engine.flyAnim.startPos, engine.flyAnim.endPos, u);
+      engine.controls.target.lerpVectors(engine.flyAnim.startTarget, engine.flyAnim.endTarget, u);
+      if (u >= 1.0) engine.flyAnim = null;
+    }
+    engine.controls.update();
+
+    // 2. Animated coastal sea ripples
+    if (engine.seaWater && engine.seaWater.visible) {
+      engine.seaWater.material.uniforms['time'].value += dt * 0.55;
+    }
+
+    // 3. Sector NON_COMPLIANT orange pulse & Fire Emergency flicker
+    for (const rec of Object.values(engine.sectorMap)) {
+      if (rec.nonCompliant) {
+        const pulse = 0.5 + 0.5 * Math.sin(t * 4.2);
+        rec.zoneMat.color.copy(rec.baseColor).lerp(colNonComp, 0.55 + 0.4 * pulse);
+        rec.zoneMat.opacity = 0.20 + 0.16 * pulse;
+      }
+      if (rec.hasFire) {
+        rec.fireGroup.scale.set(1.0 + 0.14 * Math.sin(t * 7), 1.0 + 0.22 * Math.sin(t * 9.5), 1.0 + 0.14 * Math.cos(t * 7));
+      }
+    }
+
+    // 4. Plant DESAL-01 smooth output gauge & pump rotation speed proportional to MLD
+    if (engine.plantRig) {
+      const pr = engine.plantRig;
+      const pu = easeOutCubic((t - pr.animStart) / 1.8);
+      pr.currentOut = pr.prevOut + (pr.targetOut - pr.prevOut) * pu;
+      const ratio = Math.max(0.05, Math.min(1.0, pr.currentOut / Math.max(1, pr.maxCap)));
+      pr.gaugeBar.scale.x = ratio;
+      pr.gaugeBar.position.x = 1.0 - 2.5 + 2.5 * ratio;
+      pr.gaugeMat.emissiveIntensity = 0.55 + 0.4 * Math.sin(t * (2.0 + ratio * 6.0));
+      const pumpSpin = dt * (0.8 + ratio * 7.5);
+      for (const rotor of pr.pumpRotors) rotor.rotation.z += pumpSpin;
+    }
+
+    // 5. Reservoir RES-01 smooth water level, rippling surface & floor-proximity color
+    if (engine.resRig) {
+      const rr = engine.resRig;
+      const ru = easeOutCubic((t - rr.animStart) / 2.0);
+      rr.currentPct = rr.prevPct + (rr.targetPct - rr.prevPct) * ru;
+      const waterH = rr.H * Math.max(0.03, Math.min(0.98, rr.currentPct / 100.0));
+      rr.waterBody.scale.y = waterH;
+      rr.waterBody.position.y = 0.4 + waterH * 0.5;
+      const ripple = 0.05 * Math.sin(t * 3.2);
+      rr.waterSurface.position.y = 0.4 + waterH + ripple;
+      rr.currentRing.position.y = 0.4 + waterH;
+      rr.resLbl.el.textContent = `RES-01 · ${rr.currentPct.toFixed(1)}%`;
+
+      // Color: blue normal, orange near floor (<= floor + 5%), red at/below floor
+      if (rr.currentPct <= rr.dynFloorPct + 0.05) {
+        rr.waterMat.color.copy(colRed);
+        rr.waterMat.emissive.copy(colRed);
+        rr.waterMat.emissiveIntensity = 0.55 + 0.25 * Math.sin(t * 5.0);
+      } else if (rr.currentPct <= rr.warnFloorPct) {
+        rr.waterMat.color.copy(colOrange);
+        rr.waterMat.emissive.copy(colOrange);
+        rr.waterMat.emissiveIntensity = 0.45 + 0.2 * Math.sin(t * 3.5);
+      } else {
+        rr.waterMat.color.copy(colBlue);
+        rr.waterMat.emissive.set('#0369A1');
+        rr.waterMat.emissiveIntensity = 0.35;
+      }
+    }
+
+    // 6. Valve wheel rotation & color transitions (~2s) + Reject flash
+    for (const v of Object.values(engine.valveMap)) {
+      if (v.anim) {
+        const vu = easeOutCubic((t - v.anim.start) / v.anim.duration);
+        v.wheelGroup.rotation.y = v.anim.spinSign * Math.PI * 2.0 * vu;
+        v.wheelMat.color.copy(v.anim.fromColor).lerp(v.anim.toColor, vu);
+        v.wheelMat.emissive.copy(v.anim.fromColor).lerp(v.anim.toColor, vu);
+        if (vu >= 1.0) v.anim = null;
+      }
+      if (t < v.rejectFlashUntil) {
+        v.wheelGroup.scale.setScalar(1.0 + 0.28 * Math.sin(t * 14.0));
+      } else {
+        v.wheelGroup.scale.setScalar(1.0);
+      }
+    }
+
+    // 7. Instanced water flow particles (speed & count proportional to flow; none when flow == 0)
+    if (engine.flowInst) {
+      let idx = 0;
+      for (const tr of engine.flowTracks) {
+        const fu = tr.delay > 0 ? easeOutCubic((t - tr.animStart - tr.delay) / 1.8) : easeOutCubic((t - tr.animStart) / 1.4);
+        tr.currentFlow = tr.prevFlow + (tr.targetFlow - tr.prevFlow) * fu;
+        if (tr.mat) {
+          tr.mat.color.copy(tr.dryColor).lerp(tr.activeColor, Math.min(1.0, tr.currentFlow / 25.0));
+        }
+        const speed = (tr.currentFlow / 100.0) * 0.28;
+        const activeCount = tr.currentFlow <= 0.05 ? 0 : Math.max(1, Math.min(tr.particles.length, Math.round((tr.currentFlow / 110.0) * tr.particles.length)));
+        const pScale = tr.currentFlow <= 0.05 ? 0.0 : Math.min(1.15, 0.58 + (tr.currentFlow / 120.0) * 0.55);
+
+        for (let k = 0; k < tr.particles.length; k++) {
+          const pt = tr.particles[k];
+          if (k < activeCount && pScale > 0.0) {
+            pt.phase = (pt.phase + dt * speed) % 1.0;
+            tr.curve.getPointAt(pt.phase, pPos);
+            pDummy.position.set(pPos.x, pPos.y + 0.40, pPos.z);
+            pDummy.scale.setScalar(pScale);
+          } else {
+            pDummy.position.set(0, -200, 0);
+            pDummy.scale.setScalar(0.0);
+          }
+          pDummy.updateMatrix();
+          engine.flowInst.setMatrixAt(idx++, pDummy.matrix);
+        }
+      }
+      engine.flowInst.instanceMatrix.needsUpdate = true;
+    }
+
+    // 8. Leak spray fountains & puddles (stops smoothly when isolated!)
+    for (const lk of Object.values(engine.leakMap)) {
+      if (!lk.group.visible) continue;
+      const sprayInt = lk.isActive ? 1.0 : (lk.isolatedAt !== null ? Math.max(0.0, 1.0 - easeOutCubic((t - lk.isolatedAt - 0.6) / 1.8)) : 0.0);
+      if (lk.isActive) {
+        lk.core.scale.setScalar(1.0 + 0.3 * Math.sin(t * 4.5));
+        const rScale = 1.0 + ((t * 1.4) % 1.8);
+        lk.ring.scale.setScalar(rScale);
+        lk.ringMat.opacity = Math.max(0.0, 0.8 - (rScale - 1.0) * 0.45);
+        lk.puddle.scale.setScalar(0.95 + 0.12 * Math.sin(t * 2.2));
+      } else {
+        lk.core.scale.setScalar(0.75);
+        lk.ringMat.opacity = 0.0;
+        lk.puddleMat.opacity = 0.14 + 0.28 * sprayInt;
+      }
+      for (const dr of lk.sprayDrops) {
+        if (sprayInt <= 0.02) {
+          dr.mesh.visible = false;
+        } else {
+          dr.mesh.visible = true;
+          const cyc = (t * 1.65 + dr.offset) % 1.0;
+          const r = cyc * dr.speed * 1.65 * sprayInt;
+          const y = 1.3 + (4.2 * cyc - 4.2 * cyc * cyc) * (2.7 * sprayInt);
+          dr.mesh.position.set(lk.lx + Math.cos(dr.ang) * r, Math.max(0.2, y), lk.lz + Math.sin(dr.ang) * r);
+          dr.mesh.scale.setScalar(0.85 * sprayInt);
+        }
+      }
+    }
+
+    // 9. Project floating 3D labels (distance-aware so overview stays crisp & uncluttered)
+    const wrap = document.getElementById('ag-canvas-wrap');
+    const cw = wrap.clientWidth || 800;
+    const ch = wrap.clientHeight || 450;
+    for (const item of engine.labelAnchors) {
+      if (!item.visible) { item.el.style.display = 'none'; continue; }
+      if (!item.alwaysShow && item.maxDist < Infinity && engine.camera.position.distanceTo(item.pos) > item.maxDist) {
+        item.el.style.display = 'none';
+        continue;
+      }
+      projVec.copy(item.pos).project(engine.camera);
+      if (projVec.z > 1.0) {
+        item.el.style.display = 'none';
+      } else {
+        const sx = (projVec.x * 0.5 + 0.5) * cw;
+        const sy = (-projVec.y * 0.5 + 0.5) * ch;
+        if (sx < -40 || sx > cw + 40 || sy < -30 || sy > ch + 30) {
+          item.el.style.display = 'none';
+        } else {
+          item.el.style.display = 'block';
+          item.el.style.left = sx + 'px';
+          item.el.style.top = sy + 'px';
+        }
+      }
+    }
+
+    engine.renderer.render(engine.scene, engine.camera);
+  }
+  animate();
+}
+
+window.__AQUAGRID_APPLY_UPDATE__ = (args) => {
+  try {
+    applySceneUpdate(args);
+  } catch (err) {
+    console.error('AquaGrid 3D Twin update error:', err);
+    render2DFallback('WebGL failed to render — showing the 2D OpenStreetMap fallback view.', args && args.scene_state);
+  }
+};
+window.__AQUAGRID_ENGINE_READY__ = true;
+if (window.__AQUAGRID_PENDING_ARGS__) {
+  const pending = window.__AQUAGRID_PENDING_ARGS__;
+  window.__AQUAGRID_PENDING_ARGS__ = null;
+  window.__AQUAGRID_APPLY_UPDATE__(pending);
+}
+</script>
+</body>
+</html>

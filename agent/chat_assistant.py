@@ -49,14 +49,14 @@ STRICT RULES:
 3. If live data is genuinely unavailable (for example telemetry_freshness.is_telemetry_loss is true / TELEMETRY_LOSS), explicitly state WHICH telemetry data is missing or stale and WHY you cannot plan or stage setpoint/valve changes until the feed is restored.
 4. Answer ANY operator question clearly and concisely (typically 2-6 short lines or compact bullets): plant status, leaks, quarantined sensors, reservoir & dynamic emergency floor, electricity tariffs, hourly production plans, past actions in the Audit Log, why a plan was rejected, what any technical status code means, and next steps. For simple greetings like "Hello" or "how are you", reply briefly in 1-2 friendly sentences (mentioning overall grid status) without dumping a full table unless asked.
 5. Use prior conversation messages naturally for follow-up questions (e.g. "Why?", "What about Sector 2?", "And if demand rises?").
-6. Use DISPLAY TOOLS to render helpful visuals inside your reply whenever relevant:
-   - show_3d(focus): interactive 3D digital twin view (preferred default for "show Sector N", "where is the leak", "show the reservoir", "show valve V-12", "show the plant", or "show 3D"). focus can be "all", "Sector 1".."Sector 6", a valve ID like "V-12", a leak ID like "LEAK-001", "reservoir", or "plant".
-   - show_map(sector, leak_id, show_boundaries): 2D OpenStreetMap map (use when the operator asks for "2D", "2D map", or "show the sectors" / "show the map"). sector="all" for all 6 sectors, "Sector N" to highlight/zoom one sector, or leak_id like "LEAK-001"; show_boundaries defaults to true.
+6. Use DISPLAY TOOLS to control the persistent 3D digital twin at the top of the screen and render charts/tables/approvals:
+   - show_3d(focus): flies the top 3D digital twin to focus and highlights it (others dimmed). focus can be "all", "Sector 1".."Sector 6", valve_id ("V-12"), leak_id ("LEAK-001"), junction_id ("J-14"), "reservoir", "reservoir_inside", "plant", or "intake". Use automatically for any question about a sector, leak, valve, junction, reservoir, desalination plant, intake, or chlorine status.
+   - show_map(sector, leak_id, show_boundaries): 2D OpenStreetMap view (use when the operator asks for "2D", "2D map", or "show the sectors" / "show the map").
    - show_chart(metric, asset, hours): metric in ["pressure", "flow", "reservoir", "tariff"].
    - show_table(what): what in ["leaks", "sensors", "schedule", "audit", "valves"].
    - show_schedule_validation(plan): validating a production schedule.
    - show_pending_approvals(): showing pending actions awaiting operator signoff.
-   Never describe 3D or 2D map features that are not listed in the tool result. Only cite targets, colours, flows, counts, and status values returned by the tool summary.
+   Never describe 3D or 2D features that are not listed in the tool result. Only cite targets, colours, flows, counts, and status values returned by the tool summary.
 7. If the operator asks for a physical change (e.g. "reduce output to 70 MLD", "close V-12", "isolate and flush Sector 2"), you may ONLY call propose_gated_action. All Python safety guards run automatically inside the gateway. State the exact gateway status code (STAGED_PENDING_APPROVAL or REJECTED_* + reason) and remind the operator to click the Approve or Reject button on the approval card.
 8. You can NEVER execute, auto-approve, or bypass operator approval. Keep exact technical status codes unchanged (STAGED_PENDING_APPROVAL, REJECTED_BY_SAFETY_GUARD, REJECTED_WATER_QUALITY, CANCELLED_BY_SAFETY_RECHECK, REJECTED_UNAUTHORIZED_APPROVAL_CLAIM, REJECTED_APPROVAL_MISMATCH, REJECTED_APPROVAL_ALREADY_USED, REJECTED_APPROVAL_EXPIRED, TELEMETRY_LOSS, REJECTED_STALE_TELEMETRY, CANCELLED_STALE_TELEMETRY, NON_COMPLIANT, UNTRUSTED_TEXT, VALID, GAP).
 """
@@ -118,13 +118,13 @@ CHAT_TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "show_3d",
-            "description": "Display the interactive 3D digital twin inside this chat reply, highlighting the focused target (dimming others) and flying the camera to it. Returns an exact summary of what is shown.",
+            "description": "Focus the persistent top 3D digital twin on a target, highlighting it (dimming others) and flying the camera to it. Returns an exact summary of what is shown.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "focus": {
                         "type": "string",
-                        "description": "'all', 'Sector 1'..'Sector 6', a valve ID like 'V-12', a leak ID like 'LEAK-001', 'reservoir', or 'plant'.",
+                        "description": "'all', 'Sector 1'..'Sector 6', valve_id ('V-12'), leak_id ('LEAK-001'), junction_id ('J-14'), 'reservoir', 'reservoir_inside', 'plant', or 'intake'.",
                     }
                 },
                 "required": [],
@@ -327,8 +327,9 @@ def _is_map_request(text: str) -> bool:
 
 def _parse_3d_focus_request(text: str) -> Optional[str]:
     """
-    Detect queries that should display the 3D digital twin by default:
-    'show Sector 4', 'where is the leak', 'show the reservoir', 'show valve V-12', 'show the plant', or any '3D' query.
+    Detect queries that should focus the persistent top 3D digital twin automatically:
+    'show Sector 4', 'where is the leak', 'show the reservoir', 'look inside the reservoir',
+    'show the desalination plant', 'check valve V-12', 'what about Sector 2 chlorine', 'show intake', etc.
     Returns focus target string or None (returns None if operator explicitly asks for '2D').
     """
     cleaned = (text or "").strip()
@@ -339,29 +340,45 @@ def _parse_3d_focus_request(text: str) -> Optional[str]:
     if "3d" not in lower and ("map" in lower or "sectors" in lower or "all sector" in lower):
         return None
     # Do not intercept action requests like "Close V-12" or "Open V-12"
-    if re.search(r"\b(?:close|shut|open|isolate|flush|throttle|reduce|set)\b", lower) and "show" not in lower and "3d" not in lower:
+    if re.search(r"\b(?:close|shut|open|isolate|flush|throttle|reduce|set)\b", lower) and not any(
+        k in lower for k in ("show", "3d", "check", "inspect", "look")
+    ):
         return None
 
     m_v = re.search(r"\b(v-?\d{1,2})\b", cleaned, re.IGNORECASE)
-    if m_v and any(k in lower for k in ("show", "view", "where", "3d", "display", "focus", "zoom", "inspect", "twin")):
+    if m_v and any(k in lower for k in ("show", "view", "where", "3d", "display", "focus", "zoom", "inspect", "twin", "check", "valve", "status")):
         digits = re.sub(r"\D", "", m_v.group(1))
         return f"V-{int(digits):02d}"
 
     m_l = re.search(r"\b(LEAK-\d+)\b", cleaned, re.IGNORECASE)
-    if m_l and any(k in lower for k in ("show", "view", "where", "3d", "display", "focus", "zoom")):
+    if m_l and any(k in lower for k in ("show", "view", "where", "3d", "display", "focus", "zoom", "check", "inspect")):
         return m_l.group(1).upper()
 
     if "where" in lower and "leak" in lower:
         return "leak"
 
-    if any(k in lower for k in ("reservoir", "res-01")) and any(k in lower for k in ("show", "view", "3d", "display", "focus", "twin")):
-        return "reservoir"
+    if any(k in lower for k in ("reservoir", "res-01")) and any(
+        k in lower for k in ("inside", "look", "show", "view", "3d", "display", "focus", "twin", "check")
+    ):
+        return "reservoir_inside"
 
-    if any(k in lower for k in ("plant", "desal", "desal-01")) and any(k in lower for k in ("show", "view", "3d", "display", "focus", "twin")):
+    if "intake" in lower and any(k in lower for k in ("show", "view", "3d", "display", "focus", "twin", "check", "algae", "status")):
+        return "intake"
+
+    if any(k in lower for k in ("plant", "desal", "desal-01", "desalination")) and any(
+        k in lower for k in ("show", "view", "3d", "display", "focus", "twin", "check", "inspect")
+    ):
         return "plant"
 
+    m_j = re.search(r"\b(j-?0?\d{1,2})\b", cleaned, re.IGNORECASE)
+    if m_j and any(k in lower for k in ("show", "view", "where", "3d", "focus", "zoom", "inspect", "twin")):
+        digits = re.sub(r"\D", "", m_j.group(1))
+        return f"J-{int(digits):02d}"
+
     m_s = re.search(r"sector\s*([1-6])", cleaned, re.IGNORECASE)
-    if m_s and any(k in lower for k in ("show", "view", "3d", "display", "focus", "zoom", "twin")):
+    if m_s and any(
+        k in lower for k in ("show", "view", "3d", "display", "focus", "zoom", "twin", "chlorine", "what about", "check", "status")
+    ):
         return f"Sector {m_s.group(1)}"
 
     if any(k in lower for k in ("3d", "digital twin")):
@@ -376,10 +393,9 @@ def build_3d_render_summary(
     db_path: Optional[str] = None,
 ) -> dict:
     """Compute exact factual summary of what show_3d renders so the AI only describes what is actually shown."""
-    from digital_twin.scene_state import build_3d_scene_state
+    from digital_twin.scene_state import build_3d_scene_state, build_twin_view_command
 
     raw_focus = (focus or "all").strip()
-    # Resolve generic 'leak' focus to the first active leak ID (or Sector 4 fallback)
     if raw_focus.lower() == "leak":
         conn = get_db_connection(db_path)
         try:
@@ -400,6 +416,7 @@ def build_3d_render_summary(
     pipes = state.get("pipes") or []
     valves = state.get("valves") or []
     leaks = state.get("leaks") or []
+    junctions = state.get("junctions") or []
     active_leaks = [l for l in leaks if l.get("active")]
     sectors = state.get("sectors") or []
     hyd = state.get("hydraulics") or {}
@@ -407,11 +424,12 @@ def build_3d_render_summary(
     if f_type == "sector" and f_id:
         sec_obj = next((s for s in sectors if s["name"].lower() == f_id.lower()), None)
         if sec_obj:
+            fire_note = ", FIRE EMERGENCY active" if sec_obj.get("has_fire_emergency") else ""
             summary_text = (
                 f"3D digital twin focused on **{sec_obj['name']}** ({sec_obj['color_name']}, other sectors dimmed): "
                 f"{sec_obj['pipe_count']} pipe(s), {sec_obj['valve_count']} valve(s), total flow **{sec_obj['total_flow_lps']:.1f} L/s**, "
                 f"chlorine **{sec_obj['chlorine_mg_l']:.2f} mg/L** (`{sec_obj['compliance_status']}`), "
-                f"**{sec_obj['active_leaks']}** active leak(s)."
+                f"**{sec_obj['active_leaks']}** active leak(s){fire_note}."
             )
         else:
             summary_text = f"3D digital twin focused on **{cam_label}**."
@@ -436,17 +454,40 @@ def build_3d_render_summary(
             )
         else:
             summary_text = f"3D digital twin focused on **{f_id}** ({len(active_leaks)} active leak(s) network-wide)."
-    elif f_type == "reservoir":
+    elif f_type == "junction" and f_id:
+        j_obj = next((j for j in junctions if j["junction_id"].upper() == f_id.upper()), None)
+        if j_obj:
+            summary_text = (
+                f"3D digital twin focused on **Junction {j_obj['junction_id']}** ({j_obj['sector']}): "
+                f"pressure **{j_obj['pressure_psi']:.1f} psi**, flow **{j_obj['flow_lps']:.1f} L/s**."
+            )
+        else:
+            summary_text = f"3D digital twin focused on **Junction {f_id}**."
+    elif f_type in ("reservoir", "reservoir_inside"):
+        dyn_note = (
+            f" (dynamic emergency floor **{res.get('safety_floor_percent', 35.0):.1f}%** active)"
+            if res.get("has_active_emergency")
+            else f" (safety floor **{res.get('safety_floor_percent', 35.0):.1f}%**, warning **{res.get('warning_floor_percent', 40.0):.1f}%**)"
+        )
         summary_text = (
-            f"3D digital twin focused on **Reservoir RES-01**: water level **{res.get('level_percent', 48.0):.1f}%** "
-            f"({res.get('volume_ml', 240.0):.1f} / {res.get('capacity_ml', 500.0):.0f} ML) against "
-            f"**{res.get('safety_floor_percent', 35.0):.1f}%** safety floor; DESAL-01 feeding **{plant.get('output_mld', 100.0):.0f} MLD**."
+            f"3D digital twin looking inside **Reservoir RES-01**: water level **{res.get('level_percent', 48.0):.1f}%** "
+            f"({res.get('volume_ml', 240.0):.1f} / {res.get('capacity_ml', 500.0):.0f} ML){dyn_note}; "
+            f"DESAL-01 inlet feeding **{plant.get('output_mld', 100.0):.0f} MLD**."
+        )
+    elif f_type == "intake":
+        intakes = plant.get("intakes") or []
+        i_desc = ", ".join(f"{it['id']}: `{it['status']}` ({it['turbidity_ntu']} NTU)" for it in intakes)
+        summary_text = (
+            f"3D digital twin focused on **DESAL-01 Seawater Intakes**: {i_desc}; "
+            f"bloom severity `{plant.get('bloom_severity', 'NONE')}`, algae cap **{plant.get('algae_cap_mld', 120.0):.0f} MLD**."
         )
     elif f_type == "plant":
+        intakes = plant.get("intakes") or []
+        int2_st = intakes[1]["status"] if len(intakes) > 1 else "ACTIVE"
         summary_text = (
-            f"3D digital twin focused on **DESAL-01** coastal plant: output **{plant.get('output_mld', 100.0):.0f} / "
-            f"{plant.get('max_capacity_mld', 120.0):.0f} MLD** (algae cap **{plant.get('algae_cap_mld', 120.0):.0f} MLD**, "
-            f"status `{plant.get('status', 'ONLINE')}`)."
+            f"3D digital twin focused on **DESAL-01** coastal desalination plant (intakes, pre-treatment, RO hall, HP pumps, substation, brine outfall): "
+            f"output **{plant.get('output_mld', 100.0):.0f} / {plant.get('max_capacity_mld', 120.0):.0f} MLD**, "
+            f"algae cap **{plant.get('algae_cap_mld', 120.0):.0f} MLD**, Intake 2 `{int2_st}`, status `{plant.get('status', 'ONLINE')}`."
         )
     else:
         closed_valves = [v["valve_id"] for v in valves if v["status"] == "CLOSED"]
@@ -456,13 +497,23 @@ def build_3d_render_summary(
             f"RES-01 at **{res.get('level_percent', 48.0):.1f}%**, DESAL-01 at **{plant.get('output_mld', 100.0):.0f} MLD**."
         )
 
+    tv_cmd = build_twin_view_command(
+        focus=raw_focus,
+        event_type="focus",
+        note=cam_label,
+    )
+
     return {
         "displayed": True,
         "view": "3D",
         "focus": f_id or "all",
+        "raw_focus": raw_focus,
         "focus_type": f_type,
         "focus_id": f_id,
         "camera_label": cam_label,
+        "camera_target": state.get("camera_target"),
+        "highlight": hl,
+        "twin_view": tv_cmd,
         "reservoir_percent": res.get("level_percent", 48.0),
         "plant_output_mld": plant.get("output_mld", 100.0),
         "active_leaks": len(active_leaks),
@@ -1257,7 +1308,10 @@ def run_scenario_for_chat(
         }
     ]
 
-    # Attach relevant 3D Digital Twin view + contextual charts right inside the scenario result card!
+    # Attach relevant 3D Digital Twin view command + contextual charts for every Round 1 & Round 2 scenario!
+    from digital_twin.scene_state import build_twin_view_command
+
+    scenario_twin_view = build_twin_view_command(focus="all", event_type="scenario")
     if entry["id"] == "R1-S1":
         _emit_status(status_callback, "Drawing the map...")
         conn_l = get_db_connection(db_path)
@@ -1267,13 +1321,18 @@ def run_scenario_for_chat(
             conn_l.close()
         j14_focus = lk_row["leak_id"] if lk_row else "Sector 4"
         widgets.append({"type": "twin_3d", "focus": j14_focus})
+        scenario_twin_view = build_twin_view_command(focus=j14_focus, event_type="new_leak", note="J-14 pipe leak detected")
     elif entry["id"] == "R1-S3":
         _emit_status(status_callback, "Drawing the map...")
         widgets.append({"type": "twin_3d", "focus": "V-12"})
+        scenario_twin_view = build_twin_view_command(focus="V-12", event_type="focus", note="V-12 isolation staged")
+    elif entry["id"] == "R1-S4":
+        scenario_twin_view = build_twin_view_command(focus="V-12", event_type="focus", note="Injection blocked — V-12 untouched")
     elif entry["id"] == "R1-S2":
         _emit_status(status_callback, "Validating the plan hour by hour...")
         widgets.append({"type": "twin_3d", "focus": "reservoir"})
         widgets.append({"type": "chart", "metric": "reservoir", "asset": "RES-01", "hours": 24})
+        scenario_twin_view = build_twin_view_command(focus="reservoir_inside", event_type="focus", note="Algae cap & RES-01 safety floor")
         if result.get("schedule_validation"):
             widgets.append(
                 {
@@ -1285,10 +1344,12 @@ def run_scenario_for_chat(
     elif entry["id"] == "U-5.1":
         _emit_status(status_callback, "Drawing the map...")
         widgets.append({"type": "twin_3d", "focus": "Sector 2"})
+        scenario_twin_view = build_twin_view_command(focus="Sector 2", event_type="water_quality", note="Sector 2 chlorine NON_COMPLIANT")
     elif entry["id"] == "U-5.2":
         _emit_status(status_callback, "Validating the plan hour by hour...")
         widgets.append({"type": "twin_3d", "focus": "Sector 6"})
         widgets.append({"type": "chart", "metric": "reservoir", "asset": "RES-01", "hours": 24})
+        scenario_twin_view = build_twin_view_command(focus="Sector 6", event_type="fire_emergency", note="Sector 6 fire — RES-01 floor 35.4%")
         if result.get("schedule_validation"):
             widgets.append(
                 {
@@ -1300,6 +1361,10 @@ def run_scenario_for_chat(
     elif entry["id"] in ("U-5.3", "U-5.4"):
         _emit_status(status_callback, "Drawing the map...")
         widgets.append({"type": "twin_3d", "focus": "V-17"})
+        note_txt = "Untrusted ticket on V-17" if entry["id"] == "U-5.3" else "Token replay blocked — V-18 OPEN"
+        scenario_twin_view = build_twin_view_command(focus="V-17", event_type="focus", note=note_txt)
+    elif entry["id"] == "U-5.5":
+        scenario_twin_view = build_twin_view_command(focus="all", event_type="telemetry_loss", note="TELEMETRY LOSS — holding last safe state")
 
     # Check if any PENDING actions now exist -> show inline Approval Card with buttons!
     conn = get_db_connection(db_path)
@@ -1351,6 +1416,7 @@ def run_scenario_for_chat(
         "code_checks": code_checks,
         "widgets": widgets,
         "staged_action": gw,
+        "twin_view": scenario_twin_view,
         "scenario_meta": {
             "id": entry["id"],
             "scenario_num": scenario_num,
@@ -2295,6 +2361,36 @@ def run_chat_turn(
 
     final_staged = staged_action_holder[-1] if staged_action_holder else None
     ans_status = str(final_staged.get("status", "ALLOWED")) if final_staged else "ALLOWED"
+
+    # Compute twin_view update so the persistent top 3D digital twin follows chat answers automatically
+    from digital_twin.scene_state import build_twin_view_command
+
+    reply_twin_view = None
+    if twin_3d_results_holder:
+        reply_twin_view = twin_3d_results_holder[-1].get("twin_view")
+    elif map_results_holder:
+        m_last = map_results_holder[-1]
+        m_focus = m_last.get("leak_id") or m_last.get("highlight_sector") or "all"
+        reply_twin_view = build_twin_view_command(focus=m_focus, event_type="focus", note=m_last.get("zoom_target", ""))
+    elif final_staged and final_staged.get("status") == "STAGED_PENDING_APPROVAL":
+        from digital_twin.hydraulics import simulate_valve_change_impact
+
+        a_t = str(final_staged.get("action_type", "")).upper()
+        t_id = str(final_staged.get("target_id", "")).upper()
+        if a_t in ("CLOSE_VALVE", "OPEN_VALVE"):
+            imp = simulate_valve_change_impact(t_id, "CLOSED" if a_t == "CLOSE_VALVE" else "OPEN", db_path=db_path)
+            reply_twin_view = build_twin_view_command(
+                focus=t_id,
+                event_type="staged_proposal",
+                note=f"Staged {a_t} {t_id} (awaiting Approve)",
+                highlight_pipe_ids=imp["affected_pipe_ids"],
+            )
+        elif a_t == "SET_PLANT_OUTPUT":
+            reply_twin_view = build_twin_view_command(focus="reservoir_inside", event_type="staged_proposal", note=f"Staged DESAL-01 -> {final_staged.get('proposed_value')} MLD")
+        elif a_t == "ISOLATE_AND_FLUSH" and t_id.startswith("SECTOR-"):
+            sec_num = t_id.split("-")[-1].lstrip("0") or "1"
+            reply_twin_view = build_twin_view_command(focus=f"Sector {sec_num}", event_type="staged_proposal", note=f"Staged ISOLATE_AND_FLUSH Sector {sec_num}")
+
     _audit(
         "CHAT_ANSWER",
         "ASK_AQUAGRID",
@@ -2314,6 +2410,7 @@ def run_chat_turn(
         "widgets": widgets,
         "staged_action": final_staged,
         "providers_tried": providers_tried,
+        "twin_view": reply_twin_view,
     }
 
 
@@ -2329,6 +2426,7 @@ def collect_system_alerts(
     """
     new_msgs: list[dict] = []
     updated_seen = set(seen_alert_keys)
+    from digital_twin.scene_state import build_twin_view_command
 
     # 1. Telemetry Loss (ONLY when actually in TELEMETRY_LOSS, never when Live Sim is merely OFF)
     if telemetry_data.get("telemetry_loss"):
@@ -2350,6 +2448,7 @@ def collect_system_alerts(
                     "code_checks": [{"check": "Telemetry Freshness", "status": "BLOCKED", "code": "TELEMETRY_LOSS", "detail": banner}],
                     "widgets": [{"type": "table", "what": "sensors"}],
                     "staged_action": None,
+                    "twin_view": build_twin_view_command(focus="all", event_type="telemetry_loss", note="TELEMETRY LOSS — holding last safe state"),
                 }
             )
 
@@ -2372,6 +2471,7 @@ def collect_system_alerts(
                     "code_checks": [{"check": "Sector Water Quality", "status": "BLOCKED", "code": "NON_COMPLIANT", "detail": wq_alert}],
                     "widgets": [{"type": "map", "sector": "Sector 2", "leak_id": None}],
                     "staged_action": None,
+                    "twin_view": build_twin_view_command(focus="Sector 2", event_type="water_quality", note="Sector 2 NON_COMPLIANT"),
                 }
             )
 
@@ -2381,6 +2481,7 @@ def collect_system_alerts(
         if key not in updated_seen:
             updated_seen.add(key)
             body = f"{lk.get('junction_id')} ({lk.get('sector')}) — {lk.get('diagnostic', '')}"
+            lk_focus = lk.get("leak_id") or lk.get("junction_id") or lk.get("sector") or "Sector 4"
             new_msgs.append(
                 {
                     "role": "assistant",
@@ -2397,6 +2498,7 @@ def collect_system_alerts(
                         {"type": "chart", "metric": "pressure", "asset": lk.get("junction_id", "J-14"), "hours": 2},
                     ],
                     "staged_action": None,
+                    "twin_view": build_twin_view_command(focus=lk_focus, event_type="new_leak", note=f"New leak at {lk.get('junction_id', lk_focus)}"),
                 }
             )
 
@@ -2422,6 +2524,7 @@ def collect_system_alerts(
                     "code_checks": [{"check": "Reservoir Safety Floor", "status": "BLOCKED", "code": "REJECTED_BY_SAFETY_GUARD", "detail": f"{res_pct:.1f}% < {eff_floor:.1f}%"}],
                     "widgets": [{"type": "chart", "metric": "reservoir", "asset": "RES-01", "hours": 24}],
                     "staged_action": None,
+                    "twin_view": build_twin_view_command(focus="reservoir_inside", event_type="reservoir_alert", note=f"RES-01 below floor ({res_pct:.1f}%)"),
                 }
             )
     elif res.get("has_active_emergency"):
@@ -2442,6 +2545,7 @@ def collect_system_alerts(
                     "code_checks": [{"check": "Dynamic Emergency Floor", "status": "PASS", "code": "VALID", "detail": banner}],
                     "widgets": [{"type": "chart", "metric": "reservoir", "asset": "RES-01", "hours": 24}],
                     "staged_action": None,
+                    "twin_view": build_twin_view_command(focus="Sector 6", event_type="fire_emergency", note=f"Sector 6 fire — floor {eff_floor:.1f}%"),
                 }
             )
 
@@ -2456,6 +2560,12 @@ def collect_system_alerts(
             clk = live_tick_summary.get("clock_display", "")
             if raised:
                 body = f"Live Batch #{tick_id} ({clk}): " + " | ".join(raised[:3])
+                new_lk_id = live_tick_summary.get("new_leak_id")
+                live_tv = (
+                    build_twin_view_command(focus=new_lk_id, event_type="new_leak", note=f"New live leak {new_lk_id}")
+                    if new_lk_id
+                    else build_twin_view_command(focus="all", event_type="live_alert", note=raised[0][:60])
+                )
                 new_msgs.append(
                     {
                         "role": "assistant",
@@ -2467,8 +2577,9 @@ def collect_system_alerts(
                         "provider": "Live Simulator + CODE_GUARD",
                         "tools_called": [],
                         "code_checks": [{"check": "Live SCADA Batch Guard", "status": "BLOCKED", "code": "ALERT ACTIVE", "detail": "; ".join(raised[:3])}],
-                        "widgets": [{"type": "map", "sector": None, "leak_id": live_tick_summary.get("new_leak_id")}],
+                        "widgets": [{"type": "map", "sector": None, "leak_id": new_lk_id}],
                         "staged_action": None,
+                        "twin_view": live_tv,
                     }
                 )
             elif ai_run.get("run_id"):

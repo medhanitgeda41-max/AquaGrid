@@ -55,7 +55,7 @@ _ensure_callable_param("agent.chat_assistant", "run_chat_turn", "status_callback
 _ensure_callable_param("agent.chat_assistant", "run_scenario_for_chat", "status_callback")
 _ensure_callable_param("agent.chat_assistant", "run_production_planner_for_chat", "status_callback")
 _ensure_module_attr("components.badges", "get_sim_step_lock")
-_ensure_module_attr("components.digital_twin_3d", "render_3d_digital_twin")
+_ensure_module_attr("components.digital_twin_3d", "render_persistent_top_twin")
 _ensure_module_attr("components.chat_widgets", "render_chat_widget")
 _ensure_module_attr("components.header", "render_header")
 _ensure_module_attr("components.ai_prompt_panel", "queue_scenario_request")
@@ -71,6 +71,7 @@ from database.seed_data import seed_database
 from guards.telemetry_freshness import refresh_baseline_timestamps
 from simulator import get_simulator
 from components.badges import inject_scada_css
+from components.digital_twin_3d import render_persistent_top_twin, set_twin_view
 from components.header import render_header
 from components.sidebar import render_sidebar
 from components.ai_prompt_panel import render_ask_aquagrid_chat
@@ -119,7 +120,7 @@ def main() -> None:
     # 2. Compact sidebar: Live Simulation, Scenarios (Round 1 & 2), Open Audit Log, Tech Details, Clear Chat
     render_sidebar()
 
-    # 3. Auto-post any new system ALERT messages (leaks, water quality, telemetry loss, floor breach, live checks) into chat
+    # 3. Auto-post any new system ALERT messages (leaks, water quality, telemetry loss, floor breach, live checks) into chat & twin
     seen_alerts = st.session_state.setdefault("_seen_alert_keys", set())
     live_summary = getattr(sim, "last_tick_summary", None) if st.session_state.get("live_sim_toggle", False) else None
     new_alert_msgs, updated_seen = collect_system_alerts(
@@ -131,11 +132,22 @@ def main() -> None:
     if new_alert_msgs:
         st.session_state["_seen_alert_keys"] = updated_seen
         st.session_state.setdefault("ask_aquagrid_messages", []).extend(new_alert_msgs)
+        for am in new_alert_msgs:
+            tv = am.get("twin_view")
+            if isinstance(tv, dict):
+                set_twin_view(
+                    st.session_state,
+                    focus=str(tv.get("focus") or "all"),
+                    event_type=str(tv.get("event_type") or "alert"),
+                    note=str(tv.get("note") or ""),
+                )
 
-    # 4. Full-width "Ask AquaGrid" multi-turn chat with inline visual widgets & button-only approvals
-    turn_ran = render_ask_aquagrid_chat(display_hour=display_hour, snapshot=snapshot)
+    # 4. ONE always-visible realistic 3D Digital Twin at the top (fixed key -> updates in place with ZERO reload!)
+    render_persistent_top_twin(display_hour=display_hour, snapshot=snapshot, height=450)
+
+    # 5. Scrollable "Ask AquaGrid" chat below the twin (chat & events control the top twin automatically)
+    turn_ran = render_ask_aquagrid_chat(display_hour=display_hour, snapshot=snapshot, chat_height=360)
     if turn_ran:
-        # Refresh top status bar in place (preserving st.status('Done') & streamed output)
         with header_placeholder.container():
             render_header(display_hour=display_hour)
 

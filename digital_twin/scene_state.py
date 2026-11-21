@@ -1,4 +1,4 @@
-"""Pure-Python 3D Digital Twin scene-state builder.
+"""Pure-Python 3D Digital Twin scene-state builder & view-command helpers.
 
 Reads live SCADA data from SQLite (read-only) and emits one deterministic JSON-serializable
 scene state with local x/z metre coordinates around the Dubai network centre.
@@ -11,7 +11,7 @@ import random
 import re
 from typing import Optional
 
-from config.constants import DEFAULT_SCADA_HOUR
+from config.constants import DEFAULT_SCADA_HOUR, RESERVOIR_FLOOR_PERCENT
 from config.region_config import SECTOR_COLOR_NAMES, SECTOR_COLORS
 from database.connection import get_db_connection
 from database.dubai_network import (
@@ -23,6 +23,7 @@ from database.dubai_network import (
     compute_sector_boundaries,
     point_in_polygon,
 )
+from digital_twin.hydraulics import compute_network_flows, get_effective_valve_for_segment
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
 
@@ -59,6 +60,15 @@ DUBAI_COASTLINE_LATLON: list[tuple[float, float]] = [
     (25.0200, 55.0750),
 ]
 
+SECTOR_ARCHITECTURAL_STYLES: dict[str, dict] = {
+    "Sector 1": {"style": "historic_midrise", "height_scale": 1.05, "base_hex": "#4B5563"},
+    "Sector 2": {"style": "courtyard_commercial", "height_scale": 1.15, "base_hex": "#475569"},
+    "Sector 3": {"style": "downtown_towers", "height_scale": 1.85, "base_hex": "#334155"},
+    "Sector 4": {"style": "coastal_villas", "height_scale": 0.85, "base_hex": "#52525B"},
+    "Sector 5": {"style": "urban_blocks", "height_scale": 1.10, "base_hex": "#3F4E5A"},
+    "Sector 6": {"style": "marina_skyscrapers", "height_scale": 1.75, "base_hex": "#2E3B4E"},
+}
+
 
 def latlon_to_local_xz(
     lat: float,
@@ -82,10 +92,10 @@ def generate_sector_buildings(
 ) -> list[dict]:
     """
     Deterministically generate seeded procedural city building blocks inside each sector polygon.
-    Same coordinates, dimensions, and heights on every call.
+    Same coordinates, dimensions, styles, and heights on every call.
     """
     buildings: list[dict] = []
-    target_per_sector = 16 if low_quality else 44
+    target_per_sector = 16 if low_quality else 46
 
     for sec_idx in range(1, 7):
         sec_name = f"Sector {sec_idx}"
@@ -95,13 +105,12 @@ def generate_sector_buildings(
         poly = binfo["polygon"]
         (min_lat, min_lon), (max_lat, max_lon) = binfo["bounds"]
         rng = random.Random(4200 + sec_idx * 101)
+        style_cfg = SECTOR_ARCHITECTURAL_STYLES.get(sec_name, {"style": "urban", "height_scale": 1.0, "base_hex": "#475569"})
+        height_scale = float(style_cfg["height_scale"])
 
         placed = 0
         attempts = 0
         max_attempts = target_per_sector * 14
-        # Slightly taller towers in Downtown (Sector 3) and Dubai Marina (Sector 6)
-        height_scale = 1.65 if sec_idx in (3, 6) else (1.2 if sec_idx in (1, 2) else 1.0)
-
         while placed < target_per_sector and attempts < max_attempts:
             attempts += 1
             lat = rng.uniform(min_lat, max_lat)
@@ -109,9 +118,10 @@ def generate_sector_buildings(
             if not point_in_polygon(lat, lon, poly):
                 continue
             x_m, z_m = latlon_to_local_xz(lat, lon)
-            w_m = round(rng.uniform(140.0, 310.0), 1)
-            d_m = round(rng.uniform(140.0, 310.0), 1)
-            h_m = round(rng.uniform(95.0, 360.0) * height_scale, 1)
+            is_tower = (sec_idx in (3, 6)) and (rng.random() < 0.38)
+            w_m = round(rng.uniform(110.0, 220.0) if is_tower else rng.uniform(150.0, 310.0), 1)
+            d_m = round(rng.uniform(110.0, 220.0) if is_tower else rng.uniform(150.0, 310.0), 1)
+            h_m = round((rng.uniform(220.0, 460.0) if is_tower else rng.uniform(85.0, 260.0)) * height_scale, 1)
             buildings.append(
                 {
                     "x": x_m,
@@ -120,6 +130,8 @@ def generate_sector_buildings(
                     "d": d_m,
                     "h": h_m,
                     "sector": sec_name,
+                    "style": style_cfg["style"],
+                    "base_hex": style_cfg["base_hex"],
                     "color": SECTOR_COLORS.get(sec_name, "#64748B"),
                 }
             )
@@ -128,15 +140,70 @@ def generate_sector_buildings(
     return buildings
 
 
+def generate_city_roads_and_trees(
+    boundaries: dict[str, dict],
+    low_quality: bool = False,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Deterministically generate seeded roads between city blocks, green park patches, and trees."""
+    roads: list[dict] = []
+    parks: list[dict] = []
+    trees: list[dict] = []
+    trees_per_sector = 6 if low_quality else 18
+
+    for sec_idx in range(1, 7):
+        sec_name = f"Sector {sec_idx}"
+        binfo = boundaries.get(sec_name)
+        if not binfo:
+            continue
+        poly = binfo["polygon"]
+        (min_lat, min_lon), (max_lat, max_lon) = binfo["bounds"]
+        cx_m, cz_m = latlon_to_local_xz(binfo["centroid"][0], binfo["centroid"][1])
+        rng = random.Random(7700 + sec_idx * 53)
+
+        # Two orthogonal boulevard roads crossing each sector block grid
+        lat_mid = 0.5 * (min_lat + max_lat)
+        lon_mid = 0.5 * (min_lon + max_lon)
+        r1a = list(latlon_to_local_xz(min_lat + 0.12 * (max_lat - min_lat), lon_mid))
+        r1b = list(latlon_to_local_xz(max_lat - 0.12 * (max_lat - min_lat), lon_mid))
+        r2a = list(latlon_to_local_xz(lat_mid, min_lon + 0.12 * (max_lon - min_lon)))
+        r2b = list(latlon_to_local_xz(lat_mid, max_lon - 0.12 * (max_lon - min_lon)))
+        roads.append({"sector": sec_name, "start_xz": r1a, "end_xz": r1b, "width_m": 65.0})
+        roads.append({"sector": sec_name, "start_xz": r2a, "end_xz": r2b, "width_m": 55.0})
+
+        # Seeded community park patch near centroid offset
+        px = round(cx_m + rng.uniform(-550.0, 550.0), 1)
+        pz = round(cz_m + rng.uniform(-550.0, 550.0), 1)
+        parks.append({"sector": sec_name, "x": px, "z": pz, "radius_m": round(rng.uniform(210.0, 340.0), 1)})
+
+        # Seeded park & boulevard trees inside the sector polygon
+        placed = 0
+        attempts = 0
+        while placed < trees_per_sector and attempts < trees_per_sector * 10:
+            attempts += 1
+            lat = rng.uniform(min_lat, max_lat)
+            lon = rng.uniform(min_lon, max_lon)
+            if not point_in_polygon(lat, lon, poly):
+                continue
+            tx, tz = latlon_to_local_xz(lat, lon)
+            trees.append({"x": tx, "z": tz, "scale": round(rng.uniform(0.8, 1.35), 2), "sector": sec_name})
+            placed += 1
+
+    return roads, parks, trees
+
+
 def _normalize_focus(focus: Optional[str]) -> tuple[str, Optional[str]]:
     """Classify focus string into (focus_type, normalized_id)."""
     raw = (focus or "all").strip()
     if not raw or raw.lower() in ("all", "all sectors", "network", "overview"):
         return "all", None
     low = raw.lower()
+    if low in ("reservoir_inside", "inside_reservoir", "inside reservoir", "look inside reservoir", "res-01-inside"):
+        return "reservoir_inside", "RES-01"
     if low in ("reservoir", "res-01", "res01", "tank"):
         return "reservoir", "RES-01"
-    if low in ("plant", "desal", "desal-01", "desal01"):
+    if low in ("intake", "intake-01", "intake-02", "intake 1", "intake 2", "intakes"):
+        return "intake", "INTAKE-02"
+    if low in ("plant", "desal", "desal-01", "desal01", "desalination"):
         return "plant", "DESAL-01"
     m_v = re.match(r"^v-?0?(\d{1,2})$", low)
     if m_v:
@@ -144,15 +211,12 @@ def _normalize_focus(focus: Optional[str]) -> tuple[str, Optional[str]]:
     m_l = re.match(r"^leak-?(\d+)$", low)
     if m_l:
         return "leak", f"LEAK-{int(m_l.group(1)):03d}"
+    m_j = re.match(r"^j-?0?(\d{1,2})$", low)
+    if m_j:
+        return "junction", f"J-{int(m_j.group(1)):02d}"
     m_s = re.search(r"sector[\s-]*0?([1-6])", low)
     if m_s:
         return "sector", f"Sector {m_s.group(1)}"
-    m_j = re.match(r"^j-?0?(\d{1,2})$", low)
-    if m_j:
-        j_id = f"J-{int(m_j.group(1)):02d}"
-        sec = JUNCTION_SECTOR_MAP.get(j_id)
-        if sec:
-            return "sector", sec
     return "all", None
 
 
@@ -162,18 +226,21 @@ def _compute_camera_target(
     sectors: list[dict],
     valves: list[dict],
     leaks: list[dict],
+    junctions: list[dict],
     plant: dict,
     reservoir: dict,
 ) -> dict:
-    """Compute camera look-at target (x, z in metres) and camera offset (x, y, z in metres)."""
+    """Compute camera look-at target (x, z in metres) and camera position (x, y, z in metres)."""
     if focus_type == "sector" and focus_id:
         for s in sectors:
             if s["name"].lower() == focus_id.lower():
                 cx, cz = s["centroid_xz"]
                 return {
                     "target_xz": [cx, cz],
-                    "position_xyz": [round(cx - 4200.0, 1), 3600.0, round(cz + 4600.0, 1)],
+                    "target_y": 150.0,
+                    "position_xyz": [round(cx - 4200.0, 1), 3400.0, round(cz + 4600.0, 1)],
                     "label": s["name"],
+                    "look_inside": False,
                 }
     elif focus_type == "valve" and focus_id:
         for v in valves:
@@ -181,8 +248,10 @@ def _compute_camera_target(
                 vx, vz = v["pos_xz"]
                 return {
                     "target_xz": [vx, vz],
-                    "position_xyz": [round(vx - 2200.0, 1), 1900.0, round(vz + 2500.0, 1)],
+                    "target_y": 160.0,
+                    "position_xyz": [round(vx - 1900.0, 1), 1650.0, round(vz + 2200.0, 1)],
                     "label": f"Valve {v['valve_id']}",
+                    "look_inside": False,
                 }
     elif focus_type == "leak" and focus_id:
         for lk in leaks:
@@ -190,40 +259,138 @@ def _compute_camera_target(
                 lx, lz = lk["pos_xz"]
                 return {
                     "target_xz": [lx, lz],
-                    "position_xyz": [round(lx - 2100.0, 1), 1800.0, round(lz + 2400.0, 1)],
+                    "target_y": 180.0,
+                    "position_xyz": [round(lx - 1850.0, 1), 1550.0, round(lz + 2150.0, 1)],
                     "label": f"{lk['leak_id']} ({lk['sector']})",
+                    "look_inside": False,
                 }
-    elif focus_type == "reservoir":
+    elif focus_type == "junction" and focus_id:
+        for j in junctions:
+            if j["junction_id"].upper() == focus_id.upper():
+                jx, jz = j["pos_xz"]
+                return {
+                    "target_xz": [jx, jz],
+                    "target_y": 160.0,
+                    "position_xyz": [round(jx - 2100.0, 1), 1750.0, round(jz + 2300.0, 1)],
+                    "label": f"Junction {j['junction_id']} ({j['sector']})",
+                    "look_inside": False,
+                }
+    elif focus_type in ("reservoir", "reservoir_inside"):
         rx, rz = reservoir["pos_xz"]
+        # Close cutaway view looking right inside RES-01 (level rings, rippling water, inlet/outlet pipes)
         return {
             "target_xz": [rx, rz],
-            "position_xyz": [round(rx - 2200.0, 1), 1900.0, round(rz + 2600.0, 1)],
-            "label": "Reservoir RES-01",
+            "target_y": 360.0,
+            "position_xyz": [round(rx - 950.0, 1), 720.0, round(rz + 1250.0, 1)],
+            "label": "Inside Reservoir RES-01" if focus_type == "reservoir_inside" else "Reservoir RES-01",
+            "look_inside": True,
+        }
+    elif focus_type == "intake":
+        px, pz = plant["pos_xz"]
+        return {
+            "target_xz": [round(px - 650.0, 1), pz],
+            "target_y": 180.0,
+            "position_xyz": [round(px - 2200.0, 1), 1200.0, round(pz + 1800.0, 1)],
+            "label": "Seawater Intakes (DESAL-01)",
+            "look_inside": False,
         }
     elif focus_type == "plant":
         px, pz = plant["pos_xz"]
         return {
             "target_xz": [px, pz],
-            "position_xyz": [round(px - 2600.0, 1), 2100.0, round(pz + 2800.0, 1)],
+            "target_y": 240.0,
+            "position_xyz": [round(px - 1950.0, 1), 1450.0, round(pz + 2250.0, 1)],
             "label": "Plant DESAL-01",
+            "look_inside": False,
         }
 
     # Default overview: fit all 6 sectors + coastal plant/reservoir nicely
     return {
         "target_xz": [0.0, 1200.0],
-        "position_xyz": [-14500.0, 13500.0, 16500.0],
+        "target_y": 0.0,
+        "position_xyz": [-14500.0, 12800.0, 16200.0],
         "label": "All 6 Sectors (Dubai Network)",
+        "look_inside": False,
     }
 
 
-def _baseline_pipe_flow_lps(diameter_mm: int, plant_output_mld: float, valve_status: str) -> float:
-    """Compute realistic baseline flow (L/s) for a pipe segment based on diameter, plant output, and valve state."""
-    if str(valve_status).upper() == "CLOSED":
-        return 0.0
-    scale = max(0.0, float(plant_output_mld)) / 100.0
-    # Nominal flow by diameter (900mm ~140 L/s, 700mm ~105 L/s, 600mm ~85 L/s, 500mm ~65 L/s, 400mm ~45 L/s)
-    base = max(25.0, (float(diameter_mm) / 600.0) * 85.0)
-    return round(base * scale, 1)
+def build_twin_view_command(
+    focus: str = "all",
+    event_type: str = "focus",
+    note: str = "",
+    highlight_pipe_ids: Optional[list[str]] = None,
+    seq: int = 1,
+) -> dict:
+    """Build a structured view command stored in st.session_state['twin_view'] and sent to the persistent 3D twin."""
+    f_type, f_id = _normalize_focus(focus)
+    return {
+        "focus": focus or "all",
+        "focus_type": f_type,
+        "focus_id": f_id,
+        "event_type": event_type,
+        "note": note,
+        "highlight_pipe_ids": list(highlight_pipe_ids or []),
+        "seq": int(seq),
+    }
+
+
+def build_twin_caption(scene_state: dict, twin_view: Optional[dict] = None) -> str:
+    """Build a concise one-line operator caption describing what the top 3D digital twin currently shows."""
+    tf = scene_state.get("telemetry_status") or {}
+    if tf.get("is_telemetry_loss"):
+        return "Showing: TELEMETRY LOSS — holding last safe state"
+
+    hl = scene_state.get("highlight") or {}
+    f_type = hl.get("type", "all")
+    f_id = hl.get("id")
+    tv_note = (twin_view or {}).get("note") or ""
+    suffix = f" · {tv_note}" if tv_note else ""
+
+    if f_type == "sector" and f_id:
+        sec = next((s for s in scene_state.get("sectors", []) if s["name"].lower() == f_id.lower()), None)
+        if sec:
+            cl_txt = "chlorine NON_COMPLIANT" if sec["compliance_status"] == "NON_COMPLIANT" else "chlorine OK"
+            fire_txt = ", FIRE EMERGENCY" if sec.get("has_fire_emergency") else ""
+            lk_cnt = int(sec.get("active_leaks", 0))
+            lk_txt = f"{lk_cnt} active leak" + ("" if lk_cnt == 1 else "s")
+            return f"Showing: {sec['name']} — {lk_txt}, {cl_txt}{fire_txt}{suffix}"
+
+    if f_type in ("reservoir", "reservoir_inside"):
+        res = scene_state.get("reservoir") or {}
+        em_txt = f", dynamic floor {res.get('safety_floor_percent', 35.0):.1f}%" if res.get("has_active_emergency") else f", floor {res.get('safety_floor_percent', 35.0):.1f}%"
+        prefix = "Inside Reservoir RES-01" if f_type == "reservoir_inside" else "Reservoir RES-01"
+        return f"Showing: {prefix} — {res.get('level_percent', 48.0):.1f}%{em_txt}{suffix}"
+
+    if f_type in ("plant", "intake"):
+        pl = scene_state.get("plant") or {}
+        cap_txt = f" (algae cap {pl.get('algae_cap_mld', 120):.0f} MLD)" if float(pl.get("algae_cap_mld", 120)) < float(pl.get("max_capacity_mld", 120)) else ""
+        return f"Showing: DESAL-01 — {pl.get('output_mld', 100):.0f} MLD{cap_txt}{suffix}"
+
+    if f_type == "valve" and f_id:
+        v = next((x for x in scene_state.get("valves", []) if x["valve_id"].upper() == f_id.upper()), None)
+        if v:
+            return f"Showing: Valve {v['valve_id']} ({v['sector']}) — {v['status']}{suffix}"
+
+    if f_type == "leak" and f_id:
+        lk = next((x for x in scene_state.get("leaks", []) if x["leak_id"].upper() == f_id.upper()), None)
+        if lk:
+            st_txt = "ISOLATED" if lk.get("isolated") else f"{lk.get('estimated_loss_m3_per_hour', 0):.1f} m³/hr"
+            return f"Showing: {lk['leak_id']} ({lk['sector']}) — {lk['severity']}, {st_txt}{suffix}"
+
+    if f_type == "junction" and f_id:
+        j = next((x for x in scene_state.get("junctions", []) if x["junction_id"].upper() == f_id.upper()), None)
+        if j:
+            return f"Showing: Junction {j['junction_id']} ({j['sector']}) — {j['pressure_psi']:.1f} psi, {j['flow_lps']:.1f} L/s{suffix}"
+
+    res = scene_state.get("reservoir") or {}
+    pl = scene_state.get("plant") or {}
+    act_leaks = sum(1 for l in scene_state.get("leaks", []) if l.get("active"))
+    non_comp = [s["name"] for s in scene_state.get("sectors", []) if s.get("compliance_status") == "NON_COMPLIANT"]
+    wq_txt = f"NON_COMPLIANT: {', '.join(non_comp)}" if non_comp else "chlorine OK"
+    return (
+        f"Showing: All 6 Sectors — RES-01 {res.get('level_percent', 48.0):.1f}%, "
+        f"DESAL-01 {pl.get('output_mld', 100.0):.0f} MLD, {act_leaks} active leak(s), {wq_txt}{suffix}"
+    )
 
 
 def build_3d_scene_state(
@@ -290,6 +457,7 @@ def build_3d_scene_state(
 
     res_info = feeds_data.get("reservoir") or {}
     wq_info = feeds_data.get("water_quality") or {}
+    tf_info = tel_data.get("telemetry_freshness") or {}
     plant_output_mld = float(plant_row["production_mld"]) if plant_row else float(feeds_data.get("current_plant_output_mld", 100.0))
     plant_max_mld = float(plant_row["max_capacity_mld"]) if plant_row else 120.0
     plant_status = str(plant_row["status"]) if plant_row else "ONLINE"
@@ -300,8 +468,6 @@ def build_3d_scene_state(
     }
 
     # Pure-Python directed-graph hydraulic propagation
-    from digital_twin.hydraulics import compute_network_flows, get_effective_valve_for_segment
-
     computed_flows: dict[str, float] = dict(flow_override_by_segment or {})
     isolated_leaks: set[str] = set()
     rerouted_segments: set[str] = set()
@@ -341,13 +507,8 @@ def build_3d_scene_state(
             continue
         diam = int(seg.get("diameter_mm", 500))
         v_id = get_effective_valve_for_segment(seg)
-        v_stat = valve_status_map.get(v_id, "OPEN")
         hist_item = hist_by_seg.get(seg_id, {})
-
-        if seg_id in computed_flows:
-            flow_lps = round(float(computed_flows[seg_id]), 1)
-        else:
-            flow_lps = _baseline_pipe_flow_lps(diam, plant_output_mld, v_stat)
+        flow_lps = round(float(computed_flows.get(seg_id, 0.0)), 1)
 
         sector_flow_totals[sec] = round(sector_flow_totals.get(sec, 0.0) + flow_lps, 1)
         is_hl = (
@@ -380,7 +541,6 @@ def build_3d_scene_state(
         v_sec = VALVE_SECTOR_MAP.get(v_id, "Sector 1")
         v_stat = valve_status_map.get(v_id, "OPEN")
         vx, vz = latlon_to_local_xz(v_lat, v_lon)
-        # Find nearest matching pipe direction for wheel orientation
         dir_xz = [1.0, 0.0]
         linked_seg = None
         for p in pipes_out:
@@ -434,10 +594,10 @@ def build_3d_scene_state(
                 "pos_xz": [jx, jz],
                 "pressure_psi": p_val,
                 "flow_lps": f_val,
+                "highlighted": bool(focus_type == "junction" and focus_id and j_id.upper() == focus_id.upper()),
             }
         )
 
-        # Primary representative sensor at this junction (P-xx or T-INTAKE-x)
         if j_id.startswith("J-"):
             s_id = j_id.replace("J-", "P-")
             s_val = p_val
@@ -497,7 +657,8 @@ def build_3d_scene_state(
             }
         )
 
-    # 6. Sectors summary
+    # 6. Sectors summary (with chlorine compliance & Sector 6 fire emergency flag)
+    has_fire_emergency = bool(res_info.get("has_active_emergency", False))
     sectors_out: list[dict] = []
     for i in range(1, 7):
         sec_name = f"Sector {i}"
@@ -522,6 +683,7 @@ def build_3d_scene_state(
                 "chlorine_mg_l": round(cl_val, 3),
                 "compliance_status": comp,
                 "active_leaks": active_leaks_by_sec.get(sec_name, 0),
+                "has_fire_emergency": bool(has_fire_emergency and sec_name == "Sector 6"),
                 "pipe_count": sum(1 for p in pipes_out if p["sector"] == sec_name),
                 "valve_count": sum(1 for v in valves_out if v["sector"] == sec_name),
                 "total_flow_lps": sector_flow_totals.get(sec_name, 0.0),
@@ -529,49 +691,81 @@ def build_3d_scene_state(
             }
         )
 
-    # 7. Plant DESAL-01 & Reservoir RES-01
+    # 7. Detailed DESAL-01 Coastal Desalination Plant (with Intake 1 & Intake 2 status)
     px, pz = latlon_to_local_xz(*DESAL_PLANT_LATLON)
+    bloom_sev = str(wq_info.get("bloom_severity", "NONE")).upper()
+    algae_cap = round(float(wq_info.get("max_allowable_output_mld", 120.0)), 1)
+    intake2_isolated = (bloom_sev in ("CRITICAL", "HIGH", "MODERATE")) or (algae_cap < plant_max_mld - 0.5)
+    t_int1 = next((s["value"] for s in sensors_out if s["sensor_id"] == "T-INTAKE-1"), 1.2)
+    t_int2 = next((s["value"] for s in sensors_out if s["sensor_id"] == "T-INTAKE-2"), 1.25)
+    plant_label = (
+        f"DESAL-01 — {plant_output_mld:.0f} MLD (algae cap {algae_cap:.0f})"
+        if intake2_isolated
+        else f"DESAL-01 — {plant_output_mld:.0f} MLD"
+    )
     plant_out = {
         "id": "DESAL-01",
         "pos_xz": [px, pz],
         "output_mld": round(plant_output_mld, 1),
         "max_capacity_mld": round(plant_max_mld, 1),
-        "algae_cap_mld": round(float(wq_info.get("max_allowable_output_mld", 120.0)), 1),
-        "bloom_severity": str(wq_info.get("bloom_severity", "NONE")),
+        "algae_cap_mld": algae_cap,
+        "bloom_severity": bloom_sev,
         "status": plant_status,
-        "highlighted": focus_type == "plant",
+        "label": plant_label,
+        "intakes": [
+            {"id": "Intake 1", "status": "ACTIVE", "algae_tint": False, "turbidity_ntu": t_int1},
+            {"id": "Intake 2", "status": "ISOLATED" if intake2_isolated else "ACTIVE", "algae_tint": bloom_sev != "NONE", "turbidity_ntu": t_int2},
+        ],
+        "highlighted": focus_type in ("plant", "intake"),
     }
 
+    # 8. Strategic Reservoir RES-01 (with base floor, dynamic floor & warning floor rings)
     rx, rz = latlon_to_local_xz(*RESERVOIR_RES01_LATLON)
+    base_floor_pct = round(RESERVOIR_FLOOR_PERCENT * 100.0, 2)
+    eff_floor_pct = round(float(res_info.get("safety_floor_percent", base_floor_pct)), 2)
     reservoir_out = {
         "id": "RES-01",
         "pos_xz": [rx, rz],
         "level_percent": round(float(res_info.get("current_level_percent", 48.0)), 2),
         "volume_ml": round(float(res_info.get("current_volume_ml", 240.0)), 1),
         "capacity_ml": round(float(res_info.get("capacity_ml", 500.0)), 1),
-        "safety_floor_percent": round(float(res_info.get("safety_floor_percent", 35.0)), 2),
-        "has_active_emergency": bool(res_info.get("has_active_emergency", False)),
-        "highlighted": focus_type == "reservoir",
+        "base_floor_percent": base_floor_pct,
+        "safety_floor_percent": eff_floor_pct,
+        "warning_floor_percent": round(eff_floor_pct + 5.0, 2),
+        "has_active_emergency": has_fire_emergency,
+        "floor_banner": str(res_info.get("floor_banner", "")),
+        "look_inside": focus_type in ("reservoir", "reservoir_inside"),
+        "highlighted": focus_type in ("reservoir", "reservoir_inside"),
     }
 
-    # 8. Deterministic procedural city & western coastline
+    # 9. Deterministic procedural city (buildings, roads, parks, trees) & western coastline
     buildings_out = generate_sector_buildings(boundaries, low_quality=low_quality)
+    roads_out, parks_out, trees_out = generate_city_roads_and_trees(boundaries, low_quality=low_quality)
     coastline_xz = [list(latlon_to_local_xz(lat, lon)) for lat, lon in DUBAI_COASTLINE_LATLON]
 
-    # 9. Highlight & camera target
+    # 10. Highlight & camera target
     camera_target = _compute_camera_target(
         focus_type=focus_type,
         focus_id=focus_id,
         sectors=sectors_out,
         valves=valves_out,
         leaks=leaks_out,
+        junctions=junctions_out,
         plant=plant_out,
         reservoir=reservoir_out,
     )
 
+    telemetry_status = {
+        "status": str(tf_info.get("status", "FRESH")),
+        "is_telemetry_loss": bool(tel_data.get("telemetry_loss", False) or tf_info.get("is_telemetry_loss", False)),
+        "age_seconds": int(tf_info.get("age_seconds", 0) or 0),
+        "banner": str(tf_info.get("banner", "Telemetry fresh.")),
+    }
+
     return {
-        "version": "1.0",
+        "version": "2.0",
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "current_hour": int(current_hour),
         "center_latlon": list(NETWORK_CENTER_LATLON),
         "scale_m_per_unit": 100.0,
         "low_quality": bool(low_quality),
@@ -584,7 +778,11 @@ def build_3d_scene_state(
         "plant": plant_out,
         "reservoir": reservoir_out,
         "buildings": buildings_out,
+        "roads": roads_out,
+        "parks": parks_out,
+        "trees": trees_out,
         "coastline_xz": coastline_xz,
+        "telemetry_status": telemetry_status,
         "highlight": {
             "type": focus_type,
             "id": focus_id,

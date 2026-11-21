@@ -356,4 +356,243 @@ def test_requirements_has_networkx_and_all_3d_cdn_urls_use_https():
         assert url.startswith("https://"), f"CDN URL must use https:// for Streamlit Cloud: {url}"
 
 
+def test_show_3d_sets_twin_view_for_natural_operator_questions():
+    """show_3d and chat routing set twin_view for sectors, look inside reservoir, plant, valves, and chlorine."""
+    from unittest.mock import patch
+    from agent.chat_assistant import build_3d_render_summary, run_chat_turn
+
+    # Direct build_3d_render_summary checks
+    inside = build_3d_render_summary("reservoir_inside", current_hour=14)
+    assert inside["twin_view"]["focus"] == "reservoir_inside"
+    assert inside["camera_target"]["look_inside"] is True
+
+    plant = build_3d_render_summary("plant", current_hour=14)
+    assert plant["twin_view"]["focus"] == "plant"
+    assert plant["focus"] == "DESAL-01"
+
+    intake = build_3d_render_summary("intake", current_hour=14)
+    assert intake["twin_view"]["focus"] == "intake"
+
+    # Natural-language chat routing checks (mock LLM)
+    prompts_and_expected = [
+        ("show Sector 4", "Sector 4"),
+        ("look inside the reservoir", "reservoir_inside"),
+        ("show the desalination plant", "plant"),
+        ("check valve V-12", "V-12"),
+        ("what about Sector 2 chlorine", "Sector 2"),
+    ]
+    with patch("agent.chat_assistant.llm_client.chat_with_tools", return_value=(None, "Deterministic Offline Engine", [])):
+        for prompt, expected_focus in prompts_and_expected:
+            reply = run_chat_turn(prompt, history=[], current_hour=14)
+            tv = reply.get("twin_view")
+            assert tv is not None, f"Missing twin_view for {prompt!r}"
+            assert tv["focus"] == expected_focus, f"For {prompt!r}, expected focus {expected_focus!r}, got {tv['focus']!r}"
+
+
+def test_approve_emits_valve_close_and_zero_downstream_flow_while_reject_leaves_unchanged():
+    """Approve emits valve_close in twin_view with 0 L/s downstream flow; Reject emits valve_reject and changes nothing."""
+    from unittest.mock import patch
+    import components.chat_widgets as cw
+    from database.connection import get_db_connection
+    from digital_twin.hydraulics import compute_network_flows
+    from tools.write_gateway import stage_gated_valve_or_setpoint_action
+
+    class _Col:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    reset_database()
+    gw = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-12",
+        proposed_value=0.0,
+        rationale="Isolate Sector 4 J-14 branch",
+    )
+    assert gw["status"] == "STAGED_PENDING_APPROVAL"
+
+    state_approve: dict = {"operator_signature": "Control_Op", "ask_aquagrid_messages": []}
+    with (
+        patch.object(cw.st, "session_state", state_approve),
+        patch.object(cw.st, "markdown"),
+        patch.object(cw.st, "columns", return_value=(_Col(), _Col(), _Col())),
+        patch.object(cw.st, "button", side_effect=lambda label, **kw: label.startswith("Approve")),
+        patch.object(cw.st, "rerun"),
+    ):
+        cw.render_inline_approvals("ev_ap")
+
+    tv = state_approve.get("twin_view")
+    assert tv is not None
+    assert tv["focus"] == "V-12"
+    assert tv["event_type"] == "valve_close"
+
+    # Computed downstream flow on SEG-S4-01 and SEG-S4-05 is now 0.0 L/s
+    conn = get_db_connection()
+    try:
+        v_map = {r["valve_id"]: r["status"] for r in conn.execute("SELECT valve_id, status FROM valves;").fetchall()}
+        assert v_map["V-12"] == "CLOSED"
+        hyd = compute_network_flows(valve_statuses=v_map)
+        assert hyd["pipe_flows_lps"]["SEG-S4-01"] == 0.0
+        assert hyd["pipe_flows_lps"]["SEG-S4-05"] == 0.0
+    finally:
+        conn.close()
+
+    # Now Reject on a fresh pending action
+    reset_database()
+    gw2 = stage_gated_valve_or_setpoint_action(
+        action_type="CLOSE_VALVE",
+        target_id="V-12",
+        proposed_value=0.0,
+        rationale="Reject test",
+    )
+    assert gw2["status"] == "STAGED_PENDING_APPROVAL"
+
+    state_reject: dict = {"operator_signature": "Control_Op", "ask_aquagrid_messages": []}
+    with (
+        patch.object(cw.st, "session_state", state_reject),
+        patch.object(cw.st, "markdown"),
+        patch.object(cw.st, "columns", return_value=(_Col(), _Col(), _Col())),
+        patch.object(cw.st, "button", side_effect=lambda label, **kw: label.startswith("Reject")),
+        patch.object(cw.st, "rerun"),
+    ):
+        cw.render_inline_approvals("ev_rej")
+
+    tv_rej = state_reject.get("twin_view")
+    assert tv_rej is not None
+    assert tv_rej["focus"] == "V-12"
+    assert tv_rej["event_type"] == "valve_reject"
+    assert "Rejected" in tv_rej["note"]
+
+    conn = get_db_connection()
+    try:
+        v_map2 = {r["valve_id"]: r["status"] for r in conn.execute("SELECT valve_id, status FROM valves;").fetchall()}
+        assert v_map2["V-12"] == "OPEN"
+        hyd2 = compute_network_flows(valve_statuses=v_map2)
+        assert hyd2["pipe_flows_lps"]["SEG-S4-01"] > 0.0
+    finally:
+        conn.close()
+
+
+def test_new_leak_emits_new_leak_event_from_scenario_and_alerts():
+    """R1-S1 scenario and collect_system_alerts emit event_type='new_leak' in twin_view."""
+    from unittest.mock import patch
+    from agent.chat_assistant import collect_system_alerts, run_scenario_for_chat
+    from agent.llm_factory import generate_offline_mock_response
+    from tools.read_feeds import read_tariff_and_quality_feeds
+    from tools.read_telemetry import read_network_telemetry
+
+    reset_database()
+    with patch("agent.nodes.llm_client.query", side_effect=lambda sp, up: (generate_offline_mock_response(sp, up), "Deterministic Offline Engine")):
+        msg = run_scenario_for_chat("R1-S1", current_hour=14)
+    assert msg.get("twin_view") is not None
+    assert msg["twin_view"]["event_type"] == "new_leak"
+
+    # System alert for confirmed leak also emits new_leak
+    tel = read_network_telemetry(current_hour=14, log_audit=False)
+    feeds = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=14, log_audit=False)
+    alerts, _ = collect_system_alerts(tel, feeds, seen_alert_keys=set())
+    leak_alerts = [a for a in alerts if a.get("twin_view", {}).get("event_type") == "new_leak"]
+    assert len(leak_alerts) >= 1
+
+
+def test_persistent_top_twin_uses_fixed_component_key_without_reload():
+    """render_persistent_top_twin passes updates to the SAME fixed component key across reruns (no iframe reload)."""
+    from unittest.mock import patch
+    import components.digital_twin_3d as dt3d
+
+    reset_database()
+    calls = []
+
+    def _fake_component(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    class _Col:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_state: dict = {"twin_view": {"focus": "all", "event_type": "focus", "note": "", "seq": 1}}
+
+    with (
+        patch.object(dt3d, "_aquagrid_3d_component", side_effect=_fake_component),
+        patch.object(dt3d.st, "session_state", fake_state),
+        patch.object(dt3d.st, "markdown"),
+        patch.object(dt3d.st, "columns", side_effect=lambda spec, **kw: tuple(_Col() for _ in range(len(spec) if isinstance(spec, (list, tuple)) else int(spec)))),
+        patch.object(dt3d.st, "button", return_value=False),
+        patch.object(dt3d.st, "rerun"),
+    ):
+        dt3d.render_persistent_top_twin(display_hour=14, height=450)
+        # Update focus via set_twin_view (simulating a chat turn) and re-render
+        dt3d.set_twin_view(fake_state, focus="Sector 4", event_type="focus", note="Sector 4")
+        dt3d.render_persistent_top_twin(display_hour=14, height=450)
+        dt3d.set_twin_view(fake_state, focus="reservoir_inside", event_type="focus", note="Inside RES-01")
+        dt3d.render_persistent_top_twin(display_hour=14, height=450)
+
+    assert len(calls) == 3
+    keys = [c["key"] for c in calls]
+    assert keys == [dt3d.TWIN_COMPONENT_KEY] * 3
+    assert calls[0]["view_command"]["focus"] == "all"
+    assert calls[1]["view_command"]["focus"] == "Sector 4"
+    assert calls[2]["view_command"]["focus"] == "reservoir_inside"
+    assert calls[2]["view_command"]["seq"] > calls[1]["view_command"]["seq"]
+
+
+def test_twin_frontend_index_html_has_realistic_3d_features_and_no_carto():
+    """Custom component frontend index.html implements bidirectional Streamlit messaging, Sky/Water/DESAL/RES cutaway, and OSM fallback with zero CARTO."""
+    frontend_html = (PROJECT_ROOT / "app" / "components" / "twin_frontend" / "index.html").read_text(encoding="utf-8")
+
+    # Bidirectional Streamlit component protocol
+    assert "streamlit:componentReady" in frontend_html
+    assert "streamlit:render" in frontend_html
+    assert "streamlit:setFrameHeight" in frontend_html
+
+    # Realistic Three.js modules over HTTPS (no CARTO, no API keys)
+    assert "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" in frontend_html
+    assert "three/addons/controls/OrbitControls.js" in frontend_html
+    assert "three/addons/objects/Sky.js" in frontend_html
+    assert "three/addons/objects/Water.js" in frontend_html
+    assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in frontend_html
+    assert "carto" not in frontend_html.lower()
+
+    # Required realistic features
+    assert "DESAL-01" in frontend_html
+    assert "RO Hall" in frontend_html
+    assert "Intake 2" in frontend_html
+    assert "Brine Outfall" in frontend_html
+    assert "TELEMETRY LOSS" in frontend_html
+    assert "render2DFallback" in frontend_html
+    assert "InstancedMesh" in frontend_html
+    assert "applySceneUpdate" in frontend_html
+
+
+def test_scene_state_includes_detailed_plant_reservoir_rings_and_city_features():
+    """build_3d_scene_state includes detailed DESAL-01 intakes, RES-01 floor rings, seeded roads/trees, and telemetry_status."""
+    from digital_twin.scene_state import build_twin_caption
+
+    reset_database()
+    state = build_3d_scene_state(current_hour=14, focus="reservoir_inside")
+
+    assert len(state["plant"]["intakes"]) == 2
+    assert state["plant"]["intakes"][0]["id"] == "Intake 1"
+    assert state["plant"]["intakes"][1]["id"] == "Intake 2"
+    assert state["reservoir"]["base_floor_percent"] == 35.0
+    assert state["reservoir"]["safety_floor_percent"] >= 35.0
+    assert state["reservoir"]["warning_floor_percent"] == round(state["reservoir"]["safety_floor_percent"] + 5.0, 2)
+    assert state["reservoir"]["look_inside"] is True
+    assert state["camera_target"]["look_inside"] is True
+    assert len(state["roads"]) > 0
+    assert len(state["parks"]) > 0
+    assert len(state["trees"]) > 0
+    assert state["telemetry_status"]["is_telemetry_loss"] is False
+
+    caption = build_twin_caption(state, {"focus": "reservoir_inside", "event_type": "focus"})
+    assert "Inside Reservoir RES-01" in caption
+
+
+
 
