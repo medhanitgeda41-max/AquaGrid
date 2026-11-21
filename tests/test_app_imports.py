@@ -39,3 +39,17 @@ def test_app_and_every_component_module_imports_cleanly():
     ai_panel = importlib.import_module("components.ai_prompt_panel")
     assert callable(ai_panel.render_ask_aquagrid_chat)
     assert callable(ai_panel.render_ai_prompt_panel)
+
+
+def test_sidebar_expanded_by_default_and_css_preserves_sidebar_toggle():
+    """Sidebar must start expanded and CSS must never hide header or sidebar expand/collapse controls."""
+    app_src = (APP_DIR / "app.py").read_text(encoding="utf-8")
+    assert 'initial_sidebar_state="expanded"' in app_src
+
+    badges_mod = importlib.import_module("components.badges")
+    css = badges_mod.SCADA_CSS
+    assert '[data-testid="stSidebarCollapsedControl"]' in css
+    assert '[data-testid="stExpandSidebarButton"]' in css
+    assert "header, #MainMenu, footer" not in css
+    assert '[data-testid="stToolbar"]' not in css
+    assert "#MainMenu" in css and "footer" in css
