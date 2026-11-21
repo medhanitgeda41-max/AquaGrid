@@ -1,10 +1,14 @@
 """Ask AquaGrid — Full-width multi-turn AI Chat Assistant with live Thinking status, streaming, inline widgets & 'How I got this'."""
 import html
+import importlib
+import inspect
 import logging
 import re
 import time
+import traceback
 import streamlit as st
 
+import agent.chat_assistant as _chat_assistant_mod
 from agent.chat_assistant import EXAMPLE_QUESTIONS, run_chat_turn, run_scenario_for_chat
 from agent.llm_factory import provider_supports_streaming
 from config.constants import DEFAULT_SCADA_HOUR
@@ -14,6 +18,36 @@ from components.badges import status_badge
 from components.chat_widgets import render_chat_widget
 
 logger = logging.getLogger("aquagrid.ui.chat")
+
+
+def _call_with_optional_status(fn, status_callback, **kwargs):
+    """
+    Invoke run_chat_turn / run_scenario_for_chat safely even if a Streamlit hot-reload left an older
+    signature cached in sys.modules or a unit test mocked the function without status_callback.
+    """
+    target = getattr(fn, "side_effect", None)
+    check_fn = target if callable(target) else fn
+    try:
+        params = inspect.signature(check_fn).parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        accepts_status = ("status_callback" in params) or has_var_kw
+    except (TypeError, ValueError):
+        accepts_status = False
+
+    # If the real module function is stale after hot-reload, reload agent.chat_assistant once
+    if not accepts_status and target is None and getattr(fn, "__module__", "") == "agent.chat_assistant":
+        reloaded = importlib.reload(_chat_assistant_mod)
+        fresh_fn = getattr(reloaded, getattr(fn, "__name__", ""), fn)
+        fn = fresh_fn
+        try:
+            params = inspect.signature(fn).parameters
+            accepts_status = "status_callback" in params
+        except (TypeError, ValueError):
+            accepts_status = False
+
+    if accepts_status and status_callback is not None:
+        kwargs["status_callback"] = status_callback
+    return fn(**kwargs)
 
 
 def is_chat_generating(session_state: dict) -> bool:
@@ -80,15 +114,34 @@ def queue_scenario_request(
 
 
 def word_stream_generator(text: str, max_total_seconds: float = 0.6):
-    """Yield text word-by-word (preserving markdown spacing/newlines) for st.write_stream."""
-    if not text:
+    """Yield text word-by-word (preserving markdown spacing/newlines) as a pure generator for st.write_stream."""
+    safe_text = "" if text is None else (text if isinstance(text, str) else str(text))
+    if not safe_text:
         return
-    tokens = re.findall(r"\S+\s*|\n+", str(text))
+    tokens = re.findall(r"\S+\s*|\n+", safe_text)
     delay = min(0.015, max_total_seconds / max(1, len(tokens))) if max_total_seconds > 0 else 0.0
     for tok in tokens:
         yield tok
         if delay > 0:
             time.sleep(delay)
+
+
+def _render_text_response(content, provider: str, kind: str, stream_text: bool) -> None:
+    """Stream text word-by-word via st.write_stream when supported; otherwise render with st.markdown."""
+    safe_text = "" if content is None else (content if isinstance(content, str) else str(content))
+    if (
+        stream_text
+        and kind == "text"
+        and safe_text.strip()
+        and provider_supports_streaming(str(provider or ""))
+        and hasattr(st, "write_stream")
+    ):
+        try:
+            st.write_stream(word_stream_generator(safe_text))
+            return
+        except Exception:
+            logging.exception("st.write_stream failed; falling back to st.markdown")
+    st.markdown(safe_text)
 
 
 def _sync_scenario_state(reply: dict) -> None:
@@ -178,26 +231,25 @@ def _render_assistant_message_contents(
 ) -> None:
     """Render an assistant message's text (streamed when supported), inline widgets, provider line, and 'How I got this'."""
     kind = msg.get("kind", "text")
-    content = msg.get("content", "")
-    provider = msg.get("provider", "System")
+    raw_content = msg.get("content")
+    content = "" if raw_content is None else (raw_content if isinstance(raw_content, str) else str(raw_content))
+    provider = str(msg.get("provider") or "System")
 
     if kind == "alert":
-        alert_code = msg.get("alert_code", "ALERT")
-        alert_title = msg.get("alert_title") or "ALERT"
-        raw_body = msg.get("alert_body") or content
+        alert_code = str(msg.get("alert_code") or "ALERT")
+        alert_title = str(msg.get("alert_title") or "ALERT")
+        raw_body = msg.get("alert_body") if msg.get("alert_body") is not None else content
         clean_body = str(raw_body).replace("**", "").replace("`", "")
         st.markdown(
             f'<div class="scada-card-alert">'
             f'{status_badge(alert_code)} '
-            f'<strong>{html.escape(str(alert_title))}:</strong> '
+            f'<strong>{html.escape(alert_title)}:</strong> '
             f'{html.escape(clean_body)}'
             f'</div>',
             unsafe_allow_html=True,
         )
-    elif stream_text and kind == "text" and provider_supports_streaming(str(provider)) and hasattr(st, "write_stream"):
-        st.write_stream(word_stream_generator(content))
     else:
-        st.markdown(content)
+        _render_text_response(content=content, provider=provider, kind=kind, stream_text=stream_text)
 
     # Render any inline visual components attached to this message
     for w_idx, widget in enumerate(msg.get("widgets") or []):
@@ -274,23 +326,48 @@ def _execute_pending_request(pending: dict, snapshot: dict, show_tech: bool) -> 
                     if sc_id != "U-5.5" and sim is not None and hasattr(sim, "resume_feed"):
                         sim.resume_feed()
                     with simulator_step_lock(sim):
-                        reply = run_scenario_for_chat(
-                            sc_id,
+                        reply = _call_with_optional_status(
+                            run_scenario_for_chat,
+                            _on_status,
+                            scenario_key=sc_id,
                             current_hour=pending.get("display_hour", DEFAULT_SCADA_HOUR),
-                            status_callback=_on_status,
                         )
                 else:
                     with simulator_step_lock(sim):
-                        reply = run_chat_turn(
+                        reply = _call_with_optional_status(
+                            run_chat_turn,
+                            _on_status,
                             user_message=pending["text"],
                             history=pending.get("prior_history") or [],
                             current_hour=pending.get("display_hour", DEFAULT_SCADA_HOUR),
-                            status_callback=_on_status,
                         )
-                status_box.update(label="Done", state="complete", expanded=False)
+
+                if not isinstance(reply, dict):
+                    reply = {
+                        "role": "assistant",
+                        "kind": "text",
+                        "content": "" if reply is None else str(reply),
+                        "provider": "System",
+                        "tools_called": [],
+                        "code_checks": [],
+                        "widgets": [],
+                        "staged_action": None,
+                    }
+
+                if reply.get("error") or reply.get("kind") == "error":
+                    err_line = str(reply.get("error_detail") or reply.get("content") or "Request failed")
+                    status_box.write(f"Error: {err_line}")
+                    status_box.update(label="Error", state="error", expanded=False)
+                else:
+                    status_box.update(label="Done", state="complete", expanded=False)
             except Exception as exc:
-                logger.exception("Live chat request failed unexpectedly")
-                status_box.update(label="Done", state="error", expanded=False)
+                logging.exception("Live chat request failed unexpectedly")
+                tb_frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
+                last_frame = tb_frames[-1] if tb_frames else None
+                location = f"{last_frame.filename}:{last_frame.lineno}" if last_frame else "unknown"
+                err_detail = f"{type(exc).__name__}: {exc} ({location})"
+                status_box.write(f"Error: {type(exc).__name__}: {exc}")
+                status_box.update(label="Error", state="error", expanded=False)
                 reply = {
                     "role": "assistant",
                     "kind": "error",
@@ -300,7 +377,8 @@ def _execute_pending_request(pending: dict, snapshot: dict, show_tech: bool) -> 
                     "code_checks": [],
                     "widgets": [],
                     "staged_action": None,
-                    "error_detail": f"{type(exc).__name__}: {exc}",
+                    "error_detail": err_detail,
+                    "error": True,
                 }
             finally:
                 st.session_state["_pending_chat_request"] = None

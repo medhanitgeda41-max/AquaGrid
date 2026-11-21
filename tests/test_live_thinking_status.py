@@ -221,3 +221,239 @@ def test_provider_failover_and_planner_and_scenario_emit_expected_status_steps()
     assert provider_supports_streaming("Ollama (qwen3:8b)") is True
     assert provider_supports_streaming("Deterministic Offline Engine") is False
     assert provider_supports_streaming("CODE_GUARD") is False
+
+
+def test_mocked_groq_greeting_streamed_non_streamed_tool_calls_and_failover():
+    """Mocked Groq handles greeting ('Hello'), streamed text, non-streamed text, tool calls, and failover — never Error Handler."""
+    import inspect
+    import components.ai_prompt_panel as panel
+
+    class _FakeCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeStatus(_FakeCtx):
+        def __init__(self):
+            self.updates = []
+            self.writes = []
+
+        def write(self, msg):
+            self.writes.append(msg)
+
+        def update(self, label=None, state=None, expanded=None):
+            self.updates.append((label, state, expanded))
+
+    # --- Case 1: Simple greeting ("Hello") streamed via mocked Groq ---
+    state_greet: dict = {}
+    assert panel.queue_chat_request(state_greet, "Hello", display_hour=14) is True
+    status_greet = _FakeStatus()
+    stream_args = []
+
+    def _capture_stream(gen):
+        assert inspect.isgenerator(gen), "st.write_stream must receive a generator of text chunks"
+        chunks = list(gen)
+        stream_args.append(chunks)
+        return "".join(chunks)
+
+    ok_greet = MagicMock()
+    ok_greet.choices = [MagicMock()]
+    ok_greet.choices[0].message.tool_calls = None
+    ok_greet.choices[0].message.content = "Hello! AquaGrid is online and RES-01 is at 48.0%."
+    fake_oa_greet = MagicMock()
+    fake_oa_greet.chat.completions.create.return_value = ok_greet
+    groq_chain = [
+        {"name": "Groq (openai/gpt-oss-120b)", "base_url": "https://api.groq.com/openai/v1", "api_key": "gsk_test_1", "model": "openai/gpt-oss-120b"},
+        {"name": "Groq (openai/gpt-oss-20b)", "base_url": "https://api.groq.com/openai/v1", "api_key": "gsk_test_2", "model": "openai/gpt-oss-20b"},
+    ]
+
+    with (
+        patch.object(panel.st, "session_state", state_greet),
+        patch.object(panel.st, "chat_message", return_value=_FakeCtx()),
+        patch.object(panel.st, "status", return_value=status_greet),
+        patch.object(panel.st, "write_stream", side_effect=_capture_stream),
+        patch.object(panel.st, "markdown"),
+        patch.object(panel.st, "expander", return_value=_FakeCtx()),
+        patch.object(panel.st, "caption"),
+        patch("agent.llm_factory.llm_client._get_chat_provider_chain", return_value=groq_chain),
+        patch("agent.llm_factory.OpenAI", return_value=fake_oa_greet),
+    ):
+        panel._execute_pending_request(state_greet["_pending_chat_request"], snapshot={}, show_tech=False)
+
+    reply_greet = state_greet["ask_aquagrid_messages"][-1]
+    assert reply_greet["provider"] == "Groq (openai/gpt-oss-120b)"
+    assert reply_greet["provider"] != "Error Handler"
+    assert "Hello!" in reply_greet["content"]
+    assert len(stream_args) == 1 and "".join(stream_args[0]).strip() == reply_greet["content"]
+    assert status_greet.updates[-1] == ("Done", "complete", False)
+
+    # --- Case 2: Non-streamed answer (Deterministic Offline Engine -> st.markdown, NOT st.write_stream) ---
+    state_nonstream: dict = {}
+    assert panel.queue_chat_request(state_nonstream, "What is the current status?", display_hour=14) is True
+    md_calls = []
+    ws_mock = MagicMock()
+    with (
+        patch.object(panel.st, "session_state", state_nonstream),
+        patch.object(panel.st, "chat_message", return_value=_FakeCtx()),
+        patch.object(panel.st, "status", return_value=_FakeStatus()),
+        patch.object(panel.st, "write_stream", ws_mock),
+        patch.object(panel.st, "markdown", side_effect=lambda txt, **kw: md_calls.append(txt)),
+        patch.object(panel.st, "expander", return_value=_FakeCtx()),
+        patch.object(panel.st, "caption"),
+        patch("agent.chat_assistant.llm_client.chat_with_tools", return_value=(None, "Deterministic Offline Engine", [])),
+    ):
+        panel._execute_pending_request(state_nonstream["_pending_chat_request"], snapshot={}, show_tech=False)
+
+    reply_ns = state_nonstream["ask_aquagrid_messages"][-1]
+    assert reply_ns["provider"] == "Deterministic Offline Engine"
+    assert reply_ns["provider"] != "Error Handler"
+    ws_mock.assert_not_called()
+    assert any("Live Grid Status" in str(m) for m in md_calls)
+
+    # --- Case 3: Answer with tool calls (tools execute synchronously, then final text is streamed) ---
+    state_tools: dict = {}
+    assert panel.queue_chat_request(state_tools, "Show all sectors on the map", display_hour=14) is True
+    tc_obj = MagicMock()
+    tc_obj.id = "call_map_1"
+    tc_obj.function.name = "show_map"
+    tc_obj.function.arguments = '{"sector": "all", "show_boundaries": true}'
+    resp_tool = MagicMock()
+    resp_tool.choices = [MagicMock()]
+    resp_tool.choices[0].message.content = None
+    resp_tool.choices[0].message.tool_calls = [tc_obj]
+
+    resp_final = MagicMock()
+    resp_final.choices = [MagicMock()]
+    resp_final.choices[0].message.content = "Showing all 6 sectors on OpenStreetMap."
+    resp_final.choices[0].message.tool_calls = None
+
+    fake_oa_tools = MagicMock()
+    fake_oa_tools.chat.completions.create.side_effect = [resp_tool, resp_final]
+    tool_stream_chunks = []
+
+    def _capture_tool_stream(gen):
+        assert inspect.isgenerator(gen)
+        chunks = list(gen)
+        tool_stream_chunks.extend(chunks)
+        return "".join(chunks)
+
+    with (
+        patch.object(panel.st, "session_state", state_tools),
+        patch.object(panel.st, "chat_message", return_value=_FakeCtx()),
+        patch.object(panel.st, "status", return_value=_FakeStatus()),
+        patch.object(panel.st, "write_stream", side_effect=_capture_tool_stream),
+        patch.object(panel.st, "markdown"),
+        patch.object(panel.st, "expander", return_value=_FakeCtx()),
+        patch.object(panel.st, "caption"),
+        patch("components.ai_prompt_panel.render_chat_widget"),
+        patch("agent.llm_factory.llm_client._get_chat_provider_chain", return_value=groq_chain),
+        patch("agent.llm_factory.OpenAI", return_value=fake_oa_tools),
+    ):
+        panel._execute_pending_request(state_tools["_pending_chat_request"], snapshot={}, show_tech=False)
+
+    reply_tools = state_tools["ask_aquagrid_messages"][-1]
+    assert reply_tools["provider"] == "Groq (openai/gpt-oss-120b)"
+    assert reply_tools["provider"] != "Error Handler"
+    assert any(w.get("type") == "map" for w in reply_tools.get("widgets", []))
+    assert "".join(tool_stream_chunks).strip() == "Showing all 6 sectors on OpenStreetMap."
+
+    # --- Case 4: Primary provider error falls back cleanly to secondary Groq model ---
+    state_fail: dict = {}
+    assert panel.queue_chat_request(state_fail, "Hello again", display_hour=14) is True
+    status_fail = _FakeStatus()
+    resp_backup = MagicMock()
+    resp_backup.choices = [MagicMock()]
+    resp_backup.choices[0].message.tool_calls = None
+    resp_backup.choices[0].message.content = "Backup Groq 20b answered normally."
+    fake_oa_fail = MagicMock()
+    fake_oa_fail.chat.completions.create.side_effect = [
+        RuntimeError("503 primary busy"),
+        RuntimeError("503 primary retry busy"),
+        resp_backup,
+    ]
+    with (
+        patch.object(panel.st, "session_state", state_fail),
+        patch.object(panel.st, "chat_message", return_value=_FakeCtx()),
+        patch.object(panel.st, "status", return_value=status_fail),
+        patch.object(panel.st, "write_stream", side_effect=lambda g: "".join(list(g))),
+        patch.object(panel.st, "markdown"),
+        patch.object(panel.st, "expander", return_value=_FakeCtx()),
+        patch.object(panel.st, "caption"),
+        patch("agent.llm_factory.llm_client._get_chat_provider_chain", return_value=groq_chain),
+        patch("agent.llm_factory.OpenAI", return_value=fake_oa_fail),
+    ):
+        panel._execute_pending_request(state_fail["_pending_chat_request"], snapshot={}, show_tech=False)
+
+    reply_fail = state_fail["ask_aquagrid_messages"][-1]
+    assert reply_fail["provider"] == "Groq (openai/gpt-oss-20b)"
+    assert reply_fail["provider"] != "Error Handler"
+    assert "Backup Groq 20b" in reply_fail["content"]
+    assert "Groq busy, trying backup model..." in status_fail.writes
+    assert status_fail.updates[-1] == ("Done", "complete", False)
+
+
+def test_error_shows_red_error_status_with_file_line_and_handles_stale_signature():
+    """Failures set st.status to red 'Error' (never 'Done'), log traceback with file:line, and stale hot-reload signatures never raise TypeError."""
+    import components.ai_prompt_panel as panel
+
+    # 1. Stale function without status_callback works without TypeError
+    def _legacy_chat_turn(user_message, history=None, current_hour=14):
+        return {"role": "assistant", "kind": "text", "content": f"Legacy ok: {user_message}", "provider": "System"}
+
+    res = panel._call_with_optional_status(
+        _legacy_chat_turn,
+        status_callback=lambda s: None,
+        user_message="Hello",
+        history=[],
+        current_hour=14,
+    )
+    assert res["content"] == "Legacy ok: Hello"
+
+    # 2. Unexpected exception updates status to label='Error', state='error' (not 'Done') & records file:line
+    class _FakeCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeStatus(_FakeCtx):
+        def __init__(self):
+            self.updates = []
+            self.writes = []
+
+        def write(self, msg):
+            self.writes.append(msg)
+
+        def update(self, label=None, state=None, expanded=None):
+            self.updates.append((label, state, expanded))
+
+    fake_state: dict = {}
+    assert panel.queue_chat_request(fake_state, "Trigger boom", display_hour=14) is True
+    err_status = _FakeStatus()
+
+    def _boom(**kwargs):
+        raise TypeError("simulated signature mismatch")
+
+    with (
+        patch.object(panel.st, "session_state", fake_state),
+        patch.object(panel.st, "chat_message", return_value=_FakeCtx()),
+        patch.object(panel.st, "status", return_value=err_status),
+        patch.object(panel.st, "markdown"),
+        patch.object(panel.st, "expander", return_value=_FakeCtx()),
+        patch.object(panel.st, "error"),
+        patch.object(panel.st, "caption"),
+        patch("components.ai_prompt_panel.run_chat_turn", side_effect=_boom),
+    ):
+        panel._execute_pending_request(fake_state["_pending_chat_request"], snapshot={}, show_tech=True)
+
+    err_reply = fake_state["ask_aquagrid_messages"][-1]
+    assert err_reply["kind"] == "error"
+    assert err_reply["error"] is True
+    assert "TypeError: simulated signature mismatch" in err_reply["error_detail"]
+    assert ".py:" in err_reply["error_detail"]
+    # Status MUST be red "Error", NEVER "Done"
+    assert err_status.updates[-1] == ("Error", "error", False)
+

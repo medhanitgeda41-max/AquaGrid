@@ -4,6 +4,7 @@ Launch from project root:
     python -m streamlit run app/app.py
 """
 import importlib
+import inspect
 import os
 import sys
 
@@ -23,17 +24,35 @@ def _ensure_module_attr(module_name: str, required_attr: str) -> None:
         importlib.reload(mod)
 
 
+def _ensure_callable_param(module_name: str, attr_path: str, param_name: str) -> None:
+    """Reload a cached module if a function/method signature is missing a required parameter after hot-reload."""
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        return
+    obj = mod
+    for part in attr_path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            importlib.reload(mod)
+            return
+    try:
+        params = inspect.signature(obj).parameters
+    except (TypeError, ValueError):
+        return
+    if param_name not in params:
+        importlib.reload(mod)
+
+
 # Guard against stale sys.modules across live Streamlit hot-reloads
 _ensure_module_attr("simulator", "simulator_step_lock")
 _ensure_module_attr("simulator", "STEP_LOCK")
 _ensure_module_attr("guards.telemetry_freshness", "refresh_baseline_timestamps")
-_lf_cached = sys.modules.get("agent.llm_factory")
-if _lf_cached is not None and (
-    not hasattr(getattr(_lf_cached, "llm_client", None), "chat_with_tools")
-    or not hasattr(_lf_cached, "provider_supports_streaming")
-):
-    importlib.reload(_lf_cached)
+_ensure_module_attr("agent.llm_factory", "provider_supports_streaming")
+_ensure_callable_param("agent.llm_factory", "LLMClient.chat_with_tools", "status_callback")
 _ensure_module_attr("agent.chat_assistant", "collect_system_alerts")
+_ensure_callable_param("agent.chat_assistant", "run_chat_turn", "status_callback")
+_ensure_callable_param("agent.chat_assistant", "run_scenario_for_chat", "status_callback")
+_ensure_callable_param("agent.chat_assistant", "run_production_planner_for_chat", "status_callback")
 _ensure_module_attr("components.badges", "get_sim_step_lock")
 _ensure_module_attr("components.chat_widgets", "render_chat_widget")
 _ensure_module_attr("components.header", "render_header")

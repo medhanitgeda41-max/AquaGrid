@@ -584,11 +584,26 @@ class LLMClient:
                                     "result": tool_out,
                                 }
                             )
+                            tool_json = json.dumps(tool_out, default=str)
+                            if len(tool_json) > 1800 and isinstance(tool_out, dict):
+                                slim = {
+                                    k: v
+                                    for k, v in tool_out.items()
+                                    if k in (
+                                        "displayed", "sector", "highlight_sector", "leak_id",
+                                        "show_boundaries", "boundaries_drawn", "layers_drawn",
+                                        "sector_colors", "total_pipes", "total_valves",
+                                        "total_sensors", "matched_leaks", "zoom_target",
+                                        "basemap", "summary_text", "status", "summary",
+                                        "pending_count", "row_count", "reason", "message",
+                                    )
+                                }
+                                tool_json = json.dumps(slim or {"summary": tool_json[:1200]}, separators=(",", ":"), default=str)
                             conv.append(
                                 {
                                     "role": "tool",
                                     "tool_call_id": tc_id,
-                                    "content": json.dumps(tool_out, default=str),
+                                    "content": tool_json,
                                 }
                             )
                         steps += 1

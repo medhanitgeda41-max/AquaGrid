@@ -47,7 +47,7 @@ STRICT RULES:
 1. A complete LIVE SCADA SNAPSHOT (reservoir %, dynamic floor, DESAL-01 output & limits, algae bloom cap, next 24h tariffs & demand forecast, active leaks, quarantined sensors, per-sector chlorine, pending actions, and telemetry freshness) is ALREADY provided in the system context for every turn. Use those live values directly — NEVER invent numbers.
 2. NEVER ask the operator to enable tools, re-enable tool calls, run live queries, or supply data that the system already has. Tool calls are OPTIONAL for extra details (Audit Log lookup, rendering maps/charts/tables, validating custom schedules, or staging a gated action).
 3. If live data is genuinely unavailable (for example telemetry_freshness.is_telemetry_loss is true / TELEMETRY_LOSS), explicitly state WHICH telemetry data is missing or stale and WHY you cannot plan or stage setpoint/valve changes until the feed is restored.
-4. Answer ANY operator question clearly and concisely: plant status, leaks, quarantined sensors, reservoir & dynamic emergency floor, electricity tariffs, hourly production plans, past actions in the Audit Log, why a plan was rejected, what any technical status code means, and next steps.
+4. Answer ANY operator question clearly and concisely (typically 2-6 short lines or compact bullets): plant status, leaks, quarantined sensors, reservoir & dynamic emergency floor, electricity tariffs, hourly production plans, past actions in the Audit Log, why a plan was rejected, what any technical status code means, and next steps. For simple greetings like "Hello" or "how are you", reply briefly in 1-2 friendly sentences (mentioning overall grid status) without dumping a full table unless asked.
 5. Use prior conversation messages naturally for follow-up questions (e.g. "Why?", "What about Sector 2?", "And if demand rises?").
 6. Use DISPLAY TOOLS to render helpful visuals inside your reply whenever relevant:
    - show_map(sector, leak_id, show_boundaries): sector="all" for all 6 sectors, "Sector N" to highlight/zoom one sector, or leak_id like "LEAK-001"; show_boundaries defaults to true. If the operator asks to "show the sectors" or "show the map" without naming a sector, call show_map(sector="all", show_boundaries=true) directly instead of asking which sector.
@@ -542,11 +542,40 @@ def build_live_scada_snapshot(
 
 
 def _compact_snapshot_json(snapshot: dict) -> str:
-    """Serialize snapshot excluding redundant raw_feeds/raw_telemetry/by_hour dicts for concise LLM context."""
+    """Serialize live SCADA snapshot in a compact token-efficient JSON format preserving all exact live values."""
+    t24 = snapshot.get("tariffs_next_24h") or []
+    d24 = snapshot.get("demand_next_24h") or []
+    tariffs_compact = ",".join(
+        f"{str(t.get('hour', ''))[:2]}:${float(t.get('rate_per_kwh', 0.2)):.2f}{'*' if t.get('is_peak') else ''}"
+        for t in t24
+    )
+    demand_compact = ",".join(
+        f"{str(d.get('hour', ''))[:2]}:{round(float(d.get('demand_mld', 90.0)), 1):g}"
+        for d in d24
+    )
+    cl_compact = {
+        s.get("sector"): f"{float(s.get('chlorine_mg_l', 0.5)):.2f}({s.get('status', 'OK')})"
+        for s in (snapshot.get("sector_chlorine") or [])
+        if isinstance(s, dict) and s.get("sector")
+    }
+    tf = snapshot.get("telemetry_freshness") or {}
     compact = {
-        k: v
-        for k, v in snapshot.items()
-        if k not in ("raw_feeds", "raw_telemetry", "tariff_by_hour", "demand_by_hour")
+        "current_hour": snapshot.get("current_hour"),
+        "reservoir": snapshot.get("reservoir"),
+        "desal_01": snapshot.get("desal_01"),
+        "tariffs_next_24h": tariffs_compact,
+        "demand_next_24h": demand_compact,
+        "active_leaks": snapshot.get("active_leaks") or [],
+        "quarantined_sensors": snapshot.get("quarantined_sensors") or [],
+        "sector_chlorine": cl_compact,
+        "excluded_sectors": snapshot.get("excluded_sectors") or [],
+        "pending_actions": snapshot.get("pending_actions") or [],
+        "telemetry_freshness": {
+            "status": tf.get("status", "FRESH"),
+            "is_telemetry_loss": bool(tf.get("is_telemetry_loss", False)),
+            "age_seconds": tf.get("age_seconds", 0),
+            "banner": tf.get("banner", ""),
+        },
     }
     return json.dumps(compact, separators=(",", ":"), default=str)
 
@@ -1928,11 +1957,12 @@ def run_chat_turn(
         {"role": "system", "content": ASK_AQUAGRID_SYSTEM_PROMPT},
         {"role": "system", "content": "LIVE SCADA SNAPSHOT (current real-time values — do not ask to enable tools or run queries):\n" + snapshot_json},
     ]
-    for msg in prior[-12:]:
+    for msg in prior[-6:]:
         role = msg.get("role")
         content = str(msg.get("content") or "").strip()
         if role in ("user", "assistant") and content:
-            llm_messages.append({"role": role, "content": content})
+            trimmed = content if len(content) <= 450 else (content[:447] + "...")
+            llm_messages.append({"role": role, "content": trimmed})
     llm_messages.append({"role": "user", "content": f"[Active SCADA Hour: {current_hour:02d}:00]\n{cleaned}"})
 
     def _build_live_fallback_context() -> str:
@@ -1977,7 +2007,8 @@ def run_chat_turn(
             _execute_tool("show_map", {"sector": sec_arg, "leak_id": lid_arg or "", "show_boundaries": show_b})
 
         # Safety net: never return a response begging the operator to enable tools or run live queries!
-        if not answer_text or _TOOL_BEGGING_RE.search(answer_text):
+        answer_text = "" if answer_text is None else str(answer_text)
+        if not answer_text.strip() or _TOOL_BEGGING_RE.search(answer_text):
             if answer_text and _TOOL_BEGGING_RE.search(answer_text):
                 logger.warning("Replaced tool-begging LLM response from %s with live-snapshot answer", provider_used)
             answer_text = _offline_chat_fallback(
@@ -1991,18 +2022,18 @@ def run_chat_turn(
 
         # If the operator asked to "show the sectors" / "show the map" and the LLM asked "which sector?", answer directly using the map summary
         if map_results_holder and _ASKING_WHICH_SECTOR_RE.search(answer_text):
-            answer_text = map_results_holder[-1]["summary_text"]
+            answer_text = str(map_results_holder[-1].get("summary_text") or answer_text)
 
         # Truthfulness check: if AI claims boundaries/borders were drawn when show_map did NOT draw them, replace with exact tool summary!
         if map_results_holder:
             last_map = map_results_holder[-1]
             if _BOUNDARY_CLAIM_RE.search(answer_text) and int(last_map.get("boundaries_drawn", 0)) == 0:
                 logger.warning("Replaced untruthful map boundary description with exact show_map tool summary")
-                answer_text = last_map["summary_text"]
+                answer_text = str(last_map.get("summary_text") or "Displayed live map.")
         elif _BOUNDARY_CLAIM_RE.search(answer_text) and asked_for_map:
             answer_text = "No map was rendered for this reply."
     except Exception as exc:
-        logger.exception("Ask AquaGrid chat turn failed for message: %s", cleaned[:160])
+        logging.exception("Ask AquaGrid chat turn failed for message: %s", cleaned[:160])
         providers_tried = list(getattr(active_llm_client, "last_chat_providers_tried", []) or [])
         tb_frames = traceback.extract_tb(exc.__traceback__) if exc.__traceback__ else []
         last_frame = tb_frames[-1] if tb_frames else None
