@@ -345,3 +345,15 @@ def test_scenarios_show_relevant_3d_views_in_result():
             assert any(focus_val.startswith(p) for p in valid_prefixes), f"{sc_id} got unexpected 3D focus {focus_val}"
 
 
+def test_requirements_has_networkx_and_all_3d_cdn_urls_use_https():
+    """requirements.txt includes networkx and every 3D/fallback CDN URL loads over HTTPS (Streamlit Cloud compatible)."""
+    import components.digital_twin_3d as dt3d
+
+    req_txt = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert "networkx" in req_txt.lower()
+
+    for url in (dt3d.THREE_MODULE_URL, dt3d.THREE_ADDONS_BASE, dt3d.LEAFLET_CSS_URL, dt3d.LEAFLET_JS_URL, dt3d.OSM_TILE_URL):
+        assert url.startswith("https://"), f"CDN URL must use https:// for Streamlit Cloud: {url}"
+
+
+
