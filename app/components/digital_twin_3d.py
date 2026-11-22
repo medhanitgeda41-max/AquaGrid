@@ -1288,6 +1288,7 @@ def render_persistent_top_twin(
     low_q = (quality == "Low")
     follow_chat = bool(st.session_state.get("twin_follow_chat", True))
     show_2d_map = bool(st.session_state.get("twin_show_2d_map", False))
+    show_history = bool(st.session_state.get("twin_show_leak_history", False))
 
     # Sticky CSS anchor for the left 50% column
     st.markdown('<div id="aquagrid-twin-sticky-anchor"></div>', unsafe_allow_html=True)
@@ -1297,7 +1298,22 @@ def render_persistent_top_twin(
         current_hour=display_hour,
         low_quality=low_q,
         highlight_pipe_ids=twin_view.get("highlight_pipe_ids") or [],
+        show_leak_history=show_history,
     )
+
+    from database.leak_registry import get_active_leaks, get_all_leaks, verify_leak_count_consistency
+
+    active_leaks_registry = get_active_leaks()
+    tel_leaks = (snapshot.get("telemetry_data") or {}).get("leak_alerts")
+    if tel_leaks is not None:
+        verify_leak_count_consistency(
+            {
+                "registry": len(active_leaks_registry),
+                "twin_3d": int(scene_state.get("active_leak_count", 0)),
+                "telemetry_tool": len(tel_leaks),
+            },
+            context="render_persistent_top_twin",
+        )
 
     if show_2d_map:
         from streamlit_folium import st_folium
@@ -1307,13 +1323,13 @@ def render_persistent_top_twin(
         conn = get_db_connection()
         try:
             segs = [dict(r) for r in conn.execute("SELECT * FROM pipe_segments ORDER BY sector, segment_id;").fetchall()]
-            leaks = [dict(r) for r in conn.execute("SELECT * FROM leaks ORDER BY detected_at DESC;").fetchall()]
             valves = {r["valve_id"]: r["status"] for r in conn.execute("SELECT valve_id, status FROM valves;").fetchall()}
             p_rows = conn.execute(
                 "SELECT pipe_segment_id, pressure_psi FROM scada_history WHERE id IN (SELECT MAX(id) FROM scada_history GROUP BY pipe_segment_id);"
             ).fetchall()
         finally:
             conn.close()
+        leaks = get_all_leaks(include_history=True) if show_history else active_leaks_registry
         latest_p = {r["pipe_segment_id"]: float(r["pressure_psi"]) for r in p_rows if r["pressure_psi"] is not None}
         q_ids = {s["sensor_id"] for s in (snapshot.get("telemetry_data") or {}).get("quarantined_sensors", [])}
         map_focus = resolve_2d_map_focus_from_twin_view(twin_view, leaks=leaks)
@@ -1412,11 +1428,13 @@ def render_persistent_top_twin(
             st.session_state["twin_show_2d_map"] = not show_2d_map
             st.rerun()
 
-    # Row 2: Follow chat: ON/OFF · Quality: High/Low
-    t1, t2 = st.columns([1.2, 1.0])
+    # Row 2: Follow chat: ON/OFF · Show history · Quality: High/Low
+    t1, t2, t3 = st.columns([1.2, 1.0, 1.0])
     with t1:
         st.toggle("Follow chat: ON/OFF", value=True, key="twin_follow_chat")
     with t2:
+        st.toggle("Show history", value=False, key="twin_show_leak_history")
+    with t3:
         st.radio(
             "Quality",
             options=["High", "Low"],

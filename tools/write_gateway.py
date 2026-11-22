@@ -1058,6 +1058,11 @@ def refuse_direct_write_bypass(
 
 
 ALLOWED_LEAK_STATUSES: tuple[str, ...] = (
+    "SUSPECTED",
+    "CONFIRMED",
+    "UNDER_REPAIR",
+    "RESOLVED",
+    "FALSE_ALARM",
     "Suspected",
     "Confirmed",
     "Under Repair",
@@ -1074,8 +1079,8 @@ def update_leak_status_by_operator(
     db_path: Optional[str] = None,
 ) -> dict:
     """
-    Record a human operator's status decision on a leak (e.g., Mark as False Alarm,
-    Mark Resolved, Confirmed, Under Repair) and write an immutable audit_log entry.
+    Record a human operator's status decision on a leak (e.g., FALSE_ALARM, RESOLVED,
+    CONFIRMED, UNDER_REPAIR, SUSPECTED) and write an immutable audit_log entry.
     Does NOT modify valves or plant_setpoints.
     """
     if new_status not in ALLOWED_LEAK_STATUSES:
@@ -1084,13 +1089,17 @@ def update_leak_status_by_operator(
             "reason": f"Invalid leak status '{new_status}'. Allowed: {ALLOWED_LEAK_STATUSES}",
         }
 
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with transaction_scope(db_path) as conn:
         row = conn.execute("SELECT leak_id, status, pipe_segment_id FROM leaks WHERE leak_id = ?;", (leak_id,)).fetchone()
         if not row:
             return {"status": "ERROR_NOT_FOUND", "reason": f"Leak {leak_id} not found."}
 
         prev_status = row["status"]
-        conn.execute("UPDATE leaks SET status = ? WHERE leak_id = ?;", (new_status, leak_id))
+        conn.execute(
+            "UPDATE leaks SET status = ?, updated_at = ? WHERE leak_id = ?;",
+            (new_status, now_utc, leak_id),
+        )
         details = (
             f"Operator {operator_name} updated {leak_id} ({row['pipe_segment_id']}) "
             f"from '{prev_status}' to '{new_status}'."

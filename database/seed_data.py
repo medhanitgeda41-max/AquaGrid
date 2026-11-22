@@ -262,25 +262,25 @@ def seed_database(db_path: str | None = None) -> None:
 
         seeded_leaks_spec = [
             (
-                "LEAK-001", "SEG-S4-01", 0.50, 42, "High", 64.5, 0.93, "Confirmed",
+                "LEAK-001", "J-14", "SEG-S4-01", "V-12", "SCADA_DISPATCH", 0.50, 42, "High", 64.5, 0.93, "CONFIRMED",
                 "Hydraulic mass balance confirmed major Sector 4 Main rupture on Al Wasl Rd: pressure dropped -26.5 psi while flow spiked +78.0 L/s at J-14.",
                 False,
                 "P-14 (-26.5 psi), F-14 (+78.0 L/s), Al Wasl Rd 700mm Ductile Iron main",
             ),
             (
-                "LEAK-002", "SEG-S3-01", 0.62, 78, "Medium", 28.0, 0.72, "Suspected",
+                "LEAK-002", "J-11", "SEG-S3-01", "V-07", "ACOUSTIC_MONITOR", 0.62, 78, "Medium", 28.0, 0.72, "SUSPECTED",
                 "Gradual pressure sag (-9.2 psi) with moderate flow increase (+24.5 L/s) on Sheikh Zayed Rd trunk near Business Bay; acoustic confirmation advised.",
                 True,
                 "P-11 (-9.2 psi), F-11 (+24.5 L/s), Sheikh Zayed Rd 900mm Steel trunk",
             ),
             (
-                "LEAK-003", "SEG-S4-04", 0.45, 95, "Low", 6.5, 0.34, "False Alarm – Sensor Fault",
+                "LEAK-003", "J-17", "SEG-S4-04", "V-11", "SENSOR_GUARD", 0.45, 95, "Low", 6.5, 0.34, "FALSE_ALARM",
                 "Pressure transmitter P-17 flatlined at 48.12 psi with zero variance while downstream flow F-17 remained steady; classified as sensor instrumentation fault.",
                 True,
                 "P-17 (FLATLINE 48.12 psi, variance=0.000), F-17 (nominal 110 L/s)",
             ),
             (
-                "LEAK-004", "SEG-S1-01", 0.35, 115, "Critical", 92.0, 0.96, "Under Repair",
+                "LEAK-004", "J-01", "SEG-S1-01", "V-01", "FIELD_CREW", 0.35, 115, "Critical", 92.0, 0.96, "UNDER_REPAIR",
                 "High-loss trunk leak on Al Rigga Rd (Deira, 2004 Ductile Iron 600mm main); field crew mobilized and awaiting isolation verification.",
                 False,
                 "P-01 (-31.0 psi), F-01 (+94.0 L/s), Al Rigga Rd 600mm main",
@@ -288,23 +288,27 @@ def seed_database(db_path: str | None = None) -> None:
         ]
 
         leak_rows = []
-        for lid, seg_id, frac, mins_ago, sev, loss_m3, conf, status, summary, verify_first, based_on in seeded_leaks_spec:
+        for lid, jid, seg_id, valve_id, det_by, frac, mins_ago, sev, loss_m3, conf, status, summary, verify_first, based_on in seeded_leaks_spec:
             seg = seg_by_id[seg_id]
             lat, lon = point_on_polyline(seg["geometry"], fraction=frac)
             det_ts = (now_utc - timedelta(minutes=mins_ago)).strftime("%Y-%m-%d %H:%M:%S")
             sugg_json = _make_leak_suggestions(seg, loss_m3, sev, conf, 0.20, verify_first, based_on)
             leak_rows.append((
                 lid,
+                jid,
                 seg_id,
                 seg["sector"],
                 lat,
                 lon,
                 f"{seg['street_area']} ({seg['name']})",
                 det_ts,
+                det_ts,
                 sev,
                 loss_m3,
                 conf,
                 status,
+                valve_id,
+                det_by,
                 seg["related_sensor_ids"],
                 summary,
                 sugg_json,
@@ -313,10 +317,10 @@ def seed_database(db_path: str | None = None) -> None:
         conn.executemany(
             """
             INSERT INTO leaks (
-                leak_id, pipe_segment_id, sector, latitude, longitude, location_name,
-                detected_at, severity, estimated_loss_m3_per_hour, confidence, status,
-                related_sensor_ids, ai_summary, ai_suggestions_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                leak_id, junction_id, pipe_segment_id, sector, latitude, longitude, location_name,
+                detected_at, updated_at, severity, estimated_loss_m3_per_hour, confidence, status,
+                isolating_valve_id, detected_by, related_sensor_ids, ai_summary, ai_suggestions_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             leak_rows,
         )

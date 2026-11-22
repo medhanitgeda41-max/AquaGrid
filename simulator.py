@@ -38,6 +38,7 @@ from config.constants import (
 from config.region_config import REGION_CONFIG, now_local
 from database.connection import get_db_connection, transaction_scope
 from database.dubai_network import point_on_polyline
+from database.leak_registry import upsert_leak_for_junction
 from guards.reservoir_model import compute_effective_production_mld, step_reservoir_volume_ml
 from guards.water_quality import evaluate_sector_chlorine
 from tools.read_feeds import read_tariff_and_quality_feeds
@@ -522,39 +523,31 @@ class LiveScadaSimulator:
                         (stuck_value, utc_ts_str, stuck_sensor_id, rh),
                     )
 
-            # Snap new leak onto pipe segment polyline and insert into `leaks`
+            # Snap new leak onto pipe segment polyline and upsert into single `leaks` registry (no duplicate per junction!)
             if leak_segment is not None:
                 geom = json.loads(leak_segment["geometry_json"])
                 frac = round(self._rng.uniform(0.2, 0.8), 2)
                 snap_lat, snap_lon = point_on_polyline(geom, fraction=frac)
-                existing_cnt = tx.execute("SELECT COUNT(*) AS cnt FROM leaks;").fetchone()["cnt"]
-                new_leak_id = f"LEAK-{existing_cnt + 1:03d}"
                 sev = self._rng.choice(["Medium", "High", "Critical"])
                 loss_m3 = round({"Medium": 26.0, "High": 58.0, "Critical": 88.0}[sev] + self._rng.uniform(-4.0, 6.0), 1)
                 conf = round(self._rng.uniform(0.78, 0.96), 2)
-                tx.execute(
-                    """
-                    INSERT INTO leaks (
-                        leak_id, pipe_segment_id, sector, latitude, longitude, location_name,
-                        detected_at, severity, estimated_loss_m3_per_hour, confidence, status,
-                        related_sensor_ids, ai_summary, ai_suggestions_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Suspected', ?, ?, '{}');
-                    """,
-                    (
-                        new_leak_id,
-                        leak_segment["segment_id"],
-                        leak_segment["sector"],
-                        snap_lat,
-                        snap_lon,
-                        f"{leak_segment['street_area']} ({leak_segment['name']})",
-                        utc_ts_str,
-                        sev,
-                        loss_m3,
-                        conf,
-                        leak_segment["related_sensor_ids"],
-                        f"Live telemetry anomaly detected at {clock_display}: pressure dropped to 27.5 psi with flow spike to 192.0 L/s on {leak_segment['street_area']}.",
-                    ),
+                upserted = upsert_leak_for_junction(
+                    junction_id=leak_junction or "J-14",
+                    sector=leak_segment["sector"],
+                    status="SUSPECTED",
+                    severity=sev,
+                    loss_rate_m3h=loss_m3,
+                    confidence=conf,
+                    detected_by="LIVE_SIMULATOR",
+                    summary=f"Live telemetry anomaly detected at {clock_display}: pressure dropped to 27.5 psi with flow spike to 192.0 L/s on {leak_segment['street_area']}.",
+                    pipe_segment_id=leak_segment["segment_id"],
+                    latitude=snap_lat,
+                    longitude=snap_lon,
+                    location_name=f"{leak_segment['street_area']} ({leak_segment['name']})",
+                    db_path=self._db_path,
+                    conn=tx,
                 )
+                new_leak_id = upserted["leak_id"]
 
             if new_level_pct < RESERVOIR_FLOOR_PERCENT * 100.0:
                 msg = (

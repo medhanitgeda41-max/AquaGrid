@@ -59,6 +59,7 @@ STRICT RULES:
    Never describe 3D or 2D features that are not listed in the tool result. Only cite targets, colours, flows, counts, and status values returned by the tool summary.
 7. If the operator asks for a physical change (e.g. "reduce output to 70 MLD", "close V-12", "isolate and flush Sector 2"), you may ONLY call propose_gated_action. All Python safety guards run automatically inside the gateway. State the exact gateway status code (STAGED_PENDING_APPROVAL or REJECTED_* + reason) and remind the operator to click the Approve or Reject button on the approval card.
 8. You can NEVER execute, auto-approve, or bypass operator approval. Keep exact technical status codes unchanged (STAGED_PENDING_APPROVAL, REJECTED_BY_SAFETY_GUARD, REJECTED_WATER_QUALITY, CANCELLED_BY_SAFETY_RECHECK, REJECTED_UNAUTHORIZED_APPROVAL_CLAIM, REJECTED_APPROVAL_MISMATCH, REJECTED_APPROVAL_ALREADY_USED, REJECTED_APPROVAL_EXPIRED, TELEMETRY_LOSS, REJECTED_STALE_TELEMETRY, CANCELLED_STALE_TELEMETRY, NON_COMPLIANT, UNTRUSTED_TEXT, VALID, GAP).
+9. The 3D twin and map are drawn from the same live data you receive. Never say the twin is stale or cached. If an ID is not in the data, say so plainly. Always refer to leaks with both leak_id and junction_id (e.g., "LEAK-001 at J-14, Sector 4, CONFIRMED, 64.5 m³/hr").
 """
 
 CHAT_TOOLS_SCHEMA: list[dict] = [
@@ -783,13 +784,29 @@ def _compact_snapshot_json(snapshot: dict) -> str:
         if isinstance(s, dict) and s.get("sector")
     }
     tf = snapshot.get("telemetry_freshness") or {}
+    leaks_compact = [
+        {
+            "leak_id": lk.get("leak_id"),
+            "junction_id": lk.get("junction_id"),
+            "sector": lk.get("sector"),
+            "location": lk.get("location_name") or lk.get("location"),
+            "severity": lk.get("severity"),
+            "status": lk.get("status"),
+            "loss_rate_m3h": lk.get("loss_rate_m3h", lk.get("estimated_loss_m3_per_hour", 0.0)),
+            "isolating_valve_id": lk.get("isolating_valve_id"),
+            "valve_status": lk.get("valve_status"),
+            "updated_at": lk.get("updated_at"),
+            "summary": lk.get("diagnostic"),
+        }
+        for lk in (snapshot.get("active_leaks") or [])
+    ]
     compact = {
         "current_hour": snapshot.get("current_hour"),
         "reservoir": snapshot.get("reservoir"),
         "desal_01": snapshot.get("desal_01"),
         "tariffs_next_24h": tariffs_compact,
         "demand_next_24h": demand_compact,
-        "active_leaks": snapshot.get("active_leaks") or [],
+        "active_leaks": leaks_compact,
         "quarantined_sensors": snapshot.get("quarantined_sensors") or [],
         "sector_chlorine": cl_compact,
         "excluded_sectors": snapshot.get("excluded_sectors") or [],
@@ -1668,6 +1685,24 @@ def _offline_chat_fallback(
         loss_banner = (tel.get("telemetry_freshness") or {}).get("banner", "TELEMETRY LOSS")
         loss_suffix = f"\n\n*Note: `{loss_banner}` (`TELEMETRY_LOSS`) — new change proposals are blocked until the feed is restored.*"
 
+    # 3a-0. Direct leak lookup by leak_id (e.g. "Tell me about LEAK-001") or junction_id (e.g. "Tell me about J-14")
+    m_leak_id = re.search(r"\b(LEAK-\d+)\b", text, re.IGNORECASE)
+    if m_leak_id and not _is_map_request(text):
+        from database.leak_registry import get_leak_by_id_or_junction
+
+        lid_q = m_leak_id.group(1).upper()
+        lk_rec = get_leak_by_id_or_junction(lid_q)
+        if lk_rec:
+            tool_executor("show_3d", {"focus": lk_rec["leak_id"]})
+            iso_txt = f" (isolated — valve `{lk_rec['isolating_valve_id']}` is `CLOSED`)" if lk_rec["is_isolated"] else f" (isolating valve `{lk_rec['isolating_valve_id']}` is `{lk_rec['valve_status']}`)"
+            return (
+                f"**{lk_rec['leak_id']}** at **{lk_rec['junction_id']}** ({lk_rec['sector']} — {lk_rec['location_name']}): "
+                f"status **`{lk_rec['status']}`**, severity **{lk_rec['severity']}**, "
+                f"loss **{lk_rec['loss_rate_m3h']:.1f} m³/hr**{iso_txt}. "
+                f"Detected by `{lk_rec['detected_by']}`, last updated `{lk_rec['updated_at']}`.{loss_suffix}"
+            )
+        return f"There is no leak with ID `{lid_q}` in the live leak registry.{loss_suffix}"
+
     # 3a. Default 3D Digital Twin requests ("show Sector 4", "where is the leak", "show the reservoir", "show valve V-12")
     focus_3d = _parse_3d_focus_request(text)
     if focus_3d is not None:
@@ -2500,13 +2535,19 @@ def collect_system_alerts(
                 }
             )
 
-    # 3. Confirmed Pipe Leaks
+    # 3. Confirmed Pipe Leaks (only CONFIRMED non-isolated leaks trigger high-priority chat alerts)
     for lk in telemetry_data.get("leak_alerts", []):
-        key = f"LEAK:{lk.get('junction_id')}:{lk.get('sector')}"
+        lk_st = str(lk.get("status", "CONFIRMED")).upper()
+        if lk_st not in ("CONFIRMED", "CONFIRMED_PIPE_LEAK") or lk.get("is_isolated"):
+            continue
+        lid = lk.get("leak_id") or ""
+        jid = lk.get("junction_id") or ""
+        key = f"LEAK:{lid or jid}:{lk.get('sector')}"
         if key not in updated_seen:
             updated_seen.add(key)
-            body = f"{lk.get('junction_id')} ({lk.get('sector')}) — {lk.get('diagnostic', '')}"
-            lk_focus = lk.get("leak_id") or lk.get("junction_id") or lk.get("sector") or "Sector 4"
+            id_tag = f"{lid} at {jid}" if (lid and jid) else (lid or jid)
+            body = f"{id_tag} ({lk.get('sector')}) — {lk.get('diagnostic', '')}"
+            lk_focus = lid or jid or lk.get("sector") or "Sector 4"
             new_msgs.append(
                 {
                     "role": "assistant",
@@ -2519,11 +2560,11 @@ def collect_system_alerts(
                     "tools_called": [],
                     "code_checks": [{"check": "Hydraulic Mass Balance", "status": "BLOCKED", "code": "CONFIRMED_PIPE_LEAK", "detail": lk.get("diagnostic", "")}],
                     "widgets": [
-                        {"type": "map", "sector": lk.get("sector"), "leak_id": None},
-                        {"type": "chart", "metric": "pressure", "asset": lk.get("junction_id", "J-14"), "hours": 2},
+                        {"type": "map", "sector": lk.get("sector"), "leak_id": lid or None},
+                        {"type": "chart", "metric": "pressure", "asset": jid or "J-14", "hours": 2},
                     ],
                     "staged_action": None,
-                    "twin_view": build_twin_view_command(focus=lk_focus, event_type="new_leak", note=f"New leak at {lk.get('junction_id', lk_focus)}"),
+                    "twin_view": build_twin_view_command(focus=lk_focus, event_type="new_leak", note=f"{id_tag} ({lk.get('sector')})"),
                 }
             )
 

@@ -1480,11 +1480,19 @@ function syncLeaks(state, lowQ) {
 
   (state.leaks || []).forEach(lk => {
     const lid = lk.leak_id;
-    seen.add(lid);
-    const isActive = !!lk.active && !lk.isolated;
-    let rec = engine.leakMap[lid];
+    const jid = lk.junction_id || '';
+    const stCode = String(lk.status || 'CONFIRMED').toUpperCase();
+    const isHistory = !!lk.is_history || stCode === 'RESOLVED' || stCode === 'FALSE_ALARM';
+    const isIsolated = !!lk.isolated;
+    const isConfirmed = stCode === 'CONFIRMED';
+    const isSuspected = stCode === 'SUSPECTED';
+    const isRepair = stCode === 'UNDER_REPAIR';
+    // Spray runs ONLY for active non-isolated CONFIRMED (full) or SUSPECTED (subtle); UNDER_REPAIR has NO spray if isolated; history has NO spray
+    const hasSpray = (!isHistory && !isIsolated) && (isConfirmed || isSuspected || isRepair);
+    const isPulsing = (!isHistory && !isIsolated) && (isConfirmed || isSuspected);
 
-    if (!rec && !isActive) return;
+    seen.add(lid);
+    let rec = engine.leakMap[lid];
 
     if (!rec) {
       const lx = lk.pos_xz[0] * S, lz = lk.pos_xz[1] * S;
@@ -1508,8 +1516,8 @@ function syncLeaks(state, lowQ) {
       group.add(puddle);
 
       const dropCount = lowQ ? 8 : 18;
-      const dropGeo = new THREE.SphereGeometry(0.18, 6, 6);
-      const dropMat = new THREE.MeshBasicMaterial({ color: '#7DD3FC', transparent: true, opacity: 0.92 });
+      const dropGeo = new THREE.SphereGeometry(0.16, 6, 6);
+      const dropMat = new THREE.MeshBasicMaterial({ color: '#7DD3FC', transparent: true, opacity: 0.90 });
       const sprayDrops = [];
       for (let i = 0; i < dropCount; i++) {
         const mesh = new THREE.Mesh(dropGeo, dropMat);
@@ -1518,31 +1526,72 @@ function syncLeaks(state, lowQ) {
         sprayDrops.push({ mesh, ang: (i / dropCount) * Math.PI * 2 + (i % 3) * 0.22, speed: 1.6 + (i % 4) * 0.45, offset: i / dropCount });
       }
       scene.add(group);
-      const lblRec = registerLabel(`🚨 ${lid}`, new THREE.Vector3(lx, 4.1, lz), 'ag-label ag-label-danger');
-      rec = { lx, lz, group, core, coreMat, ring, ringMat, puddle, puddleMat, sprayDrops, lblRec, isActive, isolatedAt: null };
+      const lblRec = registerLabel(`${lid}`, new THREE.Vector3(lx, 4.1, lz), 'ag-label ag-label-danger');
+      rec = { lx, lz, group, core, coreMat, ring, ringMat, puddle, puddleMat, sprayDrops, lblRec, isActive: hasSpray, isPulsing, sprayScale: 1.0, isolatedAt: null };
       engine.leakMap[lid] = rec;
     }
 
-    if (rec.isActive && !isActive) {
-      // Transitioned active -> isolated (spray will smoothly die down & stop!)
+    if (rec.isActive && !hasSpray) {
       rec.isolatedAt = now;
-    } else if (isActive) {
+    } else if (hasSpray) {
       rec.isolatedAt = null;
     }
-    rec.isActive = isActive;
+    rec.isActive = hasSpray;
+    rec.isPulsing = isPulsing;
+    rec.sprayScale = isConfirmed ? 1.0 : (isSuspected ? 0.55 : 0.45);
+
+    // Status-based colors & icons (CONFIRMED = red pulsing + spray; SUSPECTED = orange; UNDER_REPAIR = yellow + wrench; RESOLVED/FALSE_ALARM = grey)
+    let hexColor = '#EF4444';
+    let bgCss = 'rgba(220,38,38,0.94)';
+    let badgeTxt = `🚨 ${lid} (${jid})`;
+    if (isHistory) {
+      hexColor = '#94A3B8';
+      bgCss = 'rgba(71,85,105,0.88)';
+      badgeTxt = `${lid} (${stCode})`;
+      rec.puddle.visible = false;
+      rec.ring.visible = false;
+    } else if (isRepair) {
+      hexColor = '#EAB308';
+      bgCss = 'rgba(202,138,4,0.94)';
+      badgeTxt = isIsolated ? `🔧 ${lid} (${jid} · ISOLATED)` : `🔧 ${lid} (${jid} · REPAIR)`;
+      rec.puddle.visible = !isIsolated;
+      rec.ring.visible = true;
+    } else if (isSuspected) {
+      hexColor = '#F97316';
+      bgCss = 'rgba(234,88,12,0.94)';
+      badgeTxt = isIsolated ? `⚠ ${lid} (${jid} · ISOLATED)` : `⚠ ${lid} (${jid} · SUSPECTED)`;
+      rec.puddle.visible = !isIsolated;
+      rec.ring.visible = true;
+    } else {
+      hexColor = isIsolated ? '#22C55E' : '#EF4444';
+      bgCss = isIsolated ? 'rgba(22,163,74,0.92)' : 'rgba(220,38,38,0.94)';
+      badgeTxt = isIsolated ? `✓ ${lid} (${jid} · ISOLATED)` : `🚨 ${lid} (${jid})`;
+      rec.puddle.visible = true;
+      rec.ring.visible = !isIsolated;
+    }
+
+    rec.coreMat.color.set(hexColor);
+    rec.coreMat.emissive.set(hexColor);
+    rec.coreMat.emissiveIntensity = isHistory ? 0.15 : (isIsolated ? 0.35 : 0.95);
+    rec.ringMat.color.set(hexColor);
+
     rec.core.userData.selectInfo = {
       target_type: 'leak',
       target_id: lid,
       focus: lid,
-      suggestion: `Tell me about leak ${lid}`
+      suggestion: `Tell me about ${lid}`
     };
-    rec.core.userData.tooltip = `<strong>${lid}</strong> (${lk.severity} · ${isActive ? lk.status : 'ISOLATED'})<br/>${lk.location_name}<br/>Loss: <strong>${lk.estimated_loss_m3_per_hour} m³/hr</strong>`;
-    rec.lblRec.el.textContent = isActive ? `🚨 ${lid}` : `✓ ${lid} ISOLATED`;
-    rec.lblRec.el.style.background = isActive ? 'rgba(220,38,38,0.94)' : 'rgba(22,163,74,0.90)';
+    const updTxt = lk.updated_at ? `<br/>Last update: ${lk.updated_at}` : '';
+    const vTxt = lk.isolating_valve_id ? ` · Valve: ${lk.isolating_valve_id} (${lk.valve_status || 'OPEN'})` : '';
+    rec.core.userData.tooltip = `<strong>${lid}</strong> · Junction <strong>${jid}</strong> (${lk.sector})<br/>Status: <strong>${stCode}</strong>${isIsolated && !isHistory ? ' (ISOLATED)' : ''}${vTxt}<br/>Loss: <strong>${lk.estimated_loss_m3_per_hour} m³/hr</strong>${updTxt}`;
+    rec.lblRec.el.textContent = badgeTxt;
+    rec.lblRec.el.style.background = bgCss;
+    rec.lblRec.el.style.color = isRepair ? '#0F172A' : '#F8FAFC';
     rec.lblRec.visible = true;
+    rec.group.visible = true;
   });
 
-  // Hide removed leaks (e.g., after DB reset)
+  // Hide removed / resolved leaks (e.g., when resolved or after DB reset)
   for (const [lid, rec] of Object.entries(engine.leakMap)) {
     if (!seen.has(lid)) {
       rec.isActive = false;
@@ -1569,6 +1618,20 @@ function applySceneUpdate(args) {
 
   const now = engine.clock.getElapsedTime();
   const S = engine.scale;
+
+  // Apply-only-changes optimization: skip redundant visual updates when scene_hash, quality, and viewCmd.seq are unchanged
+  const incomingHash = state.scene_hash || state.scene_version || '';
+  const incomingSeq = Number(viewCmd.seq || 0);
+  if (
+    engine.lastSceneHash &&
+    incomingHash &&
+    engine.lastSceneHash === incomingHash &&
+    engine.lastQuality === quality &&
+    engine.lastCommandSeq === incomingSeq
+  ) {
+    return;
+  }
+  engine.lastSceneHash = incomingHash;
 
   // 1. Quality switch (High vs Low) without reload
   if (engine.lastQuality !== quality) {
@@ -1934,19 +1997,20 @@ function startAnimationLoop() {
       engine.flowInst.instanceMatrix.needsUpdate = true;
     }
 
-    // 8. Leak spray fountains & puddles (stops smoothly when isolated!)
+    // 8. Leak spray fountains & puddles (status-driven; stops smoothly when isolated!)
     for (const lk of Object.values(engine.leakMap)) {
       if (!lk.group.visible) continue;
-      const sprayInt = lk.isActive ? 1.0 : (lk.isolatedAt !== null ? Math.max(0.0, 1.0 - easeOutCubic((t - lk.isolatedAt - 0.6) / 1.8)) : 0.0);
-      if (lk.isActive) {
-        lk.core.scale.setScalar(1.0 + 0.3 * Math.sin(t * 4.5));
+      const sMul = lk.sprayScale !== undefined ? lk.sprayScale : 1.0;
+      const sprayInt = lk.isActive ? sMul : (lk.isolatedAt !== null ? Math.max(0.0, sMul * (1.0 - easeOutCubic((t - lk.isolatedAt - 0.6) / 1.8))) : 0.0);
+      if (lk.isPulsing) {
+        lk.core.scale.setScalar(1.0 + 0.28 * Math.sin(t * 4.5));
         const rScale = 1.0 + ((t * 1.4) % 1.8);
         lk.ring.scale.setScalar(rScale);
         lk.ringMat.opacity = Math.max(0.0, 0.8 - (rScale - 1.0) * 0.45);
         lk.puddle.scale.setScalar(0.95 + 0.12 * Math.sin(t * 2.2));
       } else {
-        lk.core.scale.setScalar(0.75);
-        lk.ringMat.opacity = 0.0;
+        lk.core.scale.setScalar(0.82);
+        lk.ringMat.opacity = lk.ring.visible ? 0.35 : 0.0;
         lk.puddleMat.opacity = 0.14 + 0.28 * sprayInt;
       }
       for (const dr of lk.sprayDrops) {

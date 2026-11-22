@@ -36,6 +36,15 @@ def init_db(db_path: str | None = None) -> None:
             conn.execute("ALTER TABLE pending_actions ADD COLUMN provenance TEXT NOT NULL DEFAULT 'AGENT_ANALYSIS';")
         if "provenance_ref" not in pa_cols:
             conn.execute("ALTER TABLE pending_actions ADD COLUMN provenance_ref TEXT NOT NULL DEFAULT '';")
+        lk_cols = {r[1] for r in conn.execute("PRAGMA table_info(leaks);").fetchall()}
+        if "junction_id" not in lk_cols:
+            conn.execute("ALTER TABLE leaks ADD COLUMN junction_id TEXT NOT NULL DEFAULT '';")
+        if "updated_at" not in lk_cols:
+            conn.execute("ALTER TABLE leaks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';")
+        if "isolating_valve_id" not in lk_cols:
+            conn.execute("ALTER TABLE leaks ADD COLUMN isolating_valve_id TEXT NOT NULL DEFAULT '';")
+        if "detected_by" not in lk_cols:
+            conn.execute("ALTER TABLE leaks ADD COLUMN detected_by TEXT NOT NULL DEFAULT 'SCADA_MASS_BALANCE';")
         conn.commit()
     finally:
         conn.close()

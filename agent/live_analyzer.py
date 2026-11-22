@@ -16,6 +16,7 @@ from typing import Optional
 from config.constants import RESERVOIR_FLOOR_PERCENT
 from config.region_config import REGION_CONFIG
 from database.connection import get_db_connection, transaction_scope
+from database.leak_registry import get_active_leaks, get_all_leaks, is_active_leak_status, normalize_leak_status
 from guards.injection_filter import sanitize_text
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
@@ -39,7 +40,7 @@ def compute_leak_suggestions(
     cost_usd_hr = round(loss_m3_hr * kwh_per_m3 * current_tariff, 2)
     cost_aed_hr = round(cost_usd_hr * usd_to_aed, 2)
 
-    is_sensor_fault = "False Alarm" in status or confidence < 0.50
+    is_sensor_fault = (normalize_leak_status(status) == "FALSE_ALARM") or confidence < 0.50
     verify_first = is_sensor_fault or confidence < 0.75
 
     urgency_map = {
@@ -262,8 +263,9 @@ def run_live_ai_analysis(
             "reason": f"All 44 telemetry streams within nominal hydraulic & quality thresholds at {current_hour:02d}:00.",
         })
 
-    # 2. Refresh practical per-leak suggestions & stage HITL proposals for High/Critical active leaks
-    active_leaks = [l for l in all_leaks if l["status"] in ("Suspected", "Confirmed", "Under Repair")]
+    # 2. Refresh practical per-leak suggestions & stage HITL proposals for High/Critical active leaks (single source of truth)
+    all_leaks = get_all_leaks(include_history=True, db_path=db_path)
+    active_leaks = get_active_leaks(db_path=db_path)
     leak_suggestion_summaries: list[str] = []
     staged_actions: list[dict] = []
 
@@ -275,9 +277,9 @@ def run_live_ai_analysis(
                 "UPDATE leaks SET ai_suggestions_json = ? WHERE leak_id = ?;",
                 (json.dumps(sugg), lk["leak_id"]),
             )
-            if lk["status"] in ("Suspected", "Confirmed", "Under Repair"):
+            if is_active_leak_status(lk["status"]):
                 leak_suggestion_summaries.append(
-                    f"{lk['leak_id']} ({lk['severity']}, {lk['sector']}): {sugg['proposed_action']} "
+                    f"{lk['leak_id']} at {lk['junction_id']} ({lk['severity']}, {lk['sector']}, {lk['status']}): {sugg['proposed_action']} "
                     f"[Loss: {sugg['estimated_loss_m3_per_hour']} m3/hr | ${sugg['estimated_cost_usd_per_hour']}/hr]"
                 )
 

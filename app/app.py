@@ -95,6 +95,30 @@ def _ensure_database_initialized() -> None:
     st.session_state["_startup_ts_refreshed"] = True
 
 
+@st.fragment(run_every=5)
+def _render_live_header_fragment(display_hour: int) -> None:
+    """Self-updating status bar every 5 seconds while Live Simulation is ON."""
+    sim = get_simulator()
+    eff_hour = (
+        (sim.current_hour if not getattr(sim, "real_time_clock", True) else now_local().hour)
+        if (st.session_state.get("live_sim_toggle", False) and sim is not None)
+        else display_hour
+    )
+    render_header(display_hour=eff_hour)
+
+
+@st.fragment(run_every=5)
+def _render_live_twin_fragment(display_hour: int, height: int = 540) -> None:
+    """Self-updating 3D twin / 2D map every 5 seconds while Live Simulation is ON (zero iframe reload, camera kept)."""
+    sim = get_simulator()
+    eff_hour = (
+        (sim.current_hour if not getattr(sim, "real_time_clock", True) else now_local().hour)
+        if (st.session_state.get("live_sim_toggle", False) and sim is not None)
+        else display_hour
+    )
+    render_persistent_top_twin(display_hour=eff_hour, snapshot=None, height=height)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Ask AquaGrid — SCADA Control Room",
@@ -107,22 +131,33 @@ def main() -> None:
 
     # Determine active clock hour (real Dubai hour when Live Sim is ON, or 14:00 for deterministic scenarios)
     sim = get_simulator()
-    if st.session_state.get("live_sim_toggle", False) and sim is not None:
+    live_on = bool(st.session_state.get("live_sim_toggle", False))
+    if live_on and sim is not None:
         display_hour = sim.current_hour if not getattr(sim, "real_time_clock", True) else now_local().hour
     else:
         display_hour = DEFAULT_SCADA_HOUR
 
-    # 1. Thin always-visible 1-line status bar at top (placeholder allows live refresh after a chat/scenario turn)
+    # 1. Thin always-visible 1-line status bar at top (self-updates every 5s when Live Simulation is ON)
     header_placeholder = st.empty()
     with header_placeholder.container():
-        snapshot = render_header(display_hour=display_hour)
+        if live_on:
+            _render_live_header_fragment(display_hour=display_hour)
+            from tools.read_feeds import read_tariff_and_quality_feeds
+            from tools.read_telemetry import read_network_telemetry
 
-    # 2. Compact sidebar: Live Simulation, Scenarios (Round 1 & 2), Open Audit Log, Tech Details, Clear Chat
+            snapshot = {
+                "telemetry_data": read_network_telemetry(current_hour=display_hour, log_audit=False),
+                "feeds_data": read_tariff_and_quality_feeds(horizon_hours=6, current_hour=display_hour, log_audit=False),
+            }
+        else:
+            snapshot = render_header(display_hour=display_hour)
+
+    # 2. Compact sidebar: Live Simulation, Reset & Re-seed DB, Audit Log, Tech Details, Clear Chat
     render_sidebar()
 
     # 3. Auto-post any new system ALERT messages (leaks, water quality, telemetry loss, floor breach, live checks) into chat & twin
     seen_alerts = st.session_state.setdefault("_seen_alert_keys", set())
-    live_summary = getattr(sim, "last_tick_summary", None) if st.session_state.get("live_sim_toggle", False) else None
+    live_summary = getattr(sim, "last_tick_summary", None) if live_on else None
     new_alert_msgs, updated_seen = collect_system_alerts(
         telemetry_data=snapshot.get("telemetry_data") or {},
         feeds_data=snapshot.get("feeds_data") or {},
@@ -143,11 +178,15 @@ def main() -> None:
                 )
 
     # 4. 50/50 Split Control Room Layout:
-    #    LEFT  = Persistent fixed 3D/2D digital twin (~80% viewport height, sticky, fixed key -> zero reload)
+    #    LEFT  = Persistent fixed 3D/2D digital twin (~80% viewport height, sticky, fixed key -> zero reload;
+    #            self-updates every 5s via st.fragment when Live Simulation is ON)
     #    RIGHT = Scrollable panel with Scenarios (Round 1 & 2) at top + Chat history + right-column chat input
     col_twin, col_chat = st.columns([1, 1], gap="medium")
     with col_twin:
-        render_persistent_top_twin(display_hour=display_hour, snapshot=snapshot, height=540)
+        if live_on:
+            _render_live_twin_fragment(display_hour=display_hour, height=540)
+        else:
+            render_persistent_top_twin(display_hour=display_hour, snapshot=snapshot, height=540)
     with col_chat:
         turn_ran = render_ask_aquagrid_chat(
             display_hour=display_hour,
@@ -155,7 +194,7 @@ def main() -> None:
             chat_height=560,
             show_scenarios=True,
         )
-    if turn_ran:
+    if turn_ran and not live_on:
         with header_placeholder.container():
             render_header(display_hour=display_hour)
 

@@ -235,6 +235,9 @@ def inject_scenario_4(db_path: str | None = None) -> dict:
     sanitized_text = "[QUARANTINED ALERT: content withheld - injection detected]"
 
     with transaction_scope(db_path) as conn:
+        # Scenario 4 tests an adversarial injection on a healthy network with no active leaks
+        conn.execute("UPDATE leaks SET status = 'RESOLVED';")
+
         conn.execute(
             """
             INSERT INTO quality_alerts (severity, location, raw_text, sanitized_text, is_injection)

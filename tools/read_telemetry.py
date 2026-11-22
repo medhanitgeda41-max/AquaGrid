@@ -7,6 +7,11 @@ and returns verified telemetry to the agent.
 from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
+from database.leak_registry import (
+    get_active_leaks,
+    resolve_telemetry_leak_for_junction,
+    upsert_leak_for_junction,
+)
 from guards.injection_filter import inspect_untrusted_text
 from guards.telemetry_freshness import evaluate_db_freshness_report
 from guards.sensor_checks import (
@@ -137,7 +142,7 @@ def read_network_telemetry(
                     "status": "NORMAL",
                 })
 
-        # 4. Sector mass-balance checks for genuine pipe leaks
+        # 4. Sector mass-balance checks for genuine pipe leaks -> sync directly into single `leaks` registry!
         # Compare current pressure and flow vs baseline (hour 10) for each junction
         junction_rows = conn.execute(
             """
@@ -147,6 +152,9 @@ def read_network_telemetry(
             """ + (" AND sector = ?" if sector_id else "") + ";",
             params,
         ).fetchall()
+
+        detected_by_junction: dict[str, dict] = {}
+        normal_junctions: list[str] = []
 
         for j in junction_rows:
             j_id = j["junction_id"]
@@ -178,17 +186,14 @@ def read_network_telemetry(
 
                 diagnostic = check_mass_balance(p_delta, f_delta)
                 if diagnostic == "LEAK_CONFIRMED":
-                    leak_alerts.append({
+                    detected_by_junction[j_id] = {
                         "junction_id": j_id,
                         "sector": sec,
                         "pressure_delta_psi": round(p_delta, 2),
                         "flow_delta_lps": round(f_delta, 2),
-                        "status": "CONFIRMED_PIPE_LEAK",
-                        "diagnostic": (
-                            f"Hydraulic mass balance confirmed leak at {j_id} ({sec}): "
-                            f"Pressure dropped {abs(p_delta):.1f} psi while Flow spiked +{f_delta:.1f} L/s"
-                        ),
-                    })
+                    }
+                elif abs(p_delta) < 5.0 and abs(f_delta) < 15.0:
+                    normal_junctions.append(j_id)
 
         # 5. Fetch latest per-sector chlorine residual readings (with timestamps)
         if sector_id:
@@ -292,6 +297,40 @@ def read_network_telemetry(
         }
     finally:
         conn.close()
+
+    # Sync telemetry mass-balance findings into the single `leaks` table (same leak_id per junction, no duplicates)
+    for j_id, info in detected_by_junction.items():
+        upsert_leak_for_junction(
+            junction_id=j_id,
+            sector=info["sector"],
+            status="CONFIRMED",
+            pressure_delta_psi=info["pressure_delta_psi"],
+            flow_delta_lps=info["flow_delta_lps"],
+            detected_by="SCADA_MASS_BALANCE",
+            db_path=db_path,
+        )
+    for j_id in normal_junctions:
+        resolve_telemetry_leak_for_junction(
+            junction_id=j_id,
+            reason=f"Telemetry mass balance at {j_id} returned to nominal.",
+            db_path=db_path,
+        )
+
+    # Single source of truth: return active leaks from get_active_leaks() with both leak_id and junction_id!
+    active_leaks = get_active_leaks(sector=sector_id, db_path=db_path)
+    for lk in active_leaks:
+        j_hit = detected_by_junction.get(lk["junction_id"])
+        if j_hit:
+            lk["pressure_delta_psi"] = j_hit["pressure_delta_psi"]
+            lk["flow_delta_lps"] = j_hit["flow_delta_lps"]
+            lk["diagnostic"] = (
+                f"{lk['leak_id']} at {lk['junction_id']}, {lk['sector']}, {lk['status']}, "
+                f"{lk['loss_rate_m3h']:.1f} m³/hr "
+                f"(pressure {j_hit['pressure_delta_psi']:+.1f} psi, flow {j_hit['flow_delta_lps']:+.1f} L/s, "
+                f"valve {lk['isolating_valve_id']}: {lk['valve_status']})"
+            )
+    leak_alerts = active_leaks
+    result["leak_alerts"] = active_leaks
 
     if log_audit:
         with transaction_scope(db_path) as audit_conn:

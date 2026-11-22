@@ -121,19 +121,23 @@ CREATE TABLE IF NOT EXISTS pipe_segments (
     related_sensor_ids TEXT NOT NULL DEFAULT ''
 );
 
--- Geospatial Leak Registry (Every leak snapped onto a pipe_segment polyline)
+-- Geospatial Leak Registry (Single source of truth for leaks; one record per junction)
 CREATE TABLE IF NOT EXISTS leaks (
     leak_id TEXT PRIMARY KEY,
+    junction_id TEXT NOT NULL DEFAULT '',
     pipe_segment_id TEXT NOT NULL,
     sector TEXT NOT NULL,
     latitude REAL NOT NULL,
     longitude REAL NOT NULL,
     location_name TEXT NOT NULL,
     detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     severity TEXT NOT NULL, -- 'Low', 'Medium', 'High', 'Critical'
     estimated_loss_m3_per_hour REAL NOT NULL,
     confidence REAL NOT NULL, -- 0.0 to 1.0
-    status TEXT NOT NULL DEFAULT 'Suspected', -- 'Suspected', 'Confirmed', 'Under Repair', 'Resolved', 'False Alarm – Sensor Fault'
+    status TEXT NOT NULL DEFAULT 'SUSPECTED', -- 'SUSPECTED', 'CONFIRMED', 'UNDER_REPAIR', 'RESOLVED', 'FALSE_ALARM'
+    isolating_valve_id TEXT NOT NULL DEFAULT '',
+    detected_by TEXT NOT NULL DEFAULT 'SCADA_MASS_BALANCE',
     related_sensor_ids TEXT NOT NULL,
     ai_summary TEXT NOT NULL,
     ai_suggestions_json TEXT NOT NULL DEFAULT '{}',

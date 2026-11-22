@@ -5,6 +5,7 @@ scene state with local x/z metre coordinates around the Dubai network centre.
 Never mutates valves, plant setpoints, or any safety guard state.
 """
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import random
@@ -12,7 +13,7 @@ import re
 from typing import Optional
 
 from config.constants import DEFAULT_SCADA_HOUR, RESERVOIR_FLOOR_PERCENT
-from config.region_config import SECTOR_COLOR_NAMES, SECTOR_COLORS
+from config.region_config import SECTOR_COLOR_NAMES, SECTOR_COLORS, now_local
 from database.connection import get_db_connection
 from database.dubai_network import (
     DUBAI_PIPE_SEGMENTS,
@@ -23,6 +24,7 @@ from database.dubai_network import (
     compute_sector_boundaries,
     point_in_polygon,
 )
+from database.leak_registry import get_active_leaks, get_all_leaks, normalize_leak_status
 from digital_twin.hydraulics import (
     build_connected_network_geometry,
     compute_network_flows,
@@ -349,6 +351,8 @@ def build_twin_caption(scene_state: dict, twin_view: Optional[dict] = None) -> s
     f_id = hl.get("id")
     tv_note = (twin_view or {}).get("note") or ""
     suffix = f" · {tv_note}" if tv_note else ""
+    upd_str = str(scene_state.get("updated_at_local") or "")
+    upd_tag = f" · Last update {upd_str}" if upd_str else ""
 
     if f_type == "sector" and f_id:
         sec = next((s for s in scene_state.get("sectors", []) if s["name"].lower() == f_id.lower()), None)
@@ -357,7 +361,7 @@ def build_twin_caption(scene_state: dict, twin_view: Optional[dict] = None) -> s
             fire_txt = ", FIRE EMERGENCY" if sec.get("has_fire_emergency") else ""
             lk_cnt = int(sec.get("active_leaks", 0))
             lk_txt = f"{lk_cnt} active leak" + ("" if lk_cnt == 1 else "s")
-            return f"Showing: {sec['name']} — {lk_txt}, {cl_txt}{fire_txt}{suffix}"
+            return f"Showing: {sec['name']} — {lk_txt}, {cl_txt}{fire_txt}{suffix}{upd_tag}"
 
     if f_type in ("reservoir", "reservoir_inside"):
         res = scene_state.get("reservoir") or {}
@@ -366,32 +370,32 @@ def build_twin_caption(scene_state: dict, twin_view: Optional[dict] = None) -> s
         trend_part = f" ({rate_str}, {eta_str})" if rate_str and eta_str else ""
         em_txt = f", dynamic floor {res.get('safety_floor_percent', 35.0):.1f}%" if res.get("has_active_emergency") else f", floor {res.get('safety_floor_percent', 35.0):.1f}%"
         prefix = "Inside Reservoir RES-01" if f_type == "reservoir_inside" else "Reservoir RES-01"
-        return f"Showing: {prefix} — {res.get('level_percent', 48.0):.1f}%{trend_part}{em_txt}{suffix}"
+        return f"Showing: {prefix} — {res.get('level_percent', 48.0):.1f}%{trend_part}{em_txt}{suffix}{upd_tag}"
 
     if f_type in ("plant", "intake"):
         pl = scene_state.get("plant") or {}
         cap_txt = f" (algae cap {pl.get('algae_cap_mld', 120):.0f} MLD)" if float(pl.get("algae_cap_mld", 120)) < float(pl.get("max_capacity_mld", 120)) else ""
-        return f"Showing: DESAL-01 — {pl.get('output_mld', 100):.0f} MLD{cap_txt}{suffix}"
+        return f"Showing: DESAL-01 — {pl.get('output_mld', 100):.0f} MLD{cap_txt}{suffix}{upd_tag}"
 
     if f_type == "valve" and f_id:
         v = next((x for x in scene_state.get("valves", []) if x["valve_id"].upper() == f_id.upper()), None)
         if v:
-            return f"Showing: Valve {v['valve_id']} ({v['sector']}) — {v['status']}{suffix}"
+            return f"Showing: Valve {v['valve_id']} ({v['sector']}) — {v['status']}{suffix}{upd_tag}"
 
     if f_type == "leak" and f_id:
         lk = next((x for x in scene_state.get("leaks", []) if x["leak_id"].upper() == f_id.upper()), None)
         if lk:
             st_txt = "ISOLATED" if lk.get("isolated") else f"{lk.get('estimated_loss_m3_per_hour', 0):.1f} m³/hr"
-            return f"Showing: {lk['leak_id']} ({lk['sector']}) — {lk['severity']}, {st_txt}{suffix}"
+            return f"Showing: {lk['leak_id']} at {lk.get('junction_id', '')} ({lk['sector']}) — {lk['status']}, {st_txt}{suffix}{upd_tag}"
 
     if f_type == "junction" and f_id:
         j = next((x for x in scene_state.get("junctions", []) if x["junction_id"].upper() == f_id.upper()), None)
         if j:
-            return f"Showing: Junction {j['junction_id']} ({j['sector']}) — {j['pressure_psi']:.1f} psi, {j['flow_lps']:.1f} L/s{suffix}"
+            return f"Showing: Junction {j['junction_id']} ({j['sector']}) — {j['pressure_psi']:.1f} psi, {j['flow_lps']:.1f} L/s{suffix}{upd_tag}"
 
     res = scene_state.get("reservoir") or {}
     pl = scene_state.get("plant") or {}
-    act_leaks = sum(1 for l in scene_state.get("leaks", []) if l.get("active"))
+    act_leaks = int(scene_state.get("active_leak_count", sum(1 for l in scene_state.get("leaks", []) if l.get("active"))))
     non_comp = [s["name"] for s in scene_state.get("sectors", []) if s.get("compliance_status") == "NON_COMPLIANT"]
     wq_txt = f"NON_COMPLIANT: {', '.join(non_comp)}" if non_comp else "chlorine OK"
     rate_str = str(res.get("rate_str") or "")
@@ -399,7 +403,7 @@ def build_twin_caption(scene_state: dict, twin_view: Optional[dict] = None) -> s
     res_trend = f" {rate_str} ({eta_str})" if rate_str and eta_str else ""
     return (
         f"Showing: All 6 Sectors — RES-01 {res.get('level_percent', 48.0):.1f}%{res_trend}, "
-        f"DESAL-01 {pl.get('output_mld', 100.0):.0f} MLD, {act_leaks} active leak(s), {wq_txt}{suffix}"
+        f"DESAL-01 {pl.get('output_mld', 100.0):.0f} MLD, {act_leaks} active leak(s), {wq_txt}{suffix}{upd_tag}"
     )
 
 
@@ -411,6 +415,7 @@ def build_3d_scene_state(
     highlight_pipe_ids: Optional[list[str]] = None,
     flow_override_by_segment: Optional[dict[str, float]] = None,
     valve_override: Optional[dict[str, str]] = None,
+    show_leak_history: bool = False,
 ) -> dict:
     """
     Build one complete, JSON-serializable 3D scene state from live SQLite tables.
@@ -635,34 +640,45 @@ def build_3d_scene_state(
             }
         )
 
-    # 5. Leaks
+    # 5. Leaks — sourced ONLY from the single `leaks` registry (`get_active_leaks` / `get_all_leaks`)
+    canonical_active_leaks = get_active_leaks(db_path=db_path)
+    source_leaks = get_all_leaks(include_history=True, db_path=db_path) if show_leak_history else canonical_active_leaks
     leaks_out: list[dict] = []
     active_leaks_by_sec: dict[str, int] = {f"Sector {i}": 0 for i in range(1, 7)}
-    for lk in leak_rows:
+    for lk in source_leaks:
         lid = lk["leak_id"]
         l_sec = lk["sector"]
-        l_status = str(lk["status"])
+        norm_status = normalize_leak_status(lk["status"])
         lx, lz = latlon_to_local_xz(float(lk["latitude"]), float(lk["longitude"]))
         seg_ref = pipe_by_id.get(lk["pipe_segment_id"])
         pipe_flow = float(seg_ref["flow_lps"]) if seg_ref else 80.0
-        is_isolated = (lid in isolated_leaks) or (pipe_flow <= 0.1) or (l_status.lower() in ("resolved", "under repair"))
-        is_active = (l_status.lower() not in ("resolved", "false alarm – sensor fault")) and (not is_isolated)
+        is_history = norm_status in ("RESOLVED", "FALSE_ALARM")
+        is_isolated = (lid in isolated_leaks) or (pipe_flow <= 0.1) or bool(lk.get("is_isolated")) or is_history
+        is_active = not is_history
         if is_active:
             active_leaks_by_sec[l_sec] = active_leaks_by_sec.get(l_sec, 0) + 1
+        eff_loss = 0.0 if is_isolated else round(float(lk["raw_loss_rate_m3h"]), 1)
         leaks_out.append(
             {
                 "leak_id": lid,
+                "junction_id": lk["junction_id"],
                 "pipe_segment_id": lk["pipe_segment_id"],
                 "sector": l_sec,
                 "location_name": lk["location_name"],
                 "pos_xz": [lx, lz],
                 "severity": lk["severity"],
-                "status": l_status,
-                "estimated_loss_m3_per_hour": 0.0 if is_isolated else round(float(lk["estimated_loss_m3_per_hour"]), 1),
-                "raw_loss_m3_per_hour": round(float(lk["estimated_loss_m3_per_hour"]), 1),
+                "status": norm_status,
+                "isolating_valve_id": lk["isolating_valve_id"],
+                "valve_status": lk["valve_status"],
+                "updated_at": lk["updated_at"],
+                "detected_by": lk["detected_by"],
+                "estimated_loss_m3_per_hour": eff_loss,
+                "loss_rate_m3h": eff_loss,
+                "raw_loss_m3_per_hour": round(float(lk["raw_loss_rate_m3h"]), 1),
                 "confidence": round(float(lk["confidence"]), 2),
                 "active": is_active,
                 "isolated": is_isolated,
+                "is_history": is_history,
                 "highlighted": bool(focus_type == "leak" and focus_id and lid.upper() == focus_id.upper()),
             }
         )
@@ -798,10 +814,29 @@ def build_3d_scene_state(
         "banner": str(tf_info.get("banner", "Telemetry fresh.")),
     }
 
+    # Deterministic state hash/version so the bidirectional 3D component applies ONLY changes (no reload, camera kept)
+    hash_payload = {
+        "hour": int(current_hour),
+        "valves": [(v["valve_id"], v["status"]) for v in valves_out],
+        "pipes": [(p["segment_id"], p["flow_lps"]) for p in pipes_out],
+        "leaks": [(l["leak_id"], l["status"], l["isolated"], l["loss_rate_m3h"], l["updated_at"]) for l in leaks_out],
+        "plant": (plant_out["output_mld"], plant_out["algae_cap_mld"], plant_out["bloom_severity"]),
+        "reservoir": (reservoir_out["level_percent"], reservoir_out["safety_floor_percent"], reservoir_out["rate_pct_per_hour"]),
+        "sectors": [(s["name"], s["compliance_status"], s["has_fire_emergency"]) for s in sectors_out],
+        "telemetry_loss": telemetry_status["is_telemetry_loss"],
+        "show_leak_history": bool(show_leak_history),
+    }
+    scene_hash = hashlib.sha256(json.dumps(hash_payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
     return {
-        "version": "2.0",
+        "version": "2.1",
+        "scene_hash": scene_hash,
+        "scene_version": scene_hash,
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "updated_at_local": now_local().strftime("%H:%M:%S"),
         "current_hour": int(current_hour),
+        "active_leak_count": len(canonical_active_leaks),
+        "show_leak_history": bool(show_leak_history),
         "center_latlon": list(NETWORK_CENTER_LATLON),
         "scale_m_per_unit": 100.0,
         "low_quality": bool(low_quality),

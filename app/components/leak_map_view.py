@@ -40,8 +40,18 @@ def _parse_utc(ts_str: str | None) -> datetime:
 
 
 def _leak_color(severity: str, status: str) -> str:
-    if status == "Resolved":
-        return LEAK_SEVERITY_COLORS["Resolved"]
+    """Color leaks by canonical status: CONFIRMED red, SUSPECTED orange, UNDER_REPAIR yellow, RESOLVED/FALSE_ALARM grey."""
+    from database.leak_registry import normalize_leak_status
+
+    norm = normalize_leak_status(status)
+    if norm == "CONFIRMED":
+        return "#EF4444"
+    if norm == "SUSPECTED":
+        return "#F97316"
+    if norm == "UNDER_REPAIR":
+        return "#EAB308"
+    if norm in ("RESOLVED", "FALSE_ALARM"):
+        return "#94A3B8"
     return LEAK_SEVERITY_COLORS.get(severity, "#F97316")
 
 
@@ -364,41 +374,57 @@ def build_leak_folium_map(
                 ).add_to(sensor_group)
         sensor_group.add_to(fmap)
 
-    # 5. Leaks Layer
+    # 5. Leaks Layer (status-driven colors: CONFIRMED red, SUSPECTED orange, UNDER_REPAIR yellow+wrench, history grey)
     if show_leaks:
+        from database.leak_registry import normalize_leak_status
+
         leak_group = folium.FeatureGroup(name="Leaks")
         for lk in leaks:
             if hl_norm is not None and str(lk.get("sector", "")).lower() != hl_norm:
                 continue
             lat = float(lk["latitude"])
             lon = float(lk["longitude"])
-            loss = float(lk["estimated_loss_m3_per_hour"])
-            color = _leak_color(lk["severity"], lk["status"])
+            loss = float(lk.get("loss_rate_m3h", lk.get("estimated_loss_m3_per_hour", 0.0)))
+            norm_st = normalize_leak_status(lk.get("status"))
+            color = _leak_color(lk.get("severity", "Medium"), norm_st)
             is_sel = selected_leak and selected_leak["leak_id"] == lk["leak_id"]
+            jid = lk.get("junction_id", "")
+            upd = lk.get("updated_at", lk.get("detected_at", ""))
 
-            radius_m = max(110.0, min(620.0, loss * 6.5))
-            folium.Circle(
-                location=[lat, lon],
-                radius=radius_m,
-                color=color,
-                weight=3 if is_sel else 1.5,
-                fill=True,
-                fill_color=color,
-                fill_opacity=0.28 if is_sel else 0.16,
-                tooltip=f"{lk['leak_id']} | Affected zone (~{int(radius_m)}m radius, {loss:.1f} m³/hr)",
-            ).add_to(leak_group)
+            if norm_st not in ("RESOLVED", "FALSE_ALARM"):
+                radius_m = max(110.0, min(620.0, max(10.0, loss) * 6.5))
+                folium.Circle(
+                    location=[lat, lon],
+                    radius=radius_m,
+                    color=color,
+                    weight=3 if is_sel else 1.5,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.28 if is_sel else 0.16,
+                    tooltip=f"{lk['leak_id']} ({jid}) | {norm_st} · {loss:.1f} m³/hr",
+                ).add_to(leak_group)
 
-            marker_tooltip = f"{lk['leak_id']} | {lk['severity']} ({lk['status']}) — {lk['location_name']}"
-            folium.CircleMarker(
-                location=[lat, lon],
-                radius=11 if is_sel else 8,
-                color="#FFFFFF" if is_sel else color,
-                weight=3 if is_sel else 2,
-                fill=True,
-                fill_color=color,
-                fill_opacity=0.95,
-                tooltip=marker_tooltip,
-            ).add_to(leak_group)
+            marker_tooltip = (
+                f"{lk['leak_id']} | Junction {jid} | {norm_st} | "
+                f"{loss:.1f} m³/hr | Updated: {upd}"
+            )
+            if norm_st == "UNDER_REPAIR":
+                folium.Marker(
+                    location=[lat, lon],
+                    tooltip=marker_tooltip,
+                    icon=folium.Icon(color="orange", icon="wrench", prefix="fa"),
+                ).add_to(leak_group)
+            else:
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=11 if is_sel else (6 if norm_st in ("RESOLVED", "FALSE_ALARM") else 8),
+                    color="#FFFFFF" if is_sel else color,
+                    weight=3 if is_sel else 2,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.65 if norm_st in ("RESOLVED", "FALSE_ALARM") else 0.95,
+                    tooltip=marker_tooltip,
+                ).add_to(leak_group)
         leak_group.add_to(fmap)
 
     # 5b. Core Facilities (DESAL-01 Coastal Plant & RES-01 Strategic Reservoir) + Main Transmission Spine

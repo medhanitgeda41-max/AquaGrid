@@ -4,6 +4,7 @@ import streamlit as st
 from config.constants import DEFAULT_SCADA_HOUR, RESERVOIR_FLOOR_PERCENT
 from config.region_config import REGION_CONFIG, now_local
 from database.connection import get_db_connection
+from database.leak_registry import get_active_leaks, verify_leak_count_consistency
 from simulator import get_simulator
 from tools.read_telemetry import read_network_telemetry
 from tools.read_feeds import read_tariff_and_quality_feeds
@@ -82,7 +83,13 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     curr_tariff = float(tariffs[0]["rate_per_kwh"]) if tariffs else 0.48
     is_peak = bool(feeds_data.get("is_current_peak_tariff", True))
     v12_status = v12["status"] if v12 else "OPEN"
-    leak_count = len(telemetry_data.get("leak_alerts", []))
+    active_leaks = get_active_leaks()
+    leak_count = len(active_leaks)
+    tel_leak_count = len(telemetry_data.get("leak_alerts", []))
+    verify_leak_count_consistency(
+        {"status_bar": leak_count, "telemetry_tool": tel_leak_count},
+        context="header",
+    )
 
     sim = get_simulator()
     if st.session_state.get("live_sim_toggle", False) and sim is not None and not getattr(sim, "real_time_clock", True):

@@ -398,9 +398,33 @@ def render_inline_chart(metric: str, asset: str | None, hours: int, snapshot: di
 def render_inline_table(what: str) -> None:
     """Render live table for leaks, sensors, schedule, audit, or valves inside chat."""
     what = (what or "leaks").lower()
+    if what == "leaks":
+        from database.leak_registry import get_active_leaks, get_all_leaks
+
+        show_hist = bool(st.session_state.get("twin_show_leak_history", False))
+        leak_list = get_all_leaks(include_history=True) if show_hist else get_active_leaks()
+        df = pd.DataFrame(
+            [
+                {
+                    "Leak ID": lk["leak_id"],
+                    "Junction": lk["junction_id"],
+                    "Sector": lk["sector"],
+                    "Location": lk["location_name"],
+                    "Severity": lk["severity"],
+                    "Loss (m³/hr)": f"{float(lk['loss_rate_m3h']):.1f}",
+                    "Status": lk["status"],
+                    "Valve": f"{lk['isolating_valve_id']} ({lk['valve_status']})",
+                    "Last Update": format_dubai_time(lk["updated_at"]),
+                }
+                for lk in leak_list
+            ]
+        )
+        st.dataframe(df, width="stretch", hide_index=True)
+        return
+
     conn = get_db_connection()
     try:
-        if what == "leaks":
+        if what == "leaks_legacy":
             rows = conn.execute(
                 "SELECT leak_id, sector, location_name, severity, estimated_loss_m3_per_hour, status, detected_at FROM leaks ORDER BY detected_at DESC LIMIT 20;"
             ).fetchall()
