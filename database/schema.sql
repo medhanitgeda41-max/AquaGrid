@@ -89,6 +89,9 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     rationale TEXT NOT NULL,
     provenance TEXT NOT NULL DEFAULT 'AGENT_ANALYSIS', -- 'AGENT_ANALYSIS' or 'UNTRUSTED_TEXT'
     provenance_ref TEXT NOT NULL DEFAULT '',
+    justification_status TEXT NOT NULL DEFAULT 'JUSTIFIED', -- 'JUSTIFIED' or 'NOT_JUSTIFIED'
+    justification_warning TEXT NOT NULL DEFAULT '',
+    impact_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'APPROVED', 'REJECTED', 'CANCELLED_BY_SAFETY_RECHECK'
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     executed_at TIMESTAMP,

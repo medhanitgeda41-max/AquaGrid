@@ -492,6 +492,8 @@ def inject_scenario_u54(db_path: str | None = None) -> dict:
         approver="Lead_Operator_SCADA",
         db_path=db_path,
         approved_at=t_1405_utc,
+        operator_reason="Authorized Sector 6 planned isolation of V-17 at 14:05.",
+        confirmed_supply_cutoff=True,
     )
     token_id = approved["token_id"]
 

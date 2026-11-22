@@ -36,6 +36,12 @@ def init_db(db_path: str | None = None) -> None:
             conn.execute("ALTER TABLE pending_actions ADD COLUMN provenance TEXT NOT NULL DEFAULT 'AGENT_ANALYSIS';")
         if "provenance_ref" not in pa_cols:
             conn.execute("ALTER TABLE pending_actions ADD COLUMN provenance_ref TEXT NOT NULL DEFAULT '';")
+        if "justification_status" not in pa_cols:
+            conn.execute("ALTER TABLE pending_actions ADD COLUMN justification_status TEXT NOT NULL DEFAULT 'JUSTIFIED';")
+        if "justification_warning" not in pa_cols:
+            conn.execute("ALTER TABLE pending_actions ADD COLUMN justification_warning TEXT NOT NULL DEFAULT '';")
+        if "impact_json" not in pa_cols:
+            conn.execute("ALTER TABLE pending_actions ADD COLUMN impact_json TEXT NOT NULL DEFAULT '{}';")
         lk_cols = {r[1] for r in conn.execute("PRAGMA table_info(leaks);").fetchall()}
         if "junction_id" not in lk_cols:
             conn.execute("ALTER TABLE leaks ADD COLUMN junction_id TEXT NOT NULL DEFAULT '';")

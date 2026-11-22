@@ -1925,20 +1925,30 @@ function applySceneUpdate(args) {
       tr.delay = (tr.pipe_class === 'TRUNK_MAIN') ? 0.15 : 0.65;
     }
     // Selecting a sector highlights ONLY that sector's pipes and fades all others!
-    let pHl = !!p.highlighted || dlSet.has(p.segment_id) || dlSet.has(keyId);
+    // Affected pipes for a pending valve proposal or supply-continuity refusal glow BRIGHT RED before approval!
+    const inImpactSet = dlSet.has(p.segment_id) || dlSet.has(keyId);
+    const isRedImpactPreview = inImpactSet && (
+      viewCmd.event_type === 'staged_proposal' ||
+      viewCmd.event_type === 'supply_continuity_refused' ||
+      (hl.type === 'valve' && viewCmd.event_type !== 'valve_close')
+    );
+    let pHl = !!p.highlighted || inImpactSet;
     let pDim = false;
     if (hl.type === 'sector' && hl.id) {
       const sameSec = String(p.sector || '').toLowerCase() === String(hl.id).toLowerCase();
-      pHl = sameSec;
-      pDim = !sameSec;
+      pHl = sameSec || inImpactSet;
+      pDim = !sameSec && !inImpactSet;
     } else if (hl.type === 'valve' && hl.id) {
       pDim = !pHl;
     }
 
+    tr.isImpactAlert = isRedImpactPreview;
     tr.isDimmed = pDim;
     tr.baseOpacity = pDim ? 0.18 : 0.96;
-    tr.baseEmissive = pHl ? tr.activeColor.clone() : new THREE.Color('#000000');
-    tr.baseEmissiveIntensity = pHl ? 0.50 : 0.0;
+    tr.baseEmissive = isRedImpactPreview
+      ? new THREE.Color('#EF4444')
+      : (pHl ? tr.activeColor.clone() : new THREE.Color('#000000'));
+    tr.baseEmissiveIntensity = isRedImpactPreview ? 0.85 : (pHl ? 0.50 : 0.0);
 
     if (engine.hoveredRunId !== tr.run_id) {
       tr.mat.opacity = tr.baseOpacity;
@@ -2164,7 +2174,16 @@ function startAnimationLoop() {
         const fu = tr.delay > 0 ? easeOutCubic((t - tr.animStart - tr.delay) / 1.8) : easeOutCubic((t - tr.animStart) / 1.4);
         tr.currentFlow = tr.prevFlow + (tr.targetFlow - tr.prevFlow) * fu;
         if (tr.mat) {
-          tr.mat.color.copy(tr.dryColor).lerp(tr.activeColor, Math.min(1.0, tr.currentFlow / 25.0));
+          if (tr.isImpactAlert) {
+            const alertPulse = 0.55 + 0.40 * Math.sin(t * 4.5);
+            tr.mat.color.copy(colRed);
+            if (engine.hoveredRunId !== tr.run_id) {
+              tr.mat.emissive.copy(colRed);
+              tr.mat.emissiveIntensity = alertPulse;
+            }
+          } else {
+            tr.mat.color.copy(tr.dryColor).lerp(tr.activeColor, Math.min(1.0, tr.currentFlow / 25.0));
+          }
         }
         const speed = (tr.currentFlow / 100.0) * 0.24;
         const dimFactor = tr.isDimmed ? 0.35 : 1.0;

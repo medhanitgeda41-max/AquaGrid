@@ -8,6 +8,7 @@ Enforces strict architectural perimeter:
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import secrets
 from typing import Optional
 from config.constants import (
@@ -28,6 +29,11 @@ from guards.safety_floors import (
     evaluate_quality_and_bloom_derating,
 )
 from guards.telemetry_freshness import check_db_telemetry_freshness
+from guards.valve_guard import (
+    assess_valve_change_impact,
+    evaluate_valve_justification,
+    validate_rationale_sector_match,
+)
 from guards.water_quality import evaluate_sector_chlorine, target_id_to_sector_name
 
 
@@ -113,6 +119,7 @@ def _execute_bound_action_in_tx(
     proposed_value: float,
     now_utc: datetime,
     db_path: Optional[str] = None,
+    operator_reason: str = "",
 ) -> dict:
     """Validate single-use token and execute physical mutation + mark used_at in ONE atomic transaction."""
     token_id = token_row["token_id"]
@@ -344,6 +351,7 @@ def _execute_bound_action_in_tx(
         "UPDATE approval_tokens SET used_at = ? WHERE token_id = ?;",
         (now_str, token_id),
     )
+    reason_suffix = f" Operator reason: {operator_reason.strip()}" if str(operator_reason or "").strip() else ""
     conn.execute(
         """
         INSERT INTO audit_log (event_type, target_id, details, actor, status)
@@ -352,7 +360,7 @@ def _execute_bound_action_in_tx(
         (
             "ACTION_EXECUTED",
             target_id,
-            f"Action {action_id} ({action_type} -> {proposed_value}) APPROVED via single-use token {token_id} and executed by {approver}.",
+            f"Action {action_id} ({action_type} -> {proposed_value}) APPROVED via single-use token {token_id} and executed by {approver}.{reason_suffix}",
             "HUMAN_OPERATOR",
             "APPROVED",
         ),
@@ -365,6 +373,7 @@ def _execute_bound_action_in_tx(
         "target_id": target_id,
         "new_value": proposed_value,
         "approver": approver,
+        "operator_reason": str(operator_reason or "").strip(),
         "token_id": token_id,
         "token_issued_at": token_row["issued_at"],
         "token_expires_at": token_row["expires_at"],
@@ -380,6 +389,7 @@ def execute_action_with_approval_token(
     proposed_value: float,
     at_time: Optional[datetime] = None,
     db_path: Optional[str] = None,
+    operator_reason: str = "",
 ) -> dict:
     """
     Attempt to execute an actuator change by presenting an approval token.
@@ -415,6 +425,7 @@ def execute_action_with_approval_token(
             proposed_value=proposed_value,
             now_utc=now_utc,
             db_path=db_path,
+            operator_reason=operator_reason,
         )
 
 
@@ -687,9 +698,38 @@ def stage_gated_valve_or_setpoint_action(
             "known_targets": KNOWN_TARGET_IDS,
         }
 
+    # 1a. Rationale sector-match validation (rejects rationales naming a different sector than the valve/target's own)
+    sector_match = validate_rationale_sector_match(action_type, target_id, rationale)
+    if not sector_match["valid"]:
+        err_reason = sector_match["reason"]
+        with transaction_scope(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                ("RATIONALE_SECTOR_MISMATCH", target_id, err_reason, "CODE_GUARD", "REJECTED_WRONG_SECTOR"),
+            )
+        return {
+            "status": "REJECTED_WRONG_SECTOR",
+            "action_type": action_type,
+            "target_id": target_id,
+            "expected_sector": sector_match["expected_sector"],
+            "mentioned_sectors": sector_match["mentioned_sectors"],
+            "reason": err_reason,
+        }
+
     conn = get_db_connection(db_path)
     sim_min_projected_percent: Optional[float] = None
     effective_floor_pct_for_resp: float = RESERVOIR_FLOOR_PERCENT * 100.0
+    valve_impact: Optional[dict] = None
+    justification_info: dict = {
+        "justification_status": "JUSTIFIED",
+        "is_justified": True,
+        "requires_override_reason": False,
+        "justification_basis": "",
+        "warning": "",
+    }
     try:
         # 1b. Duplicate PENDING guard: reject if a PENDING action already exists for same target_id & action_type
         existing_pending = conn.execute(
@@ -729,6 +769,42 @@ def stage_gated_valve_or_setpoint_action(
         if action_type in ("CLOSE_VALVE", "OPEN_VALVE"):
             v_row = conn.execute("SELECT status FROM valves WHERE valve_id = ?;", (target_id,)).fetchone()
             current_value = 1.0 if (v_row and v_row["status"] == "OPEN") else 0.0
+
+            # Pure-Python Hydraulic Impact Assessment & Supply Continuity Guard BEFORE staging
+            valve_impact = assess_valve_change_impact(valve_id=target_id, action_type=action_type, db_path=db_path)
+            if action_type == "CLOSE_VALVE" and valve_impact["cuts_entire_sector"]:
+                cutoff_list = ", ".join(valve_impact["cutoff_sectors"])
+                cust_cnt = int(valve_impact.get("approx_customers_affected", 0))
+                reason = (
+                    f"REJECTED_SUPPLY_CONTINUITY: Closing {target_id} ({valve_impact['valve_sector']}) "
+                    f"would leave {cutoff_list} with NO open supply path at all "
+                    f"(~{cust_cnt:,} customers affected). Refused without staging."
+                )
+                with transaction_scope(db_path) as audit_conn:
+                    audit_conn.execute(
+                        """
+                        INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                        VALUES (?, ?, ?, ?, ?);
+                        """,
+                        ("SUPPLY_CONTINUITY_BLOCKED", target_id, reason, "CODE_GUARD", "REJECTED_SUPPLY_CONTINUITY"),
+                    )
+                return {
+                    "status": "REJECTED_SUPPLY_CONTINUITY",
+                    "action_type": action_type,
+                    "target_id": target_id,
+                    "cutoff_sectors": valve_impact["cutoff_sectors"],
+                    "impact": valve_impact,
+                    "reason": reason,
+                }
+
+            # Pure-Python Justification Check (leak / water-quality / maintenance vs NO TECHNICAL JUSTIFICATION)
+            justification_info = evaluate_valve_justification(
+                valve_id=target_id,
+                action_type=action_type,
+                rationale=rationale,
+                impact=valve_impact,
+                db_path=db_path,
+            )
         elif action_type == "ISOLATE_AND_FLUSH":
             sec_name = target_id_to_sector_name(target_id)
             wq_row = conn.execute(
@@ -859,23 +935,39 @@ def stage_gated_valve_or_setpoint_action(
     finally:
         conn.close()
 
-    # 3. Stage Action as PENDING in pending_actions (Atomic, with provenance)
+    # 3. Stage Action as PENDING in pending_actions (Atomic, with provenance, justification & impact)
     norm_provenance = "UNTRUSTED_TEXT" if str(provenance or "").upper() == "UNTRUSTED_TEXT" else "AGENT_ANALYSIS"
     prov_ref_clean = str(provenance_ref or "").strip()
     prov_label = f"{norm_provenance} ({prov_ref_clean})" if prov_ref_clean else norm_provenance
+    just_status = str(justification_info.get("justification_status", "JUSTIFIED"))
+    just_warning = str(justification_info.get("warning", ""))
+    impact_serialized = json.dumps(valve_impact or {}, default=str)
 
     with transaction_scope(db_path) as tx_conn:
         cursor = tx_conn.execute(
             """
             INSERT INTO pending_actions (
-                action_type, target_id, proposed_value, current_value, rationale, provenance, provenance_ref, status
+                action_type, target_id, proposed_value, current_value, rationale,
+                provenance, provenance_ref, justification_status, justification_warning, impact_json, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING');
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING');
             """,
-            (action_type, target_id, proposed_value, current_value, rationale, norm_provenance, prov_ref_clean),
+            (
+                action_type,
+                target_id,
+                proposed_value,
+                current_value,
+                rationale,
+                norm_provenance,
+                prov_ref_clean,
+                just_status,
+                just_warning,
+                impact_serialized,
+            ),
         )
         action_id = cursor.lastrowid
 
+        warn_note = f" WARNING={just_warning}" if just_warning else ""
         tx_conn.execute(
             """
             INSERT INTO audit_log (event_type, target_id, details, actor, status)
@@ -886,7 +978,7 @@ def stage_gated_valve_or_setpoint_action(
                 target_id,
                 (
                     f"Action {action_type} for {target_id} staged as PENDING (ID: {action_id}, "
-                    f"provenance={prov_label}). Awaiting human authorization."
+                    f"provenance={prov_label}, justification={just_status}).{warn_note} Awaiting human authorization."
                 ),
                 "CODE_GUARD",
                 "PENDING",
@@ -903,8 +995,18 @@ def stage_gated_valve_or_setpoint_action(
         "rationale": rationale,
         "provenance": norm_provenance,
         "provenance_ref": prov_ref_clean,
-        "message": "Action staged successfully in PENDING state. Awaiting mandatory human operator authorization.",
+        "justification_status": just_status,
+        "requires_override_reason": bool(justification_info.get("requires_override_reason", False)),
+        "justification_basis": justification_info.get("justification_basis", ""),
+        "warning": just_warning,
+        "message": (
+            f"Action staged in PENDING state with warning: {just_warning}"
+            if just_warning
+            else "Action staged successfully in PENDING state. Awaiting mandatory human operator authorization."
+        ),
     }
+    if valve_impact is not None:
+        response["impact"] = valve_impact
     if sim_min_projected_percent is not None:
         response["min_projected_percent"] = sim_min_projected_percent
         response["floor_threshold_percent"] = effective_floor_pct_for_resp
@@ -916,12 +1018,49 @@ def execute_human_approval(
     approver: str = "ControlRoom_Operator",
     db_path: Optional[str] = None,
     approved_at: Optional[datetime] = None,
+    operator_reason: str = "",
+    confirmed_supply_cutoff: bool = False,
 ) -> dict:
     """
     Execute human operator approval by issuing a single-use approval token bound to
     the exact PENDING action, running the just-in-time safety re-check, and consuming
     the token (used_at) in the same ACID transaction as the physical mutation.
+
+    For NOT_JUSTIFIED actions (no leak, no quality issue, no maintenance), requires a
+    typed operator_reason (min 10 characters) AND confirmed_supply_cutoff=True, and saves
+    the typed reason in audit_log.
     """
+    conn_chk = get_db_connection(db_path)
+    try:
+        row = conn_chk.execute("SELECT * FROM pending_actions WHERE id = ?;", (action_id,)).fetchone()
+    finally:
+        conn_chk.close()
+    if not row:
+        return {"status": "ERROR_NOT_FOUND", "message": f"Pending action {action_id} not found."}
+
+    just_status = row["justification_status"] if "justification_status" in row.keys() and row["justification_status"] else "JUSTIFIED"
+    clean_reason = str(operator_reason or "").strip()
+    if just_status == "NOT_JUSTIFIED":
+        if len(clean_reason) < 10 or not bool(confirmed_supply_cutoff):
+            err_msg = (
+                "REJECTED_REASON_REQUIRED: Unjustified supply-cutoff action requires a typed operator reason "
+                "(min 10 characters) and ticking 'I understand customers will lose supply'."
+            )
+            with transaction_scope(db_path) as audit_conn:
+                audit_conn.execute(
+                    """
+                    INSERT INTO audit_log (event_type, target_id, details, actor, status)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    ("APPROVAL_REASON_REQUIRED", row["target_id"], err_msg, "CODE_GUARD", "REJECTED_REASON_REQUIRED"),
+                )
+            return {
+                "status": "REJECTED_REASON_REQUIRED",
+                "action_id": action_id,
+                "target_id": row["target_id"],
+                "reason": err_msg,
+            }
+
     now_utc = _parse_utc_timestamp(approved_at) or datetime.now(timezone.utc)
     issued = issue_approval_token(
         action_id=action_id,
@@ -932,14 +1071,6 @@ def execute_human_approval(
     if issued.get("status") != "ISSUED":
         return issued
 
-    conn_val = get_db_connection(db_path)
-    try:
-        row = conn_val.execute("SELECT action_type, target_id, proposed_value FROM pending_actions WHERE id = ?;", (action_id,)).fetchone()
-    finally:
-        conn_val.close()
-    if not row:
-        return {"status": "ERROR_NOT_FOUND", "message": f"Pending action {action_id} not found."}
-
     return execute_action_with_approval_token(
         token_id=issued["token_id"],
         action_type=row["action_type"],
@@ -947,6 +1078,7 @@ def execute_human_approval(
         proposed_value=float(row["proposed_value"]),
         at_time=now_utc,
         db_path=db_path,
+        operator_reason=clean_reason,
     )
 
 

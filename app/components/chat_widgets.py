@@ -11,6 +11,7 @@ from database.connection import get_db_connection
 from digital_twin.hydraulics import simulate_valve_change_impact
 from guards.injection_filter import detect_injection
 from guards.reservoir_model import project_reservoir_series
+from guards.valve_guard import assess_valve_change_impact
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.write_gateway import execute_human_approval, execute_human_rejection
 from components.badges import format_dubai_time, status_badge
@@ -596,17 +597,22 @@ def render_inline_3d(
 
 
 def build_approval_impact_preview(action_type: str, target_id: str, db_path: str | None = None) -> dict:
-    """Compute hydraulic impact preview & 3D focus metadata for a pending HITL approval card (read-only)."""
+    """Compute full pure-Python hydraulic impact preview & 3D focus metadata for a pending HITL approval card (read-only)."""
     a_type = str(action_type or "").upper()
     t_id = str(target_id or "").upper()
     if a_type in ("CLOSE_VALVE", "OPEN_VALVE"):
-        new_st = "CLOSED" if a_type == "CLOSE_VALVE" else "OPEN"
-        impact = simulate_valve_change_impact(valve_id=t_id, new_status=new_st, db_path=db_path)
+        impact = assess_valve_change_impact(valve_id=t_id, action_type=a_type, db_path=db_path)
         return {
             "focus": t_id,
             "highlight_pipe_ids": impact["affected_pipe_ids"],
             "summary_lines": impact["summary_lines"],
             "affected_pipes": impact["affected_pipes"],
+            "affected_junctions": impact["affected_junctions"],
+            "affected_sectors": impact["affected_sectors"],
+            "affected_area": impact["affected_area"],
+            "approx_customers_affected": impact["approx_customers_affected"],
+            "isolated_active_leaks": impact["isolated_active_leaks"],
+            "valve_sector": impact["valve_sector"],
         }
     if a_type == "SET_PLANT_OUTPUT":
         return {
@@ -614,6 +620,11 @@ def build_approval_impact_preview(action_type: str, target_id: str, db_path: str
             "highlight_pipe_ids": [],
             "summary_lines": [f"DESAL-01 output setpoint change affects RES-01 level trajectory"],
             "affected_pipes": [],
+            "affected_junctions": [],
+            "affected_sectors": [],
+            "affected_area": "RES-01 Strategic Reservoir",
+            "approx_customers_affected": 0,
+            "isolated_active_leaks": [],
         }
     if a_type == "ISOLATE_AND_FLUSH" and t_id.startswith("SECTOR-"):
         sec_num = t_id.split("-")[-1].lstrip("0") or "1"
@@ -622,12 +633,27 @@ def build_approval_impact_preview(action_type: str, target_id: str, db_path: str
             "highlight_pipe_ids": [],
             "summary_lines": [f"Isolate & flush Sector {sec_num} to restore chlorine residual >= 0.20 mg/L"],
             "affected_pipes": [],
+            "affected_junctions": [],
+            "affected_sectors": [f"Sector {sec_num}"],
+            "affected_area": f"Sector {sec_num}",
+            "approx_customers_affected": 0,
+            "isolated_active_leaks": [],
         }
-    return {"focus": "all", "highlight_pipe_ids": [], "summary_lines": [], "affected_pipes": []}
+    return {
+        "focus": "all",
+        "highlight_pipe_ids": [],
+        "summary_lines": [],
+        "affected_pipes": [],
+        "affected_junctions": [],
+        "affected_sectors": [],
+        "affected_area": "",
+        "approx_customers_affected": 0,
+        "isolated_active_leaks": [],
+    }
 
 
 def render_inline_approvals(widget_key: str) -> None:
-    """Render Pending Approval cards with compact 3D hydraulic preview and Approve / Reject BUTTONS directly inside chat."""
+    """Render Pending Approval cards with hydraulic impact assessment, justification warning & Approve / Reject BUTTONS directly inside chat."""
     conn = get_db_connection()
     try:
         pending_rows = conn.execute("SELECT * FROM pending_actions WHERE status = 'PENDING' ORDER BY id DESC;").fetchall()
@@ -647,8 +673,13 @@ def render_inline_approvals(widget_key: str) -> None:
         curr_fmt = _format_val(action_type, float(row["current_value"]))
         prop_fmt = _format_val(action_type, float(row["proposed_value"]))
         rationale = row["rationale"]
-        prov = row["provenance"] if "provenance" in row.keys() and row["provenance"] else "AGENT_ANALYSIS"
-        prov_ref = row["provenance_ref"] if "provenance_ref" in row.keys() and row["provenance_ref"] else ""
+        row_keys = set(row.keys())
+        prov = row["provenance"] if "provenance" in row_keys and row["provenance"] else "AGENT_ANALYSIS"
+        prov_ref = row["provenance_ref"] if "provenance_ref" in row_keys and row["provenance_ref"] else ""
+        just_status = row["justification_status"] if "justification_status" in row_keys and row["justification_status"] else "JUSTIFIED"
+        just_warning = row["justification_warning"] if "justification_warning" in row_keys and row["justification_warning"] else ""
+        is_unjustified = (just_status == "NOT_JUSTIFIED")
+
         prov_txt = f"{prov} ({prov_ref})" if prov_ref else prov
         prov_cls = "ag-badge-warn" if prov == "UNTRUSTED_TEXT" else "ag-badge-neutral"
 
@@ -663,34 +694,93 @@ def render_inline_approvals(widget_key: str) -> None:
                 f'</div>'
             )
 
-        st.markdown(
-            f"""
-            <div class="scada-card-pending">
-                <div>
-                    {status_badge("STAGED_PENDING_APPROVAL")}
-                    <span class="ag-badge {prov_cls}">{html.escape(prov_txt)}</span>
-                    <strong>Action #{action_id}:</strong>
-                    <span class="ag-mono">{html.escape(action_type)} {html.escape(target_id)} ({html.escape(curr_fmt)} &rarr; {html.escape(prop_fmt)})</span>
-                </div>
-                <div style="margin-top:0.3rem; font-size:0.86rem; color:#CBD5E1;">
-                    <strong>Reason:</strong> {html.escape(str(rationale))}
-                </div>
-                {flow_html}
-                <div style="margin-top:0.2rem; font-size:0.8rem; color:#94A3B8;">
-                    Safety check: PASS at staging · Clicking Approve re-checks safety floor, water quality &amp; freshness and consumes a single-use token.
-                </div>
-                <div style="margin-top:0.25rem; font-size:0.79rem; color:#38BDF8;">
-                    &rarr; {html.escape(preview['focus'])} &amp; affected downstream pipes shown in the twin view
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        impact_details_html = ""
+        if action_type in ("CLOSE_VALVE", "OPEN_VALVE"):
+            juncs_str = ", ".join(preview.get("affected_junctions") or []) or "None"
+            cust_cnt = int(preview.get("approx_customers_affected", 0))
+            area_str = preview.get("affected_area") or preview.get("valve_sector") or ""
+            iso_leaks = preview.get("isolated_active_leaks") or []
+            if iso_leaks:
+                lk_str = ", ".join(f"{l['leak_id']} at {l['junction_id']} ({l['status']}, {l['loss_rate_m3h']:.1f} m³/hr)" for l in iso_leaks)
+                lk_html = f'<span style="color:#4ADE80; font-weight:700;">{html.escape(lk_str)}</span>'
+            else:
+                lk_html = '<span style="color:#F59E0B;">None</span>'
+            impact_details_html = (
+                f'<div style="margin-top:0.22rem; font-size:0.81rem; color:#CBD5E1;">'
+                f'<strong>Impact:</strong> {html.escape(area_str)} · Junctions: <span class="ag-mono">{html.escape(juncs_str)}</span> · '
+                f'Approx. customers losing supply: <strong>~{cust_cnt:,}</strong> · Active leaks isolated: {lk_html}'
+                f'</div>'
+            )
+
+        warn_banner_html = ""
+        if is_unjustified:
+            warn_text = just_warning or f"NO TECHNICAL JUSTIFICATION — this will cut supply to {preview.get('affected_area') or target_id} with no leak or quality issue"
+            warn_banner_html = (
+                f'<div style="margin-top:0.38rem; padding:0.45rem 0.65rem; border-radius:6px; '
+                f'background:rgba(185,28,28,0.28); border:1px solid #EF4444; color:#FECACA; font-size:0.83rem; font-weight:700;">'
+                f'⚠ {html.escape(warn_text)}'
+                f'</div>'
+            )
+
+        card_cls = "scada-card-alert" if is_unjustified else "scada-card-pending"
+        card_parts = [
+            f'<div class="{card_cls}">',
+            f'<div>{status_badge("STAGED_PENDING_APPROVAL")} '
+            f'<span class="ag-badge {prov_cls}">{html.escape(prov_txt)}</span> '
+            f'<strong>Action #{action_id}:</strong> '
+            f'<span class="ag-mono">{html.escape(action_type)} {html.escape(target_id)} ({html.escape(curr_fmt)} &rarr; {html.escape(prop_fmt)})</span></div>',
+            f'<div style="margin-top:0.3rem; font-size:0.86rem; color:#CBD5E1;">'
+            f'<strong>Reason:</strong> {html.escape(str(rationale))}</div>',
+        ]
+        if warn_banner_html:
+            card_parts.append(warn_banner_html)
+        if flow_html:
+            card_parts.append(flow_html)
+        if impact_details_html:
+            card_parts.append(impact_details_html)
+        card_parts.append(
+            '<div style="margin-top:0.2rem; font-size:0.8rem; color:#94A3B8;">'
+            'Safety check: PASS at staging · Clicking Approve re-checks safety floor, water quality &amp; freshness and consumes a single-use token.</div>'
         )
+        card_parts.append(
+            f'<div style="margin-top:0.25rem; font-size:0.79rem; color:#FCA5A5;">'
+            f'&rarr; {html.escape(preview["focus"])} &amp; affected downstream pipes highlighted in red in the 3D view</div>'
+        )
+        card_parts.append("</div>")
+        st.markdown("".join(card_parts), unsafe_allow_html=True)
+
+        # Unjustified closures require operator typed reason (min 10 chars) + supply-loss confirmation checkbox
+        typed_reason = ""
+        confirm_supply = True
+        approve_disabled = False
+        if is_unjustified:
+            typed_reason = st.text_input(
+                f"Operator reason to approve {target_id} (min 10 characters, saved to Audit Log)",
+                key=f"override_reason_{widget_key}_{action_id}",
+                placeholder="Explain why supply must be cut (min 10 chars)...",
+            )
+            confirm_supply = st.checkbox(
+                "I understand customers will lose supply",
+                value=False,
+                key=f"confirm_cutoff_{widget_key}_{action_id}",
+            )
+            approve_disabled = (len(typed_reason.strip()) < 10) or (not confirm_supply)
 
         c1, c2, _ = st.columns([1.5, 1.5, 0.3])
         with c1:
-            if st.button(f"Approve #{action_id}", key=f"chat_approve_{widget_key}_{action_id}", type="primary", width="stretch"):
-                res = execute_human_approval(action_id=action_id, approver=operator_name)
+            if st.button(
+                f"Approve #{action_id}",
+                key=f"chat_approve_{widget_key}_{action_id}",
+                type="primary",
+                disabled=approve_disabled,
+                width="stretch",
+            ):
+                res = execute_human_approval(
+                    action_id=action_id,
+                    approver=operator_name,
+                    operator_reason=typed_reason,
+                    confirmed_supply_cutoff=confirm_supply,
+                )
                 st_code = res.get("status", "UNKNOWN")
                 decision_widgets: list[dict] = []
                 if st_code == "EXECUTED":

@@ -24,6 +24,11 @@ from database.connection import get_db_connection, transaction_scope
 from database.scenarios import get_scenario_by_id, reset_database
 from guards.injection_filter import detect_injection
 from guards.schedule_validator import validate_production_schedule
+from guards.valve_guard import (
+    assess_valve_change_impact,
+    format_action_rationale,
+    parse_operator_valve_request,
+)
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
 from tools.write_gateway import (
@@ -57,8 +62,8 @@ STRICT RULES:
    - show_schedule_validation(plan): validating a production schedule.
    - show_pending_approvals(): showing pending actions awaiting operator signoff.
    Never describe 3D or 2D features that are not listed in the tool result. Only cite targets, colours, flows, counts, and status values returned by the tool summary.
-7. If the operator asks for a physical change (e.g. "reduce output to 70 MLD", "close V-12", "isolate and flush Sector 2"), you may ONLY call propose_gated_action. All Python safety guards run automatically inside the gateway. State the exact gateway status code (STAGED_PENDING_APPROVAL or REJECTED_* + reason) and remind the operator to click the Approve or Reject button on the approval card.
-8. You can NEVER execute, auto-approve, or bypass operator approval. Keep exact technical status codes unchanged (STAGED_PENDING_APPROVAL, REJECTED_BY_SAFETY_GUARD, REJECTED_WATER_QUALITY, CANCELLED_BY_SAFETY_RECHECK, REJECTED_UNAUTHORIZED_APPROVAL_CLAIM, REJECTED_APPROVAL_MISMATCH, REJECTED_APPROVAL_ALREADY_USED, REJECTED_APPROVAL_EXPIRED, TELEMETRY_LOSS, REJECTED_STALE_TELEMETRY, CANCELLED_STALE_TELEMETRY, NON_COMPLIANT, UNTRUSTED_TEXT, VALID, GAP).
+7. If the operator asks for a physical change (e.g. "reduce output to 70 MLD", "close V-12", "close V-16", "isolate and flush Sector 2"), you may ONLY call propose_gated_action. All Python safety guards, hydraulic impact assessments, supply-continuity checks, and justification checks run automatically inside the gateway. NEVER invent a reason for an operator's request (if they gave no reason, pass an empty string or "Operator request — no reason given"; NEVER fabricate demand/reservoir reasons or mention a different sector than the valve's real sector). If the gateway returns justification_status="NOT_JUSTIFIED", clearly tell the operator: "There is no leak or issue on <valve>. Closing it will stop water to <area>. Do you want to continue?" and report the computed impact and warning. If the gateway returns REJECTED_SUPPLY_CONTINUITY or REJECTED_WRONG_SECTOR, state the exact code and explain why.
+8. You can NEVER execute, auto-approve, or bypass operator approval. Keep exact technical status codes unchanged (STAGED_PENDING_APPROVAL, REJECTED_BY_SAFETY_GUARD, REJECTED_WATER_QUALITY, REJECTED_SUPPLY_CONTINUITY, REJECTED_WRONG_SECTOR, REJECTED_REASON_REQUIRED, CANCELLED_BY_SAFETY_RECHECK, REJECTED_UNAUTHORIZED_APPROVAL_CLAIM, REJECTED_APPROVAL_MISMATCH, REJECTED_APPROVAL_ALREADY_USED, REJECTED_APPROVAL_EXPIRED, TELEMETRY_LOSS, REJECTED_STALE_TELEMETRY, CANCELLED_STALE_TELEMETRY, NON_COMPLIANT, UNTRUSTED_TEXT, VALID, GAP).
 9. The 3D twin and map are drawn from the same live data you receive. Never say the twin is stale or cached. If an ID is not in the data, say so plainly. Always refer to leaks with both leak_id and junction_id (e.g., "LEAK-001 at J-14, Sector 4, CONFIRMED, 64.5 m³/hr").
 """
 
@@ -1222,6 +1227,9 @@ STATUS_CODE_GLOSSARY = {
     "REJECTED_BY_SAFETY_GUARD": "Blocked because the proposal breaches the 35% (or raised emergency) reservoir floor, algal-bloom output cap, or physical limits.",
     "REJECTED_BY_CODE": "24h production schedule rejected by the deterministic physics validator (floor breach, capacity limit, bloom cap, or unparseable blocks).",
     "REJECTED_WATER_QUALITY": "Blocked because a sector has non-compliant chlorine (< 0.20 mg/L); water quality outranks peak-tariff production cuts.",
+    "REJECTED_SUPPLY_CONTINUITY": "Refused without staging because closing this valve would leave an entire sector with no open water supply path.",
+    "REJECTED_WRONG_SECTOR": "Refused because the action rationale named a different sector than the target valve's actual sector.",
+    "REJECTED_REASON_REQUIRED": "Approval refused because an unjustified supply-cutoff action requires a typed operator reason (min 10 characters) and supply-loss confirmation.",
     "NON_COMPLIANT": "Sector free chlorine residual dropped below the mandatory 0.20 mg/L potable minimum.",
     "CANCELLED_BY_SAFETY_RECHECK": "A previously staged PENDING action was cancelled automatically because conditions changed (e.g. fire emergency raised the safety floor).",
     "REJECTED_UNAUTHORIZED_APPROVAL_CLAIM": "Gateway refused an unauthorized pre_approved/approval parameter; only an operator button click can approve.",
@@ -1606,36 +1614,58 @@ def _offline_chat_fallback(
         if code.lower() in lower and any(k in lower for k in ("what", "mean", "explain", "define")):
             return f"`{code}`: {desc}"
 
-    # 1. Explicit change request -> ALWAYS stage via write gateway (never execute)
-    m_valve = re.search(r"\b(close|shut|isolate|open)\b[^\n]{0,35}?\b(v-\d{1,2})\b", text, re.IGNORECASE)
-    if not m_valve:
-        m_rev = re.search(r"\b(v-\d{1,2})\b[^\n]{0,35}?\b(close|shut|isolate|open)\b", text, re.IGNORECASE)
-        if m_rev:
-            verb, vid = m_rev.group(2).lower(), m_rev.group(1).upper()
-        else:
-            verb, vid = None, None
-    else:
-        verb, vid = m_valve.group(1).lower(), m_valve.group(2).upper()
-
-    if verb and vid:
-        parts = vid.split("-")
-        if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 1:
-            vid = f"V-0{parts[1]}"
-        a_type = "OPEN_VALVE" if verb == "open" else "CLOSE_VALVE"
-        val = 1.0 if verb == "open" else 0.0
+    # 1. Explicit change request -> ALWAYS stage via write gateway (never execute, never invent reasons!)
+    op_valve = parse_operator_valve_request(text)
+    if op_valve:
+        a_type, vid = op_valve
+        val = 1.0 if a_type == "OPEN_VALVE" else 0.0
+        truthful_rationale = format_action_rationale(
+            source="operator",
+            operator_message=text,
+            target_id=vid,
+        )
         gw = tool_executor(
             "propose_gated_action",
             {
                 "action_type": a_type,
                 "target_id": vid,
                 "proposed_value": val,
-                "rationale": f"Operator chat request: '{text[:120]}'",
+                "rationale": truthful_rationale,
             },
         )
         st_code = gw.get("status", "UNKNOWN")
-        if st_code == "STAGED_PENDING_APPROVAL":
+        imp = gw.get("impact") or {}
+        flow_str = "; ".join((imp.get("summary_lines") or [])[:3])
+        if st_code == "REJECTED_SUPPLY_CONTINUITY":
+            cut_secs = ", ".join(imp.get("cutoff_sectors") or gw.get("cutoff_sectors") or [])
+            cust = int(imp.get("approx_customers_affected", 0))
             return (
-                f"Staged **{a_type} {vid}** as `{st_code}` (Action #{gw.get('action_id')}). "
+                f"Request **{a_type} {vid}** refused with **`REJECTED_SUPPLY_CONTINUITY`** (not staged): "
+                f"closing **{vid}** would leave **{cut_secs}** with no open water supply path at all "
+                f"(~{cust:,} customers affected; {flow_str}). Shown in the 3D twin."
+            )
+        if st_code == "REJECTED_WRONG_SECTOR":
+            return f"Request **{a_type} {vid}** refused with **`REJECTED_WRONG_SECTOR`**: {gw.get('reason', '')}"
+        if st_code == "STAGED_PENDING_APPROVAL":
+            if gw.get("justification_status") == "NOT_JUSTIFIED":
+                area = imp.get("affected_area") or imp.get("valve_sector") or vid
+                cust = int(imp.get("approx_customers_affected", 0))
+                return (
+                    f"There is no leak or issue on **{vid}** ({imp.get('valve_sector', '')}). "
+                    f"Closing it will stop water to **{area}** (~{cust:,} customers; {flow_str}). "
+                    f"Do you want to continue?\n\n"
+                    f"Staged as `{st_code}` (Action #{gw.get('action_id')}) with warning: **{gw.get('warning')}**. "
+                    f"To approve, enter a reason (min 10 characters) and tick the confirmation box on the approval card below."
+                )
+            iso_leaks = imp.get("isolated_active_leaks") or []
+            leak_note = (
+                f" Isolates active leak(s): {', '.join(f'{l['leak_id']} at {l['junction_id']}' for l in iso_leaks)}."
+                if iso_leaks
+                else ""
+            )
+            impact_note = f" Impact: {flow_str}." if flow_str else ""
+            return (
+                f"Staged **{a_type} {vid}** as `{st_code}` (Action #{gw.get('action_id')}).{leak_note}{impact_note} "
                 f"No valve has been changed yet — click **Approve** or **Reject** on the approval card below."
             )
         return f"Request **{a_type} {vid}** returned `{st_code}`: {gw.get('reason') or gw.get('message', '')}"
@@ -2214,14 +2244,46 @@ def run_chat_turn(
             out = {"displayed": True, "pending_count": len(snap["pending_actions"]), "pending_actions": snap["pending_actions"]}
 
         elif tool_name == "propose_gated_action":
-            _emit_status(status_callback, "Running safety checks...")
+            _emit_status(status_callback, "Running safety & hydraulic impact checks...")
             a_type = str(args.get("action_type") or "").upper()
             target = str(args.get("target_id") or "").upper()
             try:
                 p_val = float(args.get("proposed_value", 0.0))
             except (TypeError, ValueError):
                 p_val = 0.0
-            rationale = str(args.get("rationale") or f"Proposed via Ask AquaGrid chat: {cleaned[:140]}")
+            raw_arg_rationale = str(args.get("rationale") or "").strip()
+
+            # Per-turn idempotency: if an earlier LLM provider in the failover chain already staged
+            # this exact (action_type, target_id) during this SAME turn, return that staged result
+            # instead of re-staging and getting a spurious REJECTED_DUPLICATE_PENDING!
+            prior_same_turn = next(
+                (
+                    s
+                    for s in reversed(staged_action_holder)
+                    if s.get("status") == "STAGED_PENDING_APPROVAL"
+                    and str(s.get("action_type", "")).upper() == a_type
+                    and str(s.get("target_id", "")).upper() == target
+                ),
+                None,
+            )
+            if prior_same_turn is not None:
+                return prior_same_turn
+
+            # Enforce truthful provenance-tagged rationale (NEVER let the LLM invent reasons for an operator request!)
+            op_cmd = parse_operator_valve_request(cleaned)
+            if op_cmd and op_cmd == (a_type, target):
+                rationale = format_action_rationale(
+                    source="operator",
+                    operator_message=cleaned,
+                    target_id=target,
+                )
+            else:
+                rationale = format_action_rationale(
+                    source="ai",
+                    ai_reason=raw_arg_rationale or f"Proposed via Ask AquaGrid chat for {target}",
+                    target_id=target,
+                )
+
             out = stage_gated_valve_or_setpoint_action(
                 action_type=a_type,
                 target_id=target,
@@ -2237,9 +2299,27 @@ def run_chat_turn(
                 "Write Gateway & Safety Guards",
                 gw_st == "STAGED_PENDING_APPROVAL",
                 gw_st,
-                out.get("reason") or out.get("message") or "",
+                out.get("warning") or out.get("reason") or out.get("message") or "",
             )
-            if gw_st in ("STAGED_PENDING_APPROVAL", "REJECTED_DUPLICATE_PENDING"):
+            if out.get("justification_status") == "NOT_JUSTIFIED":
+                _record_check(
+                    "Valve Justification Check",
+                    False,
+                    "NOT_JUSTIFIED",
+                    out.get("warning") or "NO TECHNICAL JUSTIFICATION",
+                )
+            elif gw_st == "STAGED_PENDING_APPROVAL" and a_type in ("CLOSE_VALVE", "OPEN_VALVE"):
+                _record_check(
+                    "Valve Justification Check",
+                    True,
+                    "JUSTIFIED",
+                    out.get("justification_basis") or "Justified.",
+                )
+            if gw_st == "REJECTED_SUPPLY_CONTINUITY":
+                cut_secs = out.get("cutoff_sectors") or []
+                if cut_secs:
+                    _append_unique_widget(widgets, {"type": "twin_3d", "focus": cut_secs[0]})
+            elif gw_st in ("STAGED_PENDING_APPROVAL", "REJECTED_DUPLICATE_PENDING"):
                 _append_unique_widget(widgets, {"type": "approvals"})
         else:
             out = {"error": f"Unknown tool '{tool_name}'."}
@@ -2369,12 +2449,57 @@ def run_chat_turn(
         if not answer_text.strip() or _TOOL_BEGGING_RE.search(answer_text):
             if answer_text and _TOOL_BEGGING_RE.search(answer_text):
                 logger.warning("Replaced tool-begging LLM response from %s with live-snapshot answer", provider_used)
-            answer_text = _offline_chat_fallback(
-                user_message=cleaned,
-                history=prior,
-                tool_executor=_execute_tool,
-                current_hour=current_hour,
-            )
+            # If the LLM ALREADY staged/checked an action via propose_gated_action in this turn, format from it
+            # instead of calling _offline_chat_fallback (which would re-propose and trigger REJECTED_DUPLICATE_PENDING)!
+            if staged_action_holder:
+                gw = staged_action_holder[-1]
+                st_code = str(gw.get("status", "UNKNOWN"))
+                a_t = str(gw.get("action_type", "")).upper()
+                vid = str(gw.get("target_id", "")).upper()
+                imp = gw.get("impact") or {}
+                flow_str = "; ".join((imp.get("summary_lines") or [])[:3])
+                if st_code == "REJECTED_SUPPLY_CONTINUITY":
+                    cut_secs = ", ".join(imp.get("cutoff_sectors") or gw.get("cutoff_sectors") or [])
+                    cust = int(imp.get("approx_customers_affected", 0))
+                    answer_text = (
+                        f"Request **{a_t} {vid}** refused with **`REJECTED_SUPPLY_CONTINUITY`** (not staged): "
+                        f"closing **{vid}** would leave **{cut_secs}** with no open water supply path at all "
+                        f"(~{cust:,} customers affected; {flow_str}). Shown in the 3D twin."
+                    )
+                elif st_code == "REJECTED_WRONG_SECTOR":
+                    answer_text = f"Request **{a_t} {vid}** refused with **`REJECTED_WRONG_SECTOR`**: {gw.get('reason', '')}"
+                elif st_code == "STAGED_PENDING_APPROVAL":
+                    if gw.get("justification_status") == "NOT_JUSTIFIED":
+                        area = imp.get("affected_area") or imp.get("valve_sector") or vid
+                        cust = int(imp.get("approx_customers_affected", 0))
+                        answer_text = (
+                            f"There is no leak or issue on **{vid}** ({imp.get('valve_sector', '')}). "
+                            f"Closing it will stop water to **{area}** (~{cust:,} customers; {flow_str}). "
+                            f"Do you want to continue?\n\n"
+                            f"Staged as `{st_code}` (Action #{gw.get('action_id')}) with warning: **{gw.get('warning')}**. "
+                            f"To approve, enter a reason (min 10 characters) and tick the confirmation box on the approval card below."
+                        )
+                    else:
+                        iso_leaks = imp.get("isolated_active_leaks") or []
+                        leak_note = (
+                            f" Isolates active leak(s): {', '.join(f'{l['leak_id']} at {l['junction_id']}' for l in iso_leaks)}."
+                            if iso_leaks
+                            else ""
+                        )
+                        impact_note = f" Impact: {flow_str}." if flow_str else ""
+                        answer_text = (
+                            f"Staged **{a_t} {vid}** as `{st_code}` (Action #{gw.get('action_id')}).{leak_note}{impact_note} "
+                            f"No valve has been changed yet — click **Approve** or **Reject** on the approval card below."
+                        )
+                else:
+                    answer_text = f"Request **{a_t} {vid}** returned `{st_code}`: {gw.get('reason') or gw.get('message', '')}"
+            else:
+                answer_text = _offline_chat_fallback(
+                    user_message=cleaned,
+                    history=prior,
+                    tool_executor=_execute_tool,
+                    current_hour=current_hour,
+                )
             if not provider_used or provider_used == "Deterministic Offline Engine":
                 provider_used = "Deterministic Offline Engine"
 
@@ -2422,34 +2547,73 @@ def run_chat_turn(
     final_staged = staged_action_holder[-1] if staged_action_holder else None
     ans_status = str(final_staged.get("status", "ALLOWED")) if final_staged else "ALLOWED"
 
+    # Guardrail on LLM wording for unjustified valve closures & supply-continuity refusals
+    if final_staged:
+        f_st = str(final_staged.get("status", ""))
+        f_tid = str(final_staged.get("target_id", "")).upper()
+        f_imp = final_staged.get("impact") or {}
+        if f_st == "STAGED_PENDING_APPROVAL" and final_staged.get("justification_status") == "NOT_JUSTIFIED":
+            low_ans = answer_text.lower()
+            if "no leak or issue" not in low_ans or "do you want to continue" not in low_ans:
+                area_txt = f_imp.get("affected_area") or f_imp.get("valve_sector") or f_tid
+                cust_n = int(f_imp.get("approx_customers_affected", 0))
+                flow_s = "; ".join((f_imp.get("summary_lines") or [])[:3])
+                prefix = (
+                    f"There is no leak or issue on **{f_tid}**. "
+                    f"Closing it will stop water to **{area_txt}** (~{cust_n:,} customers"
+                    + (f"; {flow_s}" if flow_s else "")
+                    + "). Do you want to continue?\n\n"
+                    f"**Warning:** `{final_staged.get('warning', 'NO TECHNICAL JUSTIFICATION')}`\n\n"
+                )
+                answer_text = prefix + answer_text
+        elif f_st == "REJECTED_SUPPLY_CONTINUITY" and "REJECTED_SUPPLY_CONTINUITY" not in answer_text:
+            answer_text = f"**`REJECTED_SUPPLY_CONTINUITY`**: {final_staged.get('reason', '')}\n\n" + answer_text
+        elif f_st == "REJECTED_WRONG_SECTOR" and "REJECTED_WRONG_SECTOR" not in answer_text:
+            answer_text = f"**`REJECTED_WRONG_SECTOR`**: {final_staged.get('reason', '')}\n\n" + answer_text
+
     # Compute twin_view update so the persistent top 3D digital twin follows chat answers automatically
     from digital_twin.scene_state import build_twin_view_command
 
     reply_twin_view = None
-    if twin_3d_results_holder:
-        reply_twin_view = twin_3d_results_holder[-1].get("twin_view")
-    elif map_results_holder:
-        m_last = map_results_holder[-1]
-        m_focus = m_last.get("leak_id") or m_last.get("highlight_sector") or "all"
-        reply_twin_view = build_twin_view_command(focus=m_focus, event_type="focus", note=m_last.get("zoom_target", ""))
+    if final_staged and final_staged.get("status") == "REJECTED_SUPPLY_CONTINUITY":
+        f_imp = final_staged.get("impact") or {}
+        cut_secs = final_staged.get("cutoff_sectors") or f_imp.get("cutoff_sectors") or []
+        focus_sec = cut_secs[0] if cut_secs else str(final_staged.get("target_id", "all"))
+        reply_twin_view = build_twin_view_command(
+            focus=focus_sec,
+            event_type="supply_continuity_refused",
+            note=f"REJECTED_SUPPLY_CONTINUITY — {focus_sec} would lose all supply",
+            highlight_pipe_ids=f_imp.get("affected_pipe_ids") or [],
+        )
     elif final_staged and final_staged.get("status") == "STAGED_PENDING_APPROVAL":
         from digital_twin.hydraulics import simulate_valve_change_impact
 
         a_t = str(final_staged.get("action_type", "")).upper()
         t_id = str(final_staged.get("target_id", "")).upper()
         if a_t in ("CLOSE_VALVE", "OPEN_VALVE"):
-            imp = simulate_valve_change_impact(t_id, "CLOSED" if a_t == "CLOSE_VALVE" else "OPEN", db_path=db_path)
+            imp = final_staged.get("impact") or simulate_valve_change_impact(t_id, "CLOSED" if a_t == "CLOSE_VALVE" else "OPEN", db_path=db_path)
+            note_lbl = (
+                f"NO TECHNICAL JUSTIFICATION — {t_id} affects {imp.get('affected_area', '')}"
+                if final_staged.get("justification_status") == "NOT_JUSTIFIED"
+                else f"Staged {a_t} {t_id} (awaiting Approve)"
+            )
             reply_twin_view = build_twin_view_command(
                 focus=t_id,
                 event_type="staged_proposal",
-                note=f"Staged {a_t} {t_id} (awaiting Approve)",
-                highlight_pipe_ids=imp["affected_pipe_ids"],
+                note=note_lbl,
+                highlight_pipe_ids=imp.get("affected_pipe_ids") or [],
             )
         elif a_t == "SET_PLANT_OUTPUT":
             reply_twin_view = build_twin_view_command(focus="reservoir_inside", event_type="staged_proposal", note=f"Staged DESAL-01 -> {final_staged.get('proposed_value')} MLD")
         elif a_t == "ISOLATE_AND_FLUSH" and t_id.startswith("SECTOR-"):
             sec_num = t_id.split("-")[-1].lstrip("0") or "1"
             reply_twin_view = build_twin_view_command(focus=f"Sector {sec_num}", event_type="staged_proposal", note=f"Staged ISOLATE_AND_FLUSH Sector {sec_num}")
+    elif twin_3d_results_holder:
+        reply_twin_view = twin_3d_results_holder[-1].get("twin_view")
+    elif map_results_holder:
+        m_last = map_results_holder[-1]
+        m_focus = m_last.get("leak_id") or m_last.get("highlight_sector") or "all"
+        reply_twin_view = build_twin_view_command(focus=m_focus, event_type="focus", note=m_last.get("zoom_target", ""))
 
     _audit(
         "CHAT_ANSWER",
