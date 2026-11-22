@@ -59,6 +59,14 @@
     padding: 1px 4px;
     background: rgba(15, 23, 42, 0.78);
   }
+  .ag-label-junc {
+    font-size: 8.5px;
+    font-weight: 600;
+    padding: 1px 4px;
+    background: rgba(15, 23, 42, 0.74);
+    border-color: rgba(148, 163, 184, 0.55);
+    color: #CBD5E1;
+  }
   .ag-label-part {
     font-size: 9.5px;
     padding: 1px 5px;
@@ -159,12 +167,14 @@
     bottom: 10px;
     right: 10px;
     z-index: 20;
-    background: rgba(15, 23, 42, 0.88);
+    background: rgba(15, 23, 42, 0.90);
     border: 1px solid #334155;
     border-radius: 6px;
     padding: 4px 8px;
     font-size: 10px;
-    max-width: 205px;
+    max-width: 235px;
+    max-height: 320px;
+    overflow-y: auto;
     color: #E2E8F0;
   }
   #ag-legend summary {
@@ -429,8 +439,11 @@ const engine = {
   labelAnchors: [],
   // Dynamic registries updated in place without reload
   sectorMap: {},     // name -> { zoneMesh, borderLine, labelEl, fireGroup, fireLblEl, baseColor, nonCompliant }
-  pipeMap: {},       // segment_id -> { tube, mat, curve, activeColor, dryColor, prevFlow, targetFlow, currentFlow, animStart, particles }
+  pipeMap: {},       // pipe_id -> { tube, mat, curve, radius, run_id, activeColor, dryColor, ... }
+  pipesByRun: {},    // run_id -> [pipeTrack, ...] for whole-run hover highlight
+  hoveredRunId: null,
   flowInst: null,
+  arrowInst: null,
   flowTracks: [],
   valveMap: {},      // valve_id -> { group, wheelGroup, wheelMat, hit, labelEl, status, anim }
   sensorMap: {},     // sensor_id -> { mesh, warnLabelEl }
@@ -636,17 +649,28 @@ function initEngine(state, quality) {
   // Build Sensors
   buildSensors(state);
 
-  // Build Legend
+  // Build Legend (3 pipe classes, reducer, junction, valves, flow arrow, leak statuses, sectors, tank rings)
   const legendBody = document.getElementById('ag-legend-body');
-  legendBody.innerHTML = (state.sectors || []).map(s =>
-    `<div class="ag-leg-row"><span class="ag-swatch" style="background:${s.color}55; border:2px solid ${s.color};"></span><span><strong>${s.name}</strong> (${s.color_name})</span></div>`
-  ).join('') +
-  `<div style="margin-top:4px; padding-top:4px; border-top:1px solid #334155;">
+  legendBody.innerHTML =
+  `<div style="margin-bottom:4px; padding-bottom:4px; border-bottom:1px solid #334155;">
+    <div style="font-weight:700; color:#94A3B8; margin-bottom:2px;">Pipe Classes (3)</div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#1D4ED8; height:7px; width:14px;"></span><span><strong>Trunk Main</strong> (900 mm)</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#2563EB; height:5px; width:14px;"></span><span><strong>Sector Trunk</strong> (500 mm)</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#38BDF8; height:3px; width:14px;"></span><span><strong>Distribution</strong> (200 mm)</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#CBD5E1; clip-path:polygon(0 20%,100% 0,100% 100%,0 80%); width:12px;"></span><span>Reducer (diameter change)</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#E2E8F0; border-radius:2px;"></span><span>Junction Fitting (T / Cross)</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#E0F2FE; clip-path:polygon(0 20%,65% 20%,65% 0,100% 50%,65% 100%,65% 80%,0 80%); width:12px;"></span><span>Flow Arrow (from &rarr; to)</span></div>
+  </div>
+  <div style="margin-bottom:4px; padding-bottom:4px; border-bottom:1px solid #334155;">
     <div class="ag-leg-row"><span class="ag-swatch" style="background:#22C55E; border-radius:50%;"></span><span>Valve OPEN · <span style="color:#EF4444;">●</span> CLOSED</span></div>
+    <div class="ag-leg-row"><span class="ag-swatch" style="background:#EF4444; border-radius:50%;"></span><span>Leak: <span style="color:#FCA5A5;">CONFIRMED</span> · <span style="color:#FDBA74;">SUSPECTED</span> · <span style="color:#FDE047;">REPAIR</span></span></div>
     <div class="ag-leg-row"><span class="ag-swatch" style="background:#38BDF8; border-radius:50%;"></span><span>Sensor · ⚠ Quarantined</span></div>
-    <div class="ag-leg-row"><span class="ag-swatch" style="background:#EF4444; border-radius:50%;"></span><span>Leak Spray &amp; Puddle</span></div>
     <div class="ag-leg-row"><span class="ag-swatch" style="background:#FFFFFF;"></span><span>Tank Rings: Cur · <span style="color:#FACC15;">+5%</span> · <span style="color:#F97316;">Dyn</span> · <span style="color:#EF4444;">35%</span></span></div>
-  </div>`;
+  </div>
+  <div style="font-weight:700; color:#94A3B8; margin-bottom:2px;">Sector Ground Zones</div>` +
+  (state.sectors || []).map(s =>
+    `<div class="ag-leg-row"><span class="ag-swatch" style="background:${s.color}55; border:2px solid ${s.color};"></span><span><strong>${s.name}</strong> (${s.color_name})</span></div>`
+  ).join('');
 
   // Hover Raycaster Tooltips + Interactive Click Selection (updates caption & fills chat input!)
   const raycaster = new THREE.Raycaster();
@@ -717,6 +741,26 @@ function initEngine(state, quality) {
     }
   });
 
+  function setHoveredRun(nextRunId) {
+    if (engine.hoveredRunId === nextRunId) return;
+    if (engine.hoveredRunId && engine.pipesByRun[engine.hoveredRunId]) {
+      engine.pipesByRun[engine.hoveredRunId].forEach(tr => {
+        tr.mat.emissive.copy(tr.baseEmissive);
+        tr.mat.emissiveIntensity = tr.baseEmissiveIntensity;
+        tr.mat.opacity = tr.baseOpacity;
+      });
+    }
+    engine.hoveredRunId = nextRunId;
+    if (nextRunId && engine.pipesByRun[nextRunId]) {
+      const hoverGlow = new THREE.Color('#38BDF8');
+      engine.pipesByRun[nextRunId].forEach(tr => {
+        tr.mat.emissive.copy(hoverGlow);
+        tr.mat.emissiveIntensity = 0.85;
+        tr.mat.opacity = 1.0;
+      });
+    }
+  }
+
   renderer.domElement.addEventListener('pointermove', (ev) => {
     const rect = renderer.domElement.getBoundingClientRect();
     pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
@@ -724,17 +768,23 @@ function initEngine(state, quality) {
     raycaster.setFromCamera(pointer, camera);
     const hits = raycaster.intersectObjects(engine.hoverables, false);
     if (hits.length > 0 && hits[0].object.userData.tooltip) {
-      tooltipEl.innerHTML = hits[0].object.userData.tooltip;
+      const topObj = hits[0].object;
+      setHoveredRun(topObj.userData.pipeRunId || null);
+      tooltipEl.innerHTML = topObj.userData.tooltip;
       tooltipEl.style.display = 'block';
       tooltipEl.style.left = Math.min(rect.width - 275, Math.max(8, ev.clientX - rect.left + 12)) + 'px';
-      tooltipEl.style.top = Math.min(rect.height - 96, Math.max(8, ev.clientY - rect.top + 12)) + 'px';
+      tooltipEl.style.top = Math.min(rect.height - 110, Math.max(8, ev.clientY - rect.top + 12)) + 'px';
       renderer.domElement.style.cursor = hits.some(h => h.object.userData.selectInfo) ? 'pointer' : 'grab';
     } else {
+      setHoveredRun(null);
       tooltipEl.style.display = 'none';
       renderer.domElement.style.cursor = 'grab';
     }
   });
-  renderer.domElement.addEventListener('pointerleave', () => { tooltipEl.style.display = 'none'; });
+  renderer.domElement.addEventListener('pointerleave', () => {
+    setHoveredRun(null);
+    tooltipEl.style.display = 'none';
+  });
 
   // Cancel active camera fly-to if the user manually grabs the camera
   controls.addEventListener('start', () => { engine.flyAnim = null; });
@@ -1258,29 +1308,31 @@ function buildPipesAndParticles(state, lowQ) {
   const S = engine.scale;
   const scene = engine.scene;
   const flangeMat = new THREE.MeshStandardMaterial({ color: '#CBD5E1', metalness: 0.82, roughness: 0.24 });
-  const jointMat = new THREE.MeshStandardMaterial({ color: '#E2E8F0', metalness: 0.78, roughness: 0.28 });
-  const elbowMat = new THREE.MeshStandardMaterial({ color: '#94A3B8', metalness: 0.76, roughness: 0.26 });
+  const fittingMat = new THREE.MeshStandardMaterial({ color: '#E2E8F0', metalness: 0.80, roughness: 0.24 });
+  const reducerMat = new THREE.MeshStandardMaterial({ color: '#CBD5E1', metalness: 0.84, roughness: 0.20 });
+  const elbowMat = new THREE.MeshStandardMaterial({ color: '#94A3B8', metalness: 0.78, roughness: 0.24 });
 
   engine.flowTracks = [];
   engine.pipeMap = {};
+  engine.pipesByRun = {};
 
   const connNet = state.connected_network || {};
   const pipeList = (connNet.pipes && connNet.pipes.length) ? connNet.pipes : (state.pipes || []);
-  const nodeList = connNet.nodes || [];
+  const fittingsList = connNet.fittings || [];
+  const reducersList = connNet.reducers || [];
 
   const elbowCoords = [];
 
   pipeList.forEach(pipe => {
-    const role = pipe.role || (pipe.is_trunk ? 'sector_trunk' : 'distribution');
-    const isMainTrunk = (role === 'intake' || role === 'product_water' || role === 'trunk_main');
-    const isSecTrunk = (role === 'sector_trunk');
-    const pipeY = isMainTrunk ? 1.05 : (isSecTrunk ? 0.92 : 0.82);
-    const radius = isMainTrunk ? 0.56 : (isSecTrunk ? 0.38 : 0.24);
+    const pCls = pipe.pipe_class || (pipe.is_trunk ? 'SECTOR_TRUNK' : 'DISTRIBUTION');
+    const role = pipe.role || (pCls === 'TRUNK_MAIN' ? 'trunk_main' : (pCls === 'SECTOR_TRUNK' ? 'sector_trunk' : 'distribution'));
+    const pipeY = Number(pipe.y_level !== undefined ? pipe.y_level : (pCls === 'TRUNK_MAIN' ? 2.00 : (pCls === 'SECTOR_TRUNK' ? 1.15 : 0.50)));
+    const radius = Number(pipe.radius_3d !== undefined ? pipe.radius_3d : (pCls === 'TRUNK_MAIN' ? 0.46 : (pCls === 'SECTOR_TRUNK' ? 0.30 : 0.18)));
 
     const pts = (pipe.points_xz || []).map(p => new THREE.Vector3(p[0] * S, pipeY, p[1] * S));
     if (pts.length < 2) return;
 
-    // Straight-segment CurvePath preserves exact node-to-node alignment and sharp elbow joints
+    // Crisp orthogonal straight-segment CurvePath (strictly axis-aligned street segments + 90° elbows)
     const curve = new THREE.CurvePath();
     for (let i = 0; i < pts.length - 1; i++) {
       if (pts[i].distanceTo(pts[i + 1]) > 0.01) {
@@ -1289,12 +1341,14 @@ function buildPipesAndParticles(state, lowQ) {
     }
     if (curve.curves.length === 0) return;
 
-    // Collect intermediate bend vertices for 3D elbow fittings
+    // Collect intermediate 90° elbow joints sized strictly to this pipe's diameter
     for (let i = 1; i < pts.length - 1; i++) {
-      elbowCoords.push({ pos: pts[i], r: radius * 1.32 });
+      elbowCoords.push({ pos: pts[i], r: radius * 1.24 });
     }
 
-    const activeColor = new THREE.Color(pipe.color || (isMainTrunk ? '#38BDF8' : '#2563EB'));
+    // Color strictly by standardized 3-class palette: TRUNK_MAIN #1D4ED8, SECTOR_TRUNK #2563EB, DISTRIBUTION #38BDF8
+    const classDefaultHex = pCls === 'TRUNK_MAIN' ? '#1D4ED8' : (pCls === 'SECTOR_TRUNK' ? '#2563EB' : '#38BDF8');
+    const activeColor = new THREE.Color(pipe.color || classDefaultHex);
     const dryColor = new THREE.Color('#475569');
     const flowVal = Number(pipe.flow_lps || 0);
 
@@ -1305,19 +1359,23 @@ function buildPipesAndParticles(state, lowQ) {
       transparent: true,
       opacity: 0.96
     });
-    const tubularSegs = Math.max(8, Math.min(36, (pts.length - 1) * 6));
-    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, tubularSegs, radius, 9, false), mat);
-    tube.castShadow = !lowQ && (isMainTrunk || isSecTrunk);
+    const tubularSegs = Math.max(8, Math.min(32, (pts.length - 1) * 8));
+    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, tubularSegs, radius, 10, false), mat);
+    tube.castShadow = !lowQ && (pCls !== 'DISTRIBUTION');
+    const runId = pipe.run_id || pipe.segment_id || pipe.pipe_id;
+    tube.userData.pipeRunId = runId;
     scene.add(tube);
     engine.hoverables.push(tube);
 
-    // Metallic flange rings near pipe start/end joints
+    // Metallic flange rings sized strictly to this pipe's radius
     const totalLen = curve.getLength();
-    if (totalLen > 3.5) {
-      for (const u of [0.15, 0.5, 0.85]) {
+    if (totalLen > 2.8) {
+      const flangeTubeR = Math.max(0.032, radius * 0.16);
+      const flangeUs = totalLen > 12.0 ? [0.12, 0.5, 0.88] : [0.2, 0.8];
+      for (const u of flangeUs) {
         const pPos = curve.getPointAt(u);
         const tan = curve.getTangentAt(u);
-        const flange = new THREE.Mesh(new THREE.TorusGeometry(radius + 0.08, 0.06, 6, 10), flangeMat);
+        const flange = new THREE.Mesh(new THREE.TorusGeometry(radius * 1.18, flangeTubeR, 6, 12), flangeMat);
         flange.position.copy(pPos);
         flange.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tan.normalize());
         scene.add(flange);
@@ -1325,49 +1383,129 @@ function buildPipesAndParticles(state, lowQ) {
     }
 
     const keyId = pipe.pipe_id || pipe.segment_id;
-    const maxParticles = lowQ ? (isMainTrunk ? 5 : 3) : (isMainTrunk ? 9 : (isSecTrunk ? 6 : 4));
+    const maxParticles = lowQ ? (pCls === 'TRUNK_MAIN' ? 4 : 2) : (pCls === 'TRUNK_MAIN' ? 7 : (pCls === 'SECTOR_TRUNK' ? 5 : 3));
+    const arrowCount = totalLen > 14.0 ? 3 : (totalLen > 5.0 ? 2 : 1);
     const tr = {
       pipe_id: keyId,
       segment_id: pipe.segment_id || keyId,
+      run_id: runId,
+      pipe_class: pCls,
+      class_label: pipe.class_label || (pCls === 'TRUNK_MAIN' ? 'Trunk Main' : (pCls === 'SECTOR_TRUNK' ? 'Sector Trunk' : 'Distribution')),
+      diameter_mm: Number(pipe.diameter_mm || (pCls === 'TRUNK_MAIN' ? 900 : (pCls === 'SECTOR_TRUNK' ? 500 : 200))),
+      sector: pipe.sector || 'Network',
+      from_node: pipe.from_node || '',
+      to_node: pipe.to_node || '',
       role,
+      radius,
       pipeY,
       curve,
       mat,
       tube,
       activeColor,
       dryColor,
+      baseOpacity: 0.96,
+      baseEmissive: new THREE.Color('#000000'),
+      baseEmissiveIntensity: 0.0,
+      isDimmed: false,
       prevFlow: flowVal,
       targetFlow: flowVal,
       currentFlow: flowVal,
       animStart: 0,
       delay: 0,
-      particles: Array.from({ length: maxParticles }, (_, i) => ({ phase: i / maxParticles }))
+      particles: Array.from({ length: maxParticles }, (_, i) => ({ phase: i / maxParticles })),
+      arrows: Array.from({ length: arrowCount }, (_, i) => ({ phase: (i + 0.5) / arrowCount }))
     };
     engine.pipeMap[keyId] = tr;
+    if (!engine.pipesByRun[runId]) engine.pipesByRun[runId] = [];
+    engine.pipesByRun[runId].push(tr);
     engine.flowTracks.push(tr);
   });
 
-  // Instanced spherical joints/manifolds at EVERY network node (zero gaps between connected pipes!)
-  if (nodeList.length > 0) {
-    const jointGeo = new THREE.SphereGeometry(1.0, 10, 8);
-    const jointInst = new THREE.InstancedMesh(jointGeo, jointMat, nodeList.length);
-    const dummy = new THREE.Object3D();
-    nodeList.forEach((nd, idx) => {
-      const k = nd.kind || 'pipe_node';
-      const y = (k === 'trunk_hub' || k === 'plant' || k === 'reservoir' || k === 'intake') ? 1.05 : 0.90;
-      const r = (k === 'trunk_hub') ? 0.85 : (k === 'valve' ? 0.62 : (k === 'junction' ? 0.50 : 0.42));
-      dummy.position.set(nd.pos_xz[0] * S, y, nd.pos_xz[1] * S);
-      dummy.scale.setScalar(r);
-      dummy.updateMatrix();
-      jointInst.setMatrixAt(idx, dummy.matrix);
-    });
-    jointInst.instanceMatrix.needsUpdate = true;
-    scene.add(jointInst);
-  }
+  // Real Metallic Junction Fittings (T-piece / Cross + vertical risers joining multi-elevation nodes) + small junction labels
+  fittingsList.forEach(fit => {
+    const fx = fit.pos_xz[0] * S;
+    const fz = fit.pos_xz[1] * S;
+    const yMin = Number(fit.y_min || 0.5);
+    const yMax = Number(fit.y_max || yMin);
+    const yMid = 0.5 * (yMin + yMax);
+    const r = Number(fit.radius_3d || 0.30);
+    const fType = fit.fitting_type || 'inline';
 
-  // Instanced pipe elbows wherever pipes change direction
+    const fGroup = new THREE.Group();
+    fGroup.position.set(fx, 0, fz);
+
+    // Core vertical manifold / riser joining all incident pipe elevations seamlessly
+    const spanH = Math.max(r * 2.2, (yMax - yMin) + r * 2.0);
+    const coreCyl = new THREE.Mesh(new THREE.CylinderGeometry(r * 1.18, r * 1.18, spanH, 12), fittingMat);
+    coreCyl.position.y = yMid;
+    fGroup.add(coreCyl);
+
+    // Real T-piece or Cross fitting horizontal arms sized to the junction radius
+    if (fType === 'tee' || fType === 'cross') {
+      const armLen = r * 4.4;
+      const armX = new THREE.Mesh(new THREE.CylinderGeometry(r * 1.08, r * 1.08, armLen, 10), fittingMat);
+      armX.rotation.z = Math.PI / 2;
+      armX.position.y = yMax;
+      fGroup.add(armX);
+      const armZ = new THREE.Mesh(new THREE.CylinderGeometry(r * 1.08, r * 1.08, fType === 'cross' ? armLen : armLen * 0.72, 10), fittingMat);
+      armZ.rotation.x = Math.PI / 2;
+      armZ.position.y = yMin;
+      fGroup.add(armZ);
+    }
+
+    coreCyl.userData.tooltip = `<strong>Junction ${fit.node_id}</strong> (${fit.sector || 'Network'})<br/>Fitting: <strong>${fType.toUpperCase()}</strong> (${fit.degree} pipes)`;
+    engine.hoverables.push(coreCyl);
+    scene.add(fGroup);
+
+    // Compact junction label (e.g. J-14) visible when zoomed in so overview remains crisp
+    if (fit.label && (fit.kind === 'junction' || fit.kind === 'trunk_hub')) {
+      registerLabel(fit.label, new THREE.Vector3(fx, yMax + r + 1.35, fz), 'ag-label ag-label-junc', null, 95);
+    }
+  });
+
+  // Tapered Reducer Cones at EVERY pipe class change (e.g. 900mm -> 500mm -> 200mm; thick pipe NEVER touches thin directly!)
+  const upAxis = new THREE.Vector3(0, 1, 0);
+  reducersList.forEach(red => {
+    const rx = red.pos_xz[0] * S;
+    const rz = red.pos_xz[1] * S;
+    const fromR = Number(red.from_radius || 0.46);
+    const toR = Number(red.to_radius || 0.30);
+    const fromY = Number(red.from_y || 2.0);
+    const toY = Number(red.to_y || 1.15);
+    const dx = Number((red.dir_xz && red.dir_xz[0]) || 1.0);
+    const dz = Number((red.dir_xz && red.dir_xz[1]) || 0.0);
+
+    const horizLen = Math.max(1.25, fromR * 3.1);
+    const pStart = new THREE.Vector3(rx, fromY, rz);
+    const pEnd = new THREE.Vector3(rx + dx * horizLen, toY, rz + dz * horizLen);
+    const diff = new THREE.Vector3().subVectors(pEnd, pStart);
+    const coneLen = Math.max(0.6, diff.length());
+    const mid = new THREE.Vector3().addVectors(pStart, pEnd).multiplyScalar(0.5);
+    const dir = diff.clone().normalize();
+
+    // CylinderGeometry(radiusTop, radiusBottom, height): bottom is at pStart (big fromR), top is at pEnd (smaller toR)
+    const cone = new THREE.Mesh(new THREE.CylinderGeometry(toR * 1.06, fromR * 1.06, coneLen, 14), reducerMat);
+    cone.position.copy(mid);
+    cone.quaternion.setFromUnitVectors(upAxis, dir);
+    cone.userData.tooltip = `<strong>Tapered Reducer</strong> at <strong>${red.node_id}</strong><br/>${red.from_diameter_mm} mm &rarr; ${red.to_diameter_mm} mm (${red.pipe_id})`;
+    scene.add(cone);
+    engine.hoverables.push(cone);
+
+    // Matching metallic flange collars at both ends of the reducer cone
+    const bigCollar = new THREE.Mesh(new THREE.TorusGeometry(fromR * 1.16, Math.max(0.04, fromR * 0.16), 6, 12), flangeMat);
+    bigCollar.position.copy(pStart);
+    bigCollar.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+    scene.add(bigCollar);
+
+    const smallCollar = new THREE.Mesh(new THREE.TorusGeometry(toR * 1.16, Math.max(0.032, toR * 0.16), 6, 12), flangeMat);
+    smallCollar.position.copy(pEnd);
+    smallCollar.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir);
+    scene.add(smallCollar);
+  });
+
+  // Instanced 90° pipe elbows sized strictly to each pipe's diameter
   if (elbowCoords.length > 0) {
-    const elbowGeo = new THREE.SphereGeometry(1.0, 8, 8);
+    const elbowGeo = new THREE.SphereGeometry(1.0, 10, 8);
     const elbowInst = new THREE.InstancedMesh(elbowGeo, elbowMat, elbowCoords.length);
     const dummy = new THREE.Object3D();
     elbowCoords.forEach((eb, idx) => {
@@ -1380,14 +1518,26 @@ function buildPipesAndParticles(state, lowQ) {
     scene.add(elbowInst);
   }
 
-  const total = engine.flowTracks.reduce((a, t) => a + t.particles.length, 0);
-  if (total > 0) {
+  // Small semi-transparent light-cyan water particles (~1/4 of pipe diameter — NO big white balls!)
+  const totalParticles = engine.flowTracks.reduce((a, t) => a + t.particles.length, 0);
+  if (totalParticles > 0) {
     engine.flowInst = new THREE.InstancedMesh(
-      new THREE.SphereGeometry(0.30, 8, 8),
-      new THREE.MeshBasicMaterial({ color: '#BAE6FD' }),
-      total
+      new THREE.SphereGeometry(1.0, 8, 8),
+      new THREE.MeshBasicMaterial({ color: '#67E8F9', transparent: true, opacity: 0.72, depthWrite: false }),
+      totalParticles
     );
     scene.add(engine.flowInst);
+  }
+
+  // Flow direction arrows (cones aligned strictly from_node -> to_node along every active pipe)
+  const totalArrows = engine.flowTracks.reduce((a, t) => a + t.arrows.length, 0);
+  if (totalArrows > 0) {
+    engine.arrowInst = new THREE.InstancedMesh(
+      new THREE.ConeGeometry(1.0, 2.3, 8),
+      new THREE.MeshBasicMaterial({ color: '#E0F2FE', transparent: true, opacity: 0.90 }),
+      totalArrows
+    );
+    scene.add(engine.arrowInst);
   }
 }
 
@@ -1400,15 +1550,30 @@ function buildValves(state) {
     const vx = v.pos_xz[0] * S, vz = v.pos_xz[1] * S;
     const isOpen = String(v.status).toUpperCase() === 'OPEN';
     const col = new THREE.Color(isOpen ? '#22C55E' : '#EF4444');
+    const pipeR = Number(v.pipe_radius_3d || 0.30);
+    const pipeY = Number(v.pipe_y_level || 1.15);
+    const vScale = Math.max(0.65, Math.min(1.45, pipeR / 0.30));
 
     const group = new THREE.Group();
-    group.position.set(vx, 1.0, vz);
+    group.position.set(vx, pipeY, vz);
+    if (v.pipe_dir_xz && v.pipe_dir_xz.length === 2) {
+      group.rotation.y = -Math.atan2(v.pipe_dir_xz[1], v.pipe_dir_xz[0]);
+    }
+    group.scale.setScalar(vScale);
 
-    // Metallic valve body housing + flange collar + stem
-    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 0.95, 12), bodyMat);
+    // Metallic valve body housing + twin pipe flange collars + stem sized to host pipe
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.44, 0.44, 0.85, 12), bodyMat);
     group.add(body);
-    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.14, 0.9, 8), bodyMat);
-    stem.position.y = 0.72;
+    const fCollarL = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.06, 6, 12), bodyMat);
+    fCollarL.rotation.y = Math.PI / 2;
+    fCollarL.position.x = -0.45;
+    group.add(fCollarL);
+    const fCollarR = fCollarL.clone();
+    fCollarR.position.x = 0.45;
+    group.add(fCollarR);
+
+    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.82, 8), bodyMat);
+    stem.position.y = 0.68;
     group.add(stem);
 
     // Handwheel (torus + spokes)
@@ -1416,23 +1581,23 @@ function buildValves(state) {
     const wheelMat = new THREE.MeshStandardMaterial({
       color: col.clone(),
       emissive: col.clone(),
-      emissiveIntensity: 0.35,
+      emissiveIntensity: 0.38,
       metalness: 0.45,
       roughness: 0.28
     });
-    const wheelRing = new THREE.Mesh(new THREE.TorusGeometry(0.75, 0.15, 10, 20), wheelMat);
+    const wheelRing = new THREE.Mesh(new THREE.TorusGeometry(0.62, 0.13, 10, 20), wheelMat);
     wheelRing.rotation.x = Math.PI / 2;
     wheelGroup.add(wheelRing);
-    wheelGroup.add(new THREE.Mesh(new THREE.BoxGeometry(1.42, 0.11, 0.11), wheelMat));
-    wheelGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.11, 1.42), wheelMat));
-    wheelGroup.position.y = 1.15;
+    wheelGroup.add(new THREE.Mesh(new THREE.BoxGeometry(1.18, 0.09, 0.09), wheelMat));
+    wheelGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.09, 1.18), wheelMat));
+    wheelGroup.position.y = 1.08;
     group.add(wheelGroup);
 
     const hit = new THREE.Mesh(
-      new THREE.SphereGeometry(1.45, 8, 8),
+      new THREE.SphereGeometry(1.35, 8, 8),
       new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.0, depthWrite: false })
     );
-    hit.position.y = 0.8;
+    hit.position.y = 0.72;
     hit.userData.selectInfo = {
       target_type: 'valve',
       target_id: v.valve_id,
@@ -1443,7 +1608,7 @@ function buildValves(state) {
     engine.hoverables.push(hit);
 
     scene.add(group);
-    const lblRec = registerLabel(v.valve_id, new THREE.Vector3(vx, 3.1, vz), 'ag-label ag-label-valve', isOpen ? '#22C55E' : '#EF4444', 115);
+    const lblRec = registerLabel(v.valve_id, new THREE.Vector3(vx, pipeY + 1.95 * vScale, vz), 'ag-label ag-label-valve', isOpen ? '#22C55E' : '#EF4444', 115);
     lblRec.alwaysShow = !isOpen;
     engine.valveMap[v.valve_id] = {
       group, wheelGroup, wheelMat, hit, lblRec,
@@ -1496,10 +1661,11 @@ function syncLeaks(state, lowQ) {
 
     if (!rec) {
       const lx = lk.pos_xz[0] * S, lz = lk.pos_xz[1] * S;
+      const ly = Number(lk.y_level || 1.15) + 0.48;
       const group = new THREE.Group();
       const coreMat = new THREE.MeshStandardMaterial({ color: '#EF4444', emissive: '#DC2626', emissiveIntensity: 1.0 });
       const core = new THREE.Mesh(new THREE.SphereGeometry(0.88, 14, 14), coreMat);
-      core.position.set(lx, 1.5, lz);
+      core.position.set(lx, ly, lz);
       group.add(core);
       engine.hoverables.push(core);
 
@@ -1740,7 +1906,7 @@ function applySceneUpdate(args) {
     rec.hit.userData.tooltip = `<strong>Valve ${v.valve_id}</strong> (${v.sector})<br/>Status: <span style="color:${colHex}; font-weight:700;">${nextStat}</span>${v.pipe_segment_id ? '<br/>Pipe: ' + v.pipe_segment_id : ''}`;
   });
 
-  // 6. Connected pipes flow diffs (downstream particles slow down & stop after valve turns!)
+  // 6. Connected pipes flow diffs, sector-only highlight/fade & full pipe tooltip
   const updatePipes = (state.connected_network && state.connected_network.pipes && state.connected_network.pipes.length)
     ? state.connected_network.pipes
     : (state.pipes || []);
@@ -1756,18 +1922,40 @@ function applySceneUpdate(args) {
       tr.prevFlow = tr.currentFlow;
       tr.targetFlow = nextFlow;
       tr.animStart = now;
-      tr.delay = (tr.role === 'intake' || tr.role === 'product_water' || tr.role === 'trunk_main') ? 0.15 : 0.65;
+      tr.delay = (tr.pipe_class === 'TRUNK_MAIN') ? 0.15 : 0.65;
     }
-    const pHl = !!p.highlighted || dlSet.has(p.segment_id) || dlSet.has(keyId);
-    const pDim = isFocused && !pHl && (hl.type === 'sector' || hl.type === 'valve') && (tr.role !== 'trunk_main' && tr.role !== 'product_water' && tr.role !== 'intake');
-    tr.mat.opacity = pDim ? 0.26 : 0.96;
-    tr.mat.emissive.copy(pHl ? tr.activeColor : new THREE.Color('#000000'));
-    tr.mat.emissiveIntensity = pHl ? 0.55 : 0.0;
-    const rerouteTag = p.rerouted ? ' · REROUTED' : '';
+    // Selecting a sector highlights ONLY that sector's pipes and fades all others!
+    let pHl = !!p.highlighted || dlSet.has(p.segment_id) || dlSet.has(keyId);
+    let pDim = false;
+    if (hl.type === 'sector' && hl.id) {
+      const sameSec = String(p.sector || '').toLowerCase() === String(hl.id).toLowerCase();
+      pHl = sameSec;
+      pDim = !sameSec;
+    } else if (hl.type === 'valve' && hl.id) {
+      pDim = !pHl;
+    }
+
+    tr.isDimmed = pDim;
+    tr.baseOpacity = pDim ? 0.18 : 0.96;
+    tr.baseEmissive = pHl ? tr.activeColor.clone() : new THREE.Color('#000000');
+    tr.baseEmissiveIntensity = pHl ? 0.50 : 0.0;
+
+    if (engine.hoveredRunId !== tr.run_id) {
+      tr.mat.opacity = tr.baseOpacity;
+      tr.mat.emissive.copy(tr.baseEmissive);
+      tr.mat.emissiveIntensity = tr.baseEmissiveIntensity;
+    }
+
+    const stLabel = p.status || (nextFlow <= 0.05 ? 'NO_FLOW' : (p.rerouted ? 'REROUTED' : 'FLOWING'));
+    const stColor = stLabel === 'NO_FLOW' ? '#EF4444' : (stLabel === 'REROUTED' ? '#F59E0B' : '#22C55E');
     const pressVal = p.pressure_psi !== undefined ? p.pressure_psi : segPressMap[p.segment_id];
-    const pressStr = pressVal !== undefined ? ` · Pressure: ${pressVal} psi` : '';
-    const valveStr = p.isolation_valve_id ? ` · Valve: ${p.isolation_valve_id}` : '';
-    tr.tube.userData.tooltip = `<strong>${keyId}</strong> (${p.sector})<br/>${p.name}<br/>${p.diameter_mm}mm ${tr.role.replace('_', ' ')}${valveStr}<br/>Flow: <strong>${p.flow_lps} L/s</strong>${rerouteTag}${pressStr}`;
+    const pressStr = pressVal !== undefined ? ` · ${pressVal} psi` : '';
+    const valveStr = p.isolation_valve_id ? ` · Valve ${p.isolation_valve_id}` : '';
+    tr.tube.userData.tooltip =
+      `<strong>${keyId}</strong> (${p.sector || tr.sector})<br/>` +
+      `Class: <strong>${tr.class_label}</strong> · <strong>${tr.diameter_mm} mm</strong><br/>` +
+      `Route: <code>${tr.from_node} &rarr; ${tr.to_node}</code><br/>` +
+      `Flow: <strong>${p.flow_lps} L/s</strong> · Status: <strong style="color:${stColor};">${stLabel}</strong>${valveStr}${pressStr}`;
   });
 
   // 7. Sensors
@@ -1869,6 +2057,8 @@ function startAnimationLoop() {
   const projVec = new THREE.Vector3();
   const pDummy = new THREE.Object3D();
   const pPos = new THREE.Vector3();
+  const pTan = new THREE.Vector3();
+  const coneUp = new THREE.Vector3(0, 1, 0);
   const colBlue = new THREE.Color('#0EA5E9');
   const colOrange = new THREE.Color('#F97316');
   const colRed = new THREE.Color('#EF4444');
@@ -1966,35 +2156,63 @@ function startAnimationLoop() {
       }
     }
 
-    // 7. Instanced water flow particles (speed & count proportional to flow; none when flow == 0)
-    if (engine.flowInst) {
-      let idx = 0;
+    // 7. Small light-cyan water particles (~1/4 pipe diameter) + directional flow arrows (from_node -> to_node)
+    if (engine.flowInst || engine.arrowInst) {
+      let pIdx = 0;
+      let aIdx = 0;
       for (const tr of engine.flowTracks) {
         const fu = tr.delay > 0 ? easeOutCubic((t - tr.animStart - tr.delay) / 1.8) : easeOutCubic((t - tr.animStart) / 1.4);
         tr.currentFlow = tr.prevFlow + (tr.targetFlow - tr.prevFlow) * fu;
         if (tr.mat) {
           tr.mat.color.copy(tr.dryColor).lerp(tr.activeColor, Math.min(1.0, tr.currentFlow / 25.0));
         }
-        const speed = (tr.currentFlow / 100.0) * 0.28;
+        const speed = (tr.currentFlow / 100.0) * 0.24;
+        const dimFactor = tr.isDimmed ? 0.35 : 1.0;
         const activeCount = tr.currentFlow <= 0.05 ? 0 : Math.max(1, Math.min(tr.particles.length, Math.round((tr.currentFlow / 110.0) * tr.particles.length)));
-        const pScale = tr.currentFlow <= 0.05 ? 0.0 : Math.min(1.15, 0.58 + (tr.currentFlow / 120.0) * 0.55);
+        // Particle radius strictly ~1/4 of pipe diameter (i.e. ~0.5 * pipe radius * 0.55 = 0.26 * pipe radius)
+        const pRadius = tr.currentFlow <= 0.05 ? 0.0 : Math.max(0.06, tr.radius * 0.28) * dimFactor;
 
-        for (let k = 0; k < tr.particles.length; k++) {
-          const pt = tr.particles[k];
-          if (k < activeCount && pScale > 0.0) {
-            pt.phase = (pt.phase + dt * speed) % 1.0;
-            tr.curve.getPointAt(pt.phase, pPos);
-            pDummy.position.set(pPos.x, pPos.y + 0.40, pPos.z);
-            pDummy.scale.setScalar(pScale);
-          } else {
-            pDummy.position.set(0, -200, 0);
-            pDummy.scale.setScalar(0.0);
+        if (engine.flowInst) {
+          for (let k = 0; k < tr.particles.length; k++) {
+            const pt = tr.particles[k];
+            if (k < activeCount && pRadius > 0.0) {
+              pt.phase = (pt.phase + dt * speed) % 1.0;
+              tr.curve.getPointAt(pt.phase, pPos);
+              pDummy.position.set(pPos.x, pPos.y + tr.radius * 0.45, pPos.z);
+              pDummy.rotation.set(0, 0, 0);
+              pDummy.scale.setScalar(pRadius);
+            } else {
+              pDummy.position.set(0, -200, 0);
+              pDummy.scale.setScalar(0.0);
+            }
+            pDummy.updateMatrix();
+            engine.flowInst.setMatrixAt(pIdx++, pDummy.matrix);
           }
-          pDummy.updateMatrix();
-          engine.flowInst.setMatrixAt(idx++, pDummy.matrix);
+        }
+
+        // Flow direction arrows oriented strictly along curve tangent (from_node -> to_node)
+        if (engine.arrowInst) {
+          const arrowScale = tr.currentFlow <= 0.05 ? 0.0 : Math.max(0.14, tr.radius * 0.56) * dimFactor;
+          for (let k = 0; k < tr.arrows.length; k++) {
+            const ar = tr.arrows[k];
+            if (arrowScale > 0.0) {
+              ar.phase = (ar.phase + dt * speed * 0.55) % 1.0;
+              tr.curve.getPointAt(ar.phase, pPos);
+              tr.curve.getTangentAt(ar.phase, pTan).normalize();
+              pDummy.position.set(pPos.x, pPos.y + tr.radius + arrowScale * 0.55, pPos.z);
+              pDummy.quaternion.setFromUnitVectors(coneUp, pTan);
+              pDummy.scale.setScalar(arrowScale);
+            } else {
+              pDummy.position.set(0, -200, 0);
+              pDummy.scale.setScalar(0.0);
+            }
+            pDummy.updateMatrix();
+            engine.arrowInst.setMatrixAt(aIdx++, pDummy.matrix);
+          }
         }
       }
-      engine.flowInst.instanceMatrix.needsUpdate = true;
+      if (engine.flowInst) engine.flowInst.instanceMatrix.needsUpdate = true;
+      if (engine.arrowInst) engine.arrowInst.instanceMatrix.needsUpdate = true;
     }
 
     // 8. Leak spray fountains & puddles (status-driven; stops smoothly when isolated!)

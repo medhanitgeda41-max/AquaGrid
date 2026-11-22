@@ -26,9 +26,12 @@ from database.dubai_network import (
 )
 from database.leak_registry import get_active_leaks, get_all_leaks, normalize_leak_status
 from digital_twin.hydraulics import (
+    PIPE_CLASS_SPECS,
+    _segment_intersects_aabb,
     build_connected_network_geometry,
     compute_network_flows,
     get_effective_valve_for_segment,
+    validate_pipes_clear_buildings,
 )
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
@@ -92,16 +95,52 @@ def latlon_to_local_xz(
     return round(x_m, 2), round(z_m, 2)
 
 
+def _extract_pipe_subsegments(avoid_pipes: Optional[list[dict]]) -> list[tuple[list[float], list[float]]]:
+    """Flatten pipe polylines into 2D subsegments [(a1, a2), ...] for fast clearance checks."""
+    subsegs: list[tuple[list[float], list[float]]] = []
+    if not avoid_pipes:
+        return subsegs
+    for p in avoid_pipes:
+        pts = p.get("points_xz") or []
+        for i in range(len(pts) - 1):
+            subsegs.append((pts[i], pts[i + 1]))
+    return subsegs
+
+
+def _box_hits_any_pipe(
+    bx: float,
+    bz: float,
+    w_m: float,
+    d_m: float,
+    pipe_subsegs: list[tuple[list[float], list[float]]],
+    margin_m: float = 45.0,
+) -> bool:
+    if not pipe_subsegs:
+        return False
+    hx = w_m * 0.5 + margin_m
+    hz = d_m * 0.5 + margin_m
+    min_x, max_x = bx - hx, bx + hx
+    min_z, max_z = bz - hz, bz + hz
+    for a1, a2 in pipe_subsegs:
+        if _segment_intersects_aabb(a1, a2, min_x, max_x, min_z, max_z):
+            return True
+    return False
+
+
 def generate_sector_buildings(
     boundaries: dict[str, dict],
     low_quality: bool = False,
+    avoid_pipes: Optional[list[dict]] = None,
 ) -> list[dict]:
     """
-    Deterministically generate seeded procedural city building blocks inside each sector polygon.
+    Deterministically generate seeded procedural city building blocks inside each sector polygon,
+    arranged in clean orthogonal city blocks that NEVER overlap any pipe corridor.
     Same coordinates, dimensions, styles, and heights on every call.
     """
     buildings: list[dict] = []
     target_per_sector = 16 if low_quality else 46
+    pipe_subsegs = _extract_pipe_subsegments(avoid_pipes)
+    block_step_m = 340.0
 
     for sec_idx in range(1, 7):
         sec_name = f"Sector {sec_idx}"
@@ -116,18 +155,39 @@ def generate_sector_buildings(
 
         placed = 0
         attempts = 0
-        max_attempts = target_per_sector * 14
+        max_attempts = target_per_sector * 36
+        sec_placed_boxes: list[tuple[float, float, float, float]] = []
+
         while placed < target_per_sector and attempts < max_attempts:
             attempts += 1
             lat = rng.uniform(min_lat, max_lat)
             lon = rng.uniform(min_lon, max_lon)
             if not point_in_polygon(lat, lon, poly):
                 continue
-            x_m, z_m = latlon_to_local_xz(lat, lon)
+            raw_x, raw_z = latlon_to_local_xz(lat, lon)
+            # Snap building centres to an orthogonal city-block grid so street aisles align cleanly with pipes
+            x_m = round(round(raw_x / block_step_m) * block_step_m, 1)
+            z_m = round(round(raw_z / block_step_m) * block_step_m, 1)
+
             is_tower = (sec_idx in (3, 6)) and (rng.random() < 0.38)
-            w_m = round(rng.uniform(110.0, 220.0) if is_tower else rng.uniform(150.0, 310.0), 1)
-            d_m = round(rng.uniform(110.0, 220.0) if is_tower else rng.uniform(150.0, 310.0), 1)
+            w_m = round(rng.uniform(110.0, 200.0) if is_tower else rng.uniform(135.0, 240.0), 1)
+            d_m = round(rng.uniform(110.0, 200.0) if is_tower else rng.uniform(135.0, 240.0), 1)
             h_m = round((rng.uniform(220.0, 460.0) if is_tower else rng.uniform(85.0, 260.0)) * height_scale, 1)
+
+            # Enforce strict clearance from all pipes (never build on top of or across a pipe corridor)
+            if _box_hits_any_pipe(x_m, z_m, w_m, d_m, pipe_subsegs, margin_m=45.0):
+                continue
+
+            # Keep buildings neatly separated inside distinct blocks
+            overlaps_bldg = False
+            for ox, oz, ow, od in sec_placed_boxes:
+                if abs(x_m - ox) < (w_m + ow) * 0.5 + 30.0 and abs(z_m - oz) < (d_m + od) * 0.5 + 30.0:
+                    overlaps_bldg = True
+                    break
+            if overlaps_bldg:
+                continue
+
+            sec_placed_boxes.append((x_m, z_m, w_m, d_m))
             buildings.append(
                 {
                     "x": x_m,
@@ -149,12 +209,37 @@ def generate_sector_buildings(
 def generate_city_roads_and_trees(
     boundaries: dict[str, dict],
     low_quality: bool = False,
+    avoid_pipes: Optional[list[dict]] = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    """Deterministically generate seeded roads between city blocks, green park patches, and trees."""
+    """Deterministically generate seeded street corridors under pipes, green park patches, and trees."""
     roads: list[dict] = []
     parks: list[dict] = []
     trees: list[dict] = []
     trees_per_sector = 6 if low_quality else 18
+    pipe_subsegs = _extract_pipe_subsegments(avoid_pipes)
+
+    # Render clean paved street corridors directly underneath orthogonal pipe subsegments
+    seen_roads: set[tuple[float, float, float, float]] = set()
+    for p in (avoid_pipes or []):
+        pts = p.get("points_xz") or []
+        p_cls = p.get("pipe_class", "DISTRIBUTION")
+        road_w = 88.0 if p_cls == "TRUNK_MAIN" else (64.0 if p_cls == "SECTOR_TRUNK" else 44.0)
+        for i in range(len(pts) - 1):
+            a1, a2 = pts[i], pts[i + 1]
+            if math.hypot(a2[0] - a1[0], a2[1] - a1[1]) < 25.0:
+                continue
+            key = (round(a1[0], 0), round(a1[1], 0), round(a2[0], 0), round(a2[1], 0))
+            if key in seen_roads:
+                continue
+            seen_roads.add(key)
+            roads.append(
+                {
+                    "sector": p.get("sector", "Network"),
+                    "start_xz": [round(float(a1[0]), 2), round(float(a1[1]), 2)],
+                    "end_xz": [round(float(a2[0]), 2), round(float(a2[1]), 2)],
+                    "width_m": road_w,
+                }
+            )
 
     for sec_idx in range(1, 7):
         sec_name = f"Sector {sec_idx}"
@@ -166,31 +251,33 @@ def generate_city_roads_and_trees(
         cx_m, cz_m = latlon_to_local_xz(binfo["centroid"][0], binfo["centroid"][1])
         rng = random.Random(7700 + sec_idx * 53)
 
-        # Two orthogonal boulevard roads crossing each sector block grid
-        lat_mid = 0.5 * (min_lat + max_lat)
-        lon_mid = 0.5 * (min_lon + max_lon)
-        r1a = list(latlon_to_local_xz(min_lat + 0.12 * (max_lat - min_lat), lon_mid))
-        r1b = list(latlon_to_local_xz(max_lat - 0.12 * (max_lat - min_lat), lon_mid))
-        r2a = list(latlon_to_local_xz(lat_mid, min_lon + 0.12 * (max_lon - min_lon)))
-        r2b = list(latlon_to_local_xz(lat_mid, max_lon - 0.12 * (max_lon - min_lon)))
-        roads.append({"sector": sec_name, "start_xz": r1a, "end_xz": r1b, "width_m": 65.0})
-        roads.append({"sector": sec_name, "start_xz": r2a, "end_xz": r2b, "width_m": 55.0})
+        if not avoid_pipes:
+            lat_mid = 0.5 * (min_lat + max_lat)
+            lon_mid = 0.5 * (min_lon + max_lon)
+            r1a = list(latlon_to_local_xz(min_lat + 0.12 * (max_lat - min_lat), lon_mid))
+            r1b = list(latlon_to_local_xz(max_lat - 0.12 * (max_lat - min_lat), lon_mid))
+            r2a = list(latlon_to_local_xz(lat_mid, min_lon + 0.12 * (max_lon - min_lon)))
+            r2b = list(latlon_to_local_xz(lat_mid, max_lon - 0.12 * (max_lon - min_lon)))
+            roads.append({"sector": sec_name, "start_xz": r1a, "end_xz": r1b, "width_m": 65.0})
+            roads.append({"sector": sec_name, "start_xz": r2a, "end_xz": r2b, "width_m": 55.0})
 
         # Seeded community park patch near centroid offset
         px = round(cx_m + rng.uniform(-550.0, 550.0), 1)
         pz = round(cz_m + rng.uniform(-550.0, 550.0), 1)
         parks.append({"sector": sec_name, "x": px, "z": pz, "radius_m": round(rng.uniform(210.0, 340.0), 1)})
 
-        # Seeded park & boulevard trees inside the sector polygon
+        # Seeded park & boulevard trees inside the sector polygon, clear of pipe corridors
         placed = 0
         attempts = 0
-        while placed < trees_per_sector and attempts < trees_per_sector * 10:
+        while placed < trees_per_sector and attempts < trees_per_sector * 16:
             attempts += 1
             lat = rng.uniform(min_lat, max_lat)
             lon = rng.uniform(min_lon, max_lon)
             if not point_in_polygon(lat, lon, poly):
                 continue
             tx, tz = latlon_to_local_xz(lat, lon)
+            if _box_hits_any_pipe(tx, tz, 40.0, 40.0, pipe_subsegs, margin_m=30.0):
+                continue
             trees.append({"x": tx, "z": tz, "scale": round(rng.uniform(0.8, 1.35), 2), "sector": sec_name})
             placed += 1
 
@@ -775,7 +862,7 @@ def build_3d_scene_state(
         "highlighted": focus_type in ("reservoir", "reservoir_inside"),
     }
 
-    # 8b. 100% Connected Geometric & Hydraulic Pipe Network Graph (Intakes -> DESAL-01 -> RES-01 -> Trunk Spine -> Valves -> Sectors)
+    # 8b. 100% Connected Orthogonal Street-Grid Pipe Network (Intakes -> DESAL-01 -> RES-01 -> Trunk Spine -> Valves -> Sectors)
     connected_net = build_connected_network_geometry(
         segments=segments,
         valve_statuses=valve_status_map,
@@ -790,9 +877,42 @@ def build_3d_scene_state(
         focus_id=focus_id,
     )
 
-    # 9. Deterministic procedural city (buildings, roads, parks, trees) & western coastline
-    buildings_out = generate_sector_buildings(boundaries, low_quality=low_quality)
-    roads_out, parks_out, trees_out = generate_city_roads_and_trees(boundaries, low_quality=low_quality)
+    # Sync valve size, elevation, and orthogonal tangent directly from the connected pipe each valve sits on!
+    conn_nodes_by_id = {n["node_id"]: n for n in connected_net["nodes"]}
+    valve_dir_from_pipe: dict[str, list[float]] = {}
+    seg_y_level_map: dict[str, float] = {}
+    for cp in connected_net["pipes"]:
+        seg_id_c = cp.get("segment_id")
+        if seg_id_c and seg_id_c not in seg_y_level_map:
+            seg_y_level_map[seg_id_c] = float(cp.get("y_level", 1.15))
+        pts_c = cp.get("points_xz") or []
+        if len(pts_c) >= 2:
+            fn_c, tn_c = cp["from_node"], cp["to_node"]
+            if fn_c in conn_nodes_by_id and conn_nodes_by_id[fn_c].get("kind") == "valve" and fn_c not in valve_dir_from_pipe:
+                dx, dz = pts_c[1][0] - pts_c[0][0], pts_c[1][1] - pts_c[0][1]
+                L = math.hypot(dx, dz) or 1.0
+                valve_dir_from_pipe[fn_c] = [round(dx / L, 4), round(dz / L, 4)]
+            if tn_c in conn_nodes_by_id and conn_nodes_by_id[tn_c].get("kind") == "valve" and tn_c not in valve_dir_from_pipe:
+                dx, dz = pts_c[-1][0] - pts_c[-2][0], pts_c[-1][1] - pts_c[-2][1]
+                L = math.hypot(dx, dz) or 1.0
+                valve_dir_from_pipe[tn_c] = [round(dx / L, 4), round(dz / L, 4)]
+
+    for v in valves_out:
+        vid = v["valve_id"]
+        nd = conn_nodes_by_id.get(vid, {})
+        v["pipe_radius_3d"] = float(nd.get("pipe_radius_3d", PIPE_CLASS_SPECS["SECTOR_TRUNK"]["radius_3d"]))
+        v["pipe_y_level"] = float(nd.get("pipe_y_level", PIPE_CLASS_SPECS["SECTOR_TRUNK"]["base_y"]))
+        v["pipe_class"] = str(nd.get("pipe_class", "SECTOR_TRUNK"))
+        if vid in valve_dir_from_pipe:
+            v["pipe_dir_xz"] = valve_dir_from_pipe[vid]
+
+    for lk in leaks_out:
+        lk["y_level"] = float(seg_y_level_map.get(lk.get("pipe_segment_id", ""), PIPE_CLASS_SPECS["SECTOR_TRUNK"]["base_y"]))
+
+    # 9. Deterministic procedural city blocks (STRICTLY clear of every pipe corridor), street corridors, parks & trees
+    buildings_out = generate_sector_buildings(boundaries, low_quality=low_quality, avoid_pipes=connected_net["pipes"])
+    roads_out, parks_out, trees_out = generate_city_roads_and_trees(boundaries, low_quality=low_quality, avoid_pipes=connected_net["pipes"])
+    connected_net["building_clearance"] = validate_pipes_clear_buildings(connected_net["pipes"], buildings_out, margin_m=0.0)
     coastline_xz = [list(latlon_to_local_xz(lat, lon)) for lat, lon in DUBAI_COASTLINE_LATLON]
 
     # 10. Highlight & camera target

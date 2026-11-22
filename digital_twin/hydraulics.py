@@ -35,6 +35,45 @@ TRUNK_HUB_LATLON: dict[str, tuple[float, float]] = {
     "TRUNK-HUB-S1": (25.2640, 55.3240),  # Sector 1 Deira / Al Rigga manifold
 }
 
+# Strictly THREE standardized pipe classes — fixed diameter, color, 3D radius, and non-colliding elevation layer
+PIPE_CLASS_SPECS: dict[str, dict] = {
+    "TRUNK_MAIN": {
+        "class_id": "TRUNK_MAIN",
+        "label": "Trunk Main",
+        "diameter_mm": 900,
+        "color": "#1D4ED8",      # Dark Blue
+        "radius_3d": 0.46,
+        "base_y": 2.00,
+    },
+    "SECTOR_TRUNK": {
+        "class_id": "SECTOR_TRUNK",
+        "label": "Sector Trunk",
+        "diameter_mm": 500,
+        "color": "#2563EB",      # Blue
+        "radius_3d": 0.30,
+        "base_y": 1.15,
+    },
+    "DISTRIBUTION": {
+        "class_id": "DISTRIBUTION",
+        "label": "Distribution",
+        "diameter_mm": 200,
+        "color": "#38BDF8",      # Light Blue
+        "radius_3d": 0.18,
+        "base_y": 0.50,
+    },
+}
+
+
+def classify_pipe_class(diameter_mm: int, role: str = "") -> str:
+    """Map database diameter & role into strictly one of the 3 standardized pipe classes."""
+    r = str(role or "").lower()
+    d = int(diameter_mm or 500)
+    if r in ("intake", "product_water", "trunk_main") or d >= 800:
+        return "TRUNK_MAIN"
+    if r == "sector_trunk" or d >= 500:
+        return "SECTOR_TRUNK"
+    return "DISTRIBUTION"
+
 # Primary valve controlling each pipe segment (aligned with DUBAI_PIPE_SEGMENTS & V-01..V-20 placements)
 SEGMENT_VALVE_MAP: dict[str, str] = {
     # Sector 1
@@ -388,6 +427,239 @@ def _split_polyline_at_coord(
     return up, down
 
 
+def _pts_close(p1: list[float], p2: list[float], tol: float = 0.25) -> bool:
+    return math.hypot(float(p1[0]) - float(p2[0]), float(p1[1]) - float(p2[1])) <= tol
+
+
+def _segments_intersect_2d(
+    a1: list[float],
+    a2: list[float],
+    b1: list[float],
+    b2: list[float],
+    eps: float = 1e-6,
+) -> bool:
+    """Return True if 2D segments [a1, a2] and [b1, b2] intersect (including proper crossings & collinear overlaps)."""
+    x1, z1 = float(a1[0]), float(a1[1])
+    x2, z2 = float(a2[0]), float(a2[1])
+    x3, z3 = float(b1[0]), float(b1[1])
+    x4, z4 = float(b2[0]), float(b2[1])
+
+    # Bounding-box fast reject
+    if max(x1, x2) < min(x3, x4) - eps or max(x3, x4) < min(x1, x2) - eps:
+        return False
+    if max(z1, z2) < min(z3, z4) - eps or max(z3, z4) < min(z1, z2) - eps:
+        return False
+
+    def _orient(px: float, pz: float, qx: float, qz: float, rx: float, rz: float) -> float:
+        return (qx - px) * (rz - pz) - (qz - pz) * (rx - px)
+
+    o1 = _orient(x1, z1, x2, z2, x3, z3)
+    o2 = _orient(x1, z1, x2, z2, x4, z4)
+    o3 = _orient(x3, z3, x4, z4, x1, z1)
+    o4 = _orient(x3, z3, x4, z4, x2, z2)
+
+    if ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps)) and ((o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps)):
+        return True
+
+    def _on_seg(px: float, pz: float, qx: float, qz: float, rx: float, rz: float) -> bool:
+        return (
+            min(px, rx) - eps <= qx <= max(px, rx) + eps
+            and min(pz, rz) - eps <= qz <= max(pz, rz) + eps
+        )
+
+    if abs(o1) <= eps and _on_seg(x1, z1, x3, z3, x2, z2):
+        return True
+    if abs(o2) <= eps and _on_seg(x1, z1, x4, z4, x2, z2):
+        return True
+    if abs(o3) <= eps and _on_seg(x3, z3, x1, z1, x4, z4):
+        return True
+    if abs(o4) <= eps and _on_seg(x3, z3, x2, z2, x4, z4):
+        return True
+    return False
+
+
+def _choose_clean_orthogonal_route(
+    start_pt: list[float],
+    end_pt: list[float],
+    placed_subsegs: list[tuple[list[float], list[float], str, str]],
+    from_node: str,
+    to_node: str,
+) -> list[list[float]]:
+    """
+    Build a crisp orthogonal street-grid route (only horizontal X or vertical Z segments with 90-degree elbows)
+    from `start_pt` to `end_pt`, selecting the L-route (HV vs VH) that minimizes 2D crossings with existing pipes.
+    """
+    sx, sz = float(start_pt[0]), float(start_pt[1])
+    ex, ez = float(end_pt[0]), float(end_pt[1])
+    if abs(sx - ex) <= 0.5 or abs(sz - ez) <= 0.5:
+        return [[sx, sz], [ex, ez]]
+
+    candidates = [
+        [[sx, sz], [ex, sz], [ex, ez]],  # Horizontal-then-Vertical (90° elbow)
+        [[sx, sz], [sx, ez], [ex, ez]],  # Vertical-then-Horizontal (90° elbow)
+    ]
+
+    best_route = candidates[0]
+    best_score = float("inf")
+    for cand in candidates:
+        crossings = 0
+        for i in range(len(cand) - 1):
+            a1, a2 = cand[i], cand[i + 1]
+            for b1, b2, b_fn, b_tn in placed_subsegs:
+                # Ignore shared endpoint touches with adjacent pipes
+                if b_fn in (from_node, to_node) or b_tn in (from_node, to_node):
+                    if _pts_close(a1, b1) or _pts_close(a1, b2) or _pts_close(a2, b1) or _pts_close(a2, b2):
+                        continue
+                if _segments_intersect_2d(a1, a2, b1, b2):
+                    crossings += 1
+        if crossings < best_score:
+            best_score = crossings
+            best_route = cand
+            if crossings == 0:
+                break
+    return best_route
+
+
+def _pipes_intersect_3d_unconnected(p1: dict, p2: dict) -> bool:
+    """Return True if two non-identical pipes intersect in 3D at any point other than a shared node."""
+    shared_nodes = {p1["from_node"], p1["to_node"]} & {p2["from_node"], p2["to_node"]}
+    y1, r1 = float(p1["y_level"]), float(p1["radius_3d"])
+    y2, r2 = float(p2["y_level"]), float(p2["radius_3d"])
+    # Vertical clearance check: pipes at different depths with daylight gap >= r1 + r2 + 0.04 NEVER intersect!
+    if abs(y1 - y2) >= (r1 + r2 + 0.04):
+        return False
+
+    pts1 = p1.get("points_xz") or []
+    pts2 = p2.get("points_xz") or []
+    for i in range(len(pts1) - 1):
+        a1, a2 = pts1[i], pts1[i + 1]
+        for j in range(len(pts2) - 1):
+            b1, b2 = pts2[j], pts2[j + 1]
+            if not _segments_intersect_2d(a1, a2, b1, b2):
+                continue
+            # If they share a graph node, verify this touch is ONLY at the shared endpoint (not a mid-segment crossing)
+            if shared_nodes:
+                touch_only_at_end = (
+                    (_pts_close(a1, b1) or _pts_close(a1, b2) or _pts_close(a2, b1) or _pts_close(a2, b2))
+                    and not (
+                        abs(a1[0] - a2[0]) <= 0.1 and abs(b1[0] - b2[0]) <= 0.1 and abs(a1[0] - b1[0]) <= 0.1
+                        and (min(a1[1], a2[1]) < max(b1[1], b2[1]) - 0.5 and min(b1[1], b2[1]) < max(a1[1], a2[1]) - 0.5)
+                    )
+                    and not (
+                        abs(a1[1] - a2[1]) <= 0.1 and abs(b1[1] - b2[1]) <= 0.1 and abs(a1[1] - b1[1]) <= 0.1
+                        and (min(a1[0], a2[0]) < max(b1[0], b2[0]) - 0.5 and min(b1[0], b2[0]) < max(a1[0], a2[0]) - 0.5)
+                    )
+                )
+                if touch_only_at_end:
+                    continue
+            return True
+    return False
+
+
+def _resolve_pipe_crossings_3d(pipes_out: list[dict]) -> None:
+    """
+    Guarantee ZERO unconnected 3D pipe-pipe intersections:
+    Pipes already sit on distinct base elevations per class (TRUNK_MAIN=2.00, SECTOR_TRUNK=1.15, DISTRIBUTION=0.50).
+    If any two pipes still intersect in 3D (e.g. same-class crossing), assign a clean vertical overpass depth offset.
+    """
+    candidate_offsets = [0.0, 0.55, 1.10, 1.65, 2.20, 2.75, 3.30, 3.85]
+    for idx, p in enumerate(pipes_out):
+        base_y = float(PIPE_CLASS_SPECS[p["pipe_class"]]["base_y"])
+        for off in candidate_offsets:
+            p["y_level"] = round(base_y + off, 3)
+            p["has_crossing_offset"] = off > 0.0
+            conflict = False
+            for j in range(idx):
+                if _pipes_intersect_3d_unconnected(p, pipes_out[j]):
+                    conflict = True
+                    break
+            if not conflict:
+                break
+
+
+def _compute_fittings_and_reducers(nodes_by_id: dict[str, dict], pipes_out: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Build explicit junction fittings (T-piece / Cross / Riser) and tapered Reducers at EVERY node
+    where connected pipes change diameter class (e.g., TRUNK_MAIN 900mm -> SECTOR_TRUNK 500mm -> DISTRIBUTION 200mm).
+    """
+    incident: dict[str, list[dict]] = {nid: [] for nid in nodes_by_id}
+    for p in pipes_out:
+        if p["from_node"] in incident:
+            incident[p["from_node"]].append({"pipe": p, "is_outgoing": True})
+        if p["to_node"] in incident:
+            incident[p["to_node"]].append({"pipe": p, "is_outgoing": False})
+
+    fittings: list[dict] = []
+    reducers: list[dict] = []
+
+    for nid, inc_list in incident.items():
+        if not inc_list:
+            continue
+        nd = nodes_by_id[nid]
+        deg = len(inc_list)
+        ys = [float(item["pipe"]["y_level"]) for item in inc_list]
+        radii = [float(item["pipe"]["radius_3d"]) for item in inc_list]
+        classes = {item["pipe"]["pipe_class"] for item in inc_list}
+        max_r = max(radii)
+        y_min, y_max = min(ys), max(ys)
+
+        fitting_type = "cross" if deg >= 4 else ("tee" if deg == 3 else ("inline" if deg == 2 else "endcap"))
+        fittings.append(
+            {
+                "node_id": nid,
+                "kind": nd["kind"],
+                "sector": nd["sector"],
+                "pos_xz": list(nd["pos_xz"]),
+                "degree": deg,
+                "fitting_type": fitting_type,
+                "y_min": round(y_min, 3),
+                "y_max": round(y_max, 3),
+                "radius_3d": round(max_r, 3),
+                "label": nid if (nd["kind"] in ("junction", "trunk_hub") or deg >= 3) else "",
+            }
+        )
+
+        # Wherever >1 pipe class meets at this node, emit a tapered reducer cone transitioning from the larger pipe to each smaller pipe!
+        if len(classes) > 1:
+            largest_item = max(inc_list, key=lambda it: PIPE_CLASS_SPECS[it["pipe"]["pipe_class"]]["diameter_mm"])
+            from_cls = largest_item["pipe"]["pipe_class"]
+            from_spec = PIPE_CLASS_SPECS[from_cls]
+            from_y = float(largest_item["pipe"]["y_level"])
+            for item in inc_list:
+                to_p = item["pipe"]
+                to_cls = to_p["pipe_class"]
+                if to_cls == from_cls:
+                    continue
+                to_spec = PIPE_CLASS_SPECS[to_cls]
+                to_y = float(to_p["y_level"])
+                pts = to_p["points_xz"]
+                if item["is_outgoing"] and len(pts) >= 2:
+                    dx, dz = pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]
+                elif (not item["is_outgoing"]) and len(pts) >= 2:
+                    dx, dz = pts[-2][0] - pts[-1][0], pts[-2][1] - pts[-1][1]
+                else:
+                    dx, dz = 1.0, 0.0
+                dlen = max(1e-6, math.hypot(dx, dz))
+                reducers.append(
+                    {
+                        "node_id": nid,
+                        "pipe_id": to_p["pipe_id"],
+                        "pos_xz": list(nd["pos_xz"]),
+                        "from_class": from_cls,
+                        "to_class": to_cls,
+                        "from_diameter_mm": from_spec["diameter_mm"],
+                        "to_diameter_mm": to_spec["diameter_mm"],
+                        "from_radius": from_spec["radius_3d"],
+                        "to_radius": to_spec["radius_3d"],
+                        "from_y": round(from_y, 3),
+                        "to_y": round(to_y, 3),
+                        "dir_xz": [round(dx / dlen, 4), round(dz / dlen, 4)],
+                    }
+                )
+
+    return fittings, reducers
+
+
 def build_connected_network_geometry(
     segments: Optional[list[dict]] = None,
     valve_statuses: Optional[dict[str, str]] = None,
@@ -402,13 +674,16 @@ def build_connected_network_geometry(
     focus_id: Optional[str] = None,
 ) -> dict:
     """
-    Build ONE 100% connected geometric & hydraulic pipe network from:
-        Sea Intakes (INTAKE-01/02) -> DESAL-01 -> RES-01 -> Outlet Trunk Spine (TRUNK-HUB-S6..S1)
+    Build ONE 100% connected, clean orthogonal street-grid pipe network from:
+        Sea Intakes (INTAKE-01/02) -> DESAL-01 -> Product Pipe -> RES-01 -> Main Trunk (TRUNK-HUB-S6..S1)
         -> Sector Trunks -> Isolation Valves (V-01..V-20 placed ON exact nodes)
         -> All 28 Dubai Street Pipes & Junctions -> Distribution Branches.
 
-    Every pipe edge starts and ends at an exact node position in `nodes_by_id` (zero floating segments).
-    Pipe roles control 3D diameter: 'intake'/'product_water'/'trunk_main' (thick), 'sector_trunk' (medium), 'distribution' (thin).
+    Guarantees:
+    - Strictly 3 pipe classes: TRUNK_MAIN (900mm dark blue), SECTOR_TRUNK (500mm blue), DISTRIBUTION (200mm light blue).
+    - Every connected run keeps the same class end to end; tapered reducers sit at EVERY class change.
+    - Orthogonal 90-degree street-aligned segments only; ZERO unconnected 3D pipe-pipe crossings.
+    - Real junction fittings (T-piece / Cross) at connected nodes; valves sized to their pipe.
     """
     segs = list(segments) if segments is not None else list(DUBAI_PIPE_SEGMENTS)
     v_map = {k: str(v).upper() for k, v in (valve_statuses or {}).items()}
@@ -449,17 +724,15 @@ def build_connected_network_geometry(
         return list(nodes_by_id[node_id]["pos_xz"])
 
     # 1. Core Plant, Intakes, Reservoir & Main Transmission Spine Hubs
-    p_int1 = _add_node("INTAKE-01", "intake", *JUNCTION_COORDINATES["INTAKE-01"], sector="Plant")
-    p_int2 = _add_node("INTAKE-02", "intake", *JUNCTION_COORDINATES["INTAKE-02"], sector="Plant")
-    p_plant = _add_node("DESAL-01", "plant", *PLANT_DESAL01_LATLON, sector="Plant")
-    p_res = _add_node("RES-01", "reservoir", *RESERVOIR_RES01_LATLON, sector="Reservoir")
+    _add_node("INTAKE-01", "intake", *JUNCTION_COORDINATES["INTAKE-01"], sector="Plant")
+    _add_node("INTAKE-02", "intake", *JUNCTION_COORDINATES["INTAKE-02"], sector="Plant")
+    _add_node("DESAL-01", "plant", *PLANT_DESAL01_LATLON, sector="Plant")
+    _add_node("RES-01", "reservoir", *RESERVOIR_RES01_LATLON, sector="Reservoir")
 
-    hub_pos: dict[str, list[float]] = {}
     for hub_id, (hlat, hlon) in TRUNK_HUB_LATLON.items():
         sec_num = hub_id[-1]
-        hub_pos[hub_id] = _add_node(hub_id, "trunk_hub", hlat, hlon, sector=f"Sector {sec_num}")
+        _add_node(hub_id, "trunk_hub", hlat, hlon, sector=f"Sector {sec_num}")
 
-    # Register every Valve (V-01..V-20) as a first-class graph node
     for vid, (vlat, vlon) in VALVE_COORDINATES.items():
         _add_node(
             vid,
@@ -471,42 +744,59 @@ def build_connected_network_geometry(
         )
 
     pipes_out: list[dict] = []
+    placed_subsegs: list[tuple[list[float], list[float], str, str]] = []
 
     def _add_pipe(
         pipe_id: str,
         name: str,
         from_node: str,
         to_node: str,
-        points_xz: list[list[float]],
         role: str,
-        diameter_mm: int,
+        raw_diameter_mm: int,
         sector: str,
-        color: str,
         flow_lps: float,
+        pipe_class_override: Optional[str] = None,
         valve_id: Optional[str] = None,
         segment_id: Optional[str] = None,
         is_rerouted: bool = False,
         highlighted: bool = False,
     ) -> None:
-        # Enforce exact mathematical endpoint snapping to nodes_by_id (0.00m gap!)
         start_pt = list(nodes_by_id[from_node]["pos_xz"])
         end_pt = list(nodes_by_id[to_node]["pos_xz"])
-        clean_pts = [start_pt] + [list(p) for p in points_xz[1:-1]] + [end_pt] if len(points_xz) >= 2 else [start_pt, end_pt]
+        clean_pts = _choose_clean_orthogonal_route(start_pt, end_pt, placed_subsegs, from_node, to_node)
+        for i in range(len(clean_pts) - 1):
+            placed_subsegs.append((clean_pts[i], clean_pts[i + 1], from_node, to_node))
+
+        p_cls = pipe_class_override or classify_pipe_class(raw_diameter_mm, role)
+        spec = PIPE_CLASS_SPECS[p_cls]
         elbows = [list(p) for p in clean_pts[1:-1]]
+        f_val = round(max(0.0, float(flow_lps)), 1)
+        pipe_status = "NO_FLOW" if f_val <= 0.05 else ("REROUTED" if is_rerouted else "FLOWING")
+
+        run_id_val = pipe_id if pipe_id.startswith("TIE-") else (segment_id or pipe_id)
+
         pipes_out.append(
             {
                 "pipe_id": pipe_id,
                 "segment_id": segment_id or pipe_id,
+                "run_id": run_id_val,
                 "name": name,
                 "from_node": from_node,
                 "to_node": to_node,
                 "role": role,
-                "diameter_mm": int(diameter_mm),
-                "is_trunk": role in ("intake", "product_water", "trunk_main", "sector_trunk"),
+                "pipe_class": p_cls,
+                "class_label": spec["label"],
+                "diameter_mm": spec["diameter_mm"],
+                "db_diameter_mm": int(raw_diameter_mm),
+                "radius_3d": spec["radius_3d"],
+                "y_level": spec["base_y"],
+                "has_crossing_offset": False,
+                "is_trunk": p_cls in ("TRUNK_MAIN", "SECTOR_TRUNK"),
                 "sector": sector,
-                "color": color,
+                "color": spec["color"],
                 "isolation_valve_id": valve_id,
-                "flow_lps": round(max(0.0, float(flow_lps)), 1),
+                "flow_lps": f_val,
+                "status": pipe_status,
                 "rerouted": bool(is_rerouted),
                 "highlighted": bool(highlighted),
                 "points_xz": clean_pts,
@@ -516,30 +806,28 @@ def build_connected_network_geometry(
             }
         )
 
-    # 2. Main Backbone Edges: Sea Intakes -> DESAL-01 -> RES-01 -> Outlet Trunk Spine (S6 & S5->S4->S3->S2->S1)
-    plant_flow_lps = round((float(plant_output_mld) * 1_000_000.0) / 86_400.0, 1)  # 100 MLD ≈ 1157.4 L/s (display scaled cleanly)
+    # 2. Main Backbone Edges (TRUNK_MAIN — 900mm dark blue): Sea Intakes -> DESAL-01 -> RES-01 -> Spine Hubs
+    plant_flow_lps = round((float(plant_output_mld) * 1_000_000.0) / 86_400.0, 1)
     backbone_lps = round(max(0.0, float(plant_output_mld)) * 1.4, 1)
     int1_lps = backbone_lps if intake2_isolated else round(backbone_lps * 0.55, 1)
     int2_lps = 0.0 if intake2_isolated else round(backbone_lps * 0.55, 1)
 
     _add_pipe(
         "PIPE-INTAKE-01", "Sea Intake 1 Main", "INTAKE-01", "DESAL-01",
-        [p_int1, p_plant], role="intake", diameter_mm=1200, sector="Plant",
-        color="#0284C7", flow_lps=int1_lps, highlighted=(focus_type in ("plant", "intake")),
+        role="intake", raw_diameter_mm=900, sector="Plant",
+        flow_lps=int1_lps, pipe_class_override="TRUNK_MAIN", highlighted=(focus_type in ("plant", "intake")),
     )
     _add_pipe(
         "PIPE-INTAKE-02", "Sea Intake 2 Main", "INTAKE-02", "DESAL-01",
-        [p_int2, p_plant], role="intake", diameter_mm=1200, sector="Plant",
-        color="#22C55E" if intake2_isolated else "#0284C7", flow_lps=int2_lps,
-        highlighted=(focus_type in ("plant", "intake")),
+        role="intake", raw_diameter_mm=900, sector="Plant",
+        flow_lps=int2_lps, pipe_class_override="TRUNK_MAIN", highlighted=(focus_type in ("plant", "intake")),
     )
     _add_pipe(
         "PIPE-PRODUCT-01", "DESAL-01 Product Water Trunk -> RES-01", "DESAL-01", "RES-01",
-        [p_plant, p_res], role="product_water", diameter_mm=1200, sector="Reservoir",
-        color="#38BDF8", flow_lps=backbone_lps, highlighted=(focus_type in ("plant", "reservoir", "reservoir_inside")),
+        role="product_water", raw_diameter_mm=900, sector="Reservoir",
+        flow_lps=backbone_lps, pipe_class_override="TRUNK_MAIN", highlighted=(focus_type in ("plant", "reservoir", "reservoir_inside")),
     )
 
-    # Compute total open flow in each sector so spine trunk carries realistic positive flow whenever downstream is open
     sec_flow_totals: dict[int, float] = {i: 0.0 for i in range(1, 7)}
     for seg in segs:
         sec_str = str(seg.get("sector", "Sector 1"))
@@ -547,26 +835,23 @@ def build_connected_network_geometry(
         sec_flow_totals[s_num] += float(pipe_flows_lps.get(seg["segment_id"], 0.0))
 
     spine_edges = [
-        ("TRUNK-RES-S6", "RES-01 South Outlet Trunk -> Sector 6", "RES-01", "TRUNK-HUB-S6", 1200, "Sector 6", sec_flow_totals[6]),
-        ("TRUNK-RES-S5", "RES-01 North Outlet Trunk -> Sector 5", "RES-01", "TRUNK-HUB-S5", 1200, "Sector 5", sum(sec_flow_totals[k] for k in (5, 4, 3, 2, 1))),
-        ("TRUNK-S5-S4", "Sheikh Zayed Transmission Main (S5 -> S4)", "TRUNK-HUB-S5", "TRUNK-HUB-S4", 1100, "Sector 4", sum(sec_flow_totals[k] for k in (4, 3, 2, 1))),
-        ("TRUNK-S4-S3", "Sheikh Zayed Transmission Main (S4 -> S3)", "TRUNK-HUB-S4", "TRUNK-HUB-S3", 1000, "Sector 3", sum(sec_flow_totals[k] for k in (3, 2, 1))),
-        ("TRUNK-S3-S2", "Sheikh Zayed Transmission Main (S3 -> S2)", "TRUNK-HUB-S3", "TRUNK-HUB-S2", 950, "Sector 2", sum(sec_flow_totals[k] for k in (2, 1))),
-        ("TRUNK-S2-S1", "Sheikh Zayed Transmission Main (S2 -> S1)", "TRUNK-HUB-S2", "TRUNK-HUB-S1", 900, "Sector 1", sec_flow_totals[1]),
+        ("TRUNK-RES-S6", "RES-01 South Outlet Trunk -> Sector 6", "RES-01", "TRUNK-HUB-S6", 900, "Sector 6", sec_flow_totals[6]),
+        ("TRUNK-RES-S5", "RES-01 North Outlet Trunk -> Sector 5", "RES-01", "TRUNK-HUB-S5", 900, "Sector 5", sum(sec_flow_totals[k] for k in (5, 4, 3, 2, 1))),
+        ("TRUNK-S5-S4", "Main Transmission Trunk (S5 -> S4)", "TRUNK-HUB-S5", "TRUNK-HUB-S4", 900, "Sector 4", sum(sec_flow_totals[k] for k in (4, 3, 2, 1))),
+        ("TRUNK-S4-S3", "Main Transmission Trunk (S4 -> S3)", "TRUNK-HUB-S4", "TRUNK-HUB-S3", 900, "Sector 3", sum(sec_flow_totals[k] for k in (3, 2, 1))),
+        ("TRUNK-S3-S2", "Main Transmission Trunk (S3 -> S2)", "TRUNK-HUB-S3", "TRUNK-HUB-S2", 900, "Sector 2", sum(sec_flow_totals[k] for k in (2, 1))),
+        ("TRUNK-S2-S1", "Main Transmission Trunk (S2 -> S1)", "TRUNK-HUB-S2", "TRUNK-HUB-S1", 900, "Sector 1", sec_flow_totals[1]),
     ]
     for pid, pname, fn, tn, diam, sec_lbl, cum_flow in spine_edges:
         eff_flow = min(140.0, max(35.0 if (plant_output_mld > 0.1 and cum_flow > 0.1) else 0.0, cum_flow * 0.25))
         _add_pipe(
             pid, pname, fn, tn,
-            [nodes_by_id[fn]["pos_xz"], nodes_by_id[tn]["pos_xz"]],
-            role="trunk_main", diameter_mm=diam, sector=sec_lbl,
-            color="#38BDF8", flow_lps=eff_flow,
+            role="trunk_main", raw_diameter_mm=diam, sector=sec_lbl,
+            flow_lps=eff_flow, pipe_class_override="TRUNK_MAIN",
             highlighted=(focus_type == "reservoir" or (focus_type == "sector" and focus_id == sec_lbl)),
         )
 
-    # 3. Map each hydraulic topology downstream node -> actual geometric end node of its producing segment
-    # First register every street segment's start & end nodes, and identify which segment hosts each valve V-01..V-20
-    seg_geom_xz: dict[str, list[list[float]]] = {}
+    # 3. Register street segment start/end nodes and map valves + junctions cleanly onto host segments
     seg_start_node: dict[str, str] = {}
     seg_end_node: dict[str, str] = {}
     topo_node_to_geom_node: dict[str, str] = {f"HDR-S{i}": f"TRUNK-HUB-S{i}" for i in range(1, 7)}
@@ -588,12 +873,12 @@ def build_connected_network_geometry(
 
     host_seg_to_valve: dict[str, str] = {sid: vid for vid, sid in valve_host_segment.items()}
 
+    # Map each street segment -> its primary junction node (e.g. SEG-S4-01 -> J-14)
+    seg_to_junction: dict[str, str] = {}
     for seg in segs:
         seg_id = seg["segment_id"]
         sec = seg["sector"]
         geom = seg.get("geometry") or json.loads(seg.get("geometry_json", "[]"))
-        pts = [list(latlon_to_xz(float(p[0]), float(p[1]))) for p in geom]
-        seg_geom_xz[seg_id] = pts
         s_nid = f"{seg_id}-START"
         e_nid = f"{seg_id}-END"
         _add_node(s_nid, "pipe_node", float(geom[0][0]), float(geom[0][1]), sector=sec)
@@ -601,16 +886,24 @@ def build_connected_network_geometry(
         seg_start_node[seg_id] = s_nid
         seg_end_node[seg_id] = e_nid
 
+        rel = [x.strip() for x in str(seg.get("related_sensor_ids", "")).split(",") if x.strip()]
+        if rel and rel[0].startswith("P-"):
+            cand_j = rel[0].replace("P-", "J-")
+            if cand_j in JUNCTION_COORDINATES and cand_j not in seg_to_junction.values():
+                seg_to_junction[seg_id] = cand_j
+                jlat, jlon = JUNCTION_COORDINATES[cand_j]
+                _add_node(cand_j, "junction", jlat, jlon, sector=sec)
+
         _, v_topo, _ = SEGMENT_TOPOLOGY.get(seg_id, (f"HDR-S{sec[-1]}", f"N-{seg_id}", None))
         topo_node_to_geom_node[v_topo] = e_nid
 
-    # Register junctions J-01..J-20 as nodes
+    # Register any remaining junctions J-01..J-20
     for jid, (jlat, jlon) in JUNCTION_COORDINATES.items():
         if jid.startswith("INTAKE-"):
             continue
         _add_node(jid, "junction", jlat, jlon, sector=JUNCTION_SECTOR_MAP.get(jid, "Sector 1"))
 
-    # 4. Build connected sector trunks, valve-split street pipes, and inter-segment connectors
+    # 4. Build connected sector trunks & distribution runs (consistent class end-to-end along every run!)
     for seg in segs:
         seg_id = seg["segment_id"]
         sec = seg["sector"]
@@ -618,7 +911,6 @@ def build_connected_network_geometry(
         v_id = get_effective_valve_for_segment(seg)
         flow_lps = float(pipe_flows_lps.get(seg_id, 0.0))
         is_rr = seg_id in rerouted
-        col = SECTOR_COLORS.get(sec, "#38BDF8")
         is_hl = (
             (seg_id in hl_set)
             or (focus_type == "sector" and focus_id == sec)
@@ -628,34 +920,30 @@ def build_connected_network_geometry(
         upstream_geom_node = topo_node_to_geom_node.get(u_topo, f"TRUNK-HUB-S{sec[-1]}")
         s_nid = seg_start_node[seg_id]
         e_nid = seg_end_node[seg_id]
-        pts = seg_geom_xz[seg_id]
 
-        # Role by hydraulic function & diameter
+        # Consistent run class determined from DB diameter & hydraulic role (SECTOR_TRUNK=500mm or DISTRIBUTION=200mm)
         is_sector_feeder = u_topo.startswith("HDR-")
-        seg_role = "sector_trunk" if (diam >= 600 or is_sector_feeder) else "distribution"
+        run_class = "SECTOR_TRUNK" if (is_sector_feeder or diam >= 500) else "DISTRIBUTION"
+        run_role = "sector_trunk" if run_class == "SECTOR_TRUNK" else "distribution"
 
-        # Upstream connector from TRUNK-HUB-Si (or parent segment end node) -> segment start node
-        # Note: if segment is downstream of a closed valve, dead-end connector also carries 0 L/s
-        conn_role = "sector_trunk" if is_sector_feeder else "distribution"
-        conn_diam = max(diam, 650) if is_sector_feeder else max(350, min(diam, 500))
+        # Upstream connector keeps the EXACT same run_class so reducers occur cleanly at hub/branch nodes!
         _add_pipe(
             pipe_id=f"FEED-{seg_id}" if is_sector_feeder else f"CONN-{seg_id}",
-            name=f"{sec} Feeder -> {seg['name']}" if is_sector_feeder else f"Branch Tie -> {seg['name']}",
+            name=f"{sec} Trunk Feeder -> {seg['name']}" if is_sector_feeder else f"{sec} Distribution Branch -> {seg['name']}",
             from_node=upstream_geom_node,
             to_node=s_nid,
-            points_xz=[nodes_by_id[upstream_geom_node]["pos_xz"], nodes_by_id[s_nid]["pos_xz"]],
-            role=conn_role,
-            diameter_mm=conn_diam,
+            role=run_role,
+            raw_diameter_mm=diam,
             sector=sec,
-            color=col,
             flow_lps=flow_lps,
+            pipe_class_override=run_class,
             valve_id=v_id,
             segment_id=seg_id,
             is_rerouted=is_rr,
             highlighted=is_hl,
         )
 
-        # Optional cross-tie ring connector where alt_u exists in SEGMENT_TOPOLOGY (makes ring loops physically connected too!)
+        # Optional distribution ring cross-tie where alt_u exists in SEGMENT_TOPOLOGY
         if alt_u_topo and alt_u_topo in topo_node_to_geom_node:
             alt_node = topo_node_to_geom_node[alt_u_topo]
             tie_flow = flow_lps if is_rr else round(flow_lps * 0.25, 1)
@@ -664,80 +952,164 @@ def build_connected_network_geometry(
                 name=f"{sec} Ring Cross-Tie -> {seg['name']}",
                 from_node=alt_node,
                 to_node=s_nid,
-                points_xz=[nodes_by_id[alt_node]["pos_xz"], nodes_by_id[s_nid]["pos_xz"]],
                 role="distribution",
-                diameter_mm=400,
+                raw_diameter_mm=200,
                 sector=sec,
-                color=col,
                 flow_lps=tie_flow,
+                pipe_class_override="DISTRIBUTION",
                 valve_id=v_id,
                 segment_id=seg_id,
                 is_rerouted=is_rr,
                 highlighted=is_hl,
             )
 
-        # If this street segment hosts a valve V-xx on its polyline, split cleanly AT the valve node
-        # so the valve sits directly ON the pipe node (start -> V-xx -> end)!
+        # Route street segment through its hosted valve (V-xx) and hosted junction (J-xx) cleanly with the SAME run_class!
         hosted_vid = host_seg_to_valve.get(seg_id)
+        hosted_jid = seg_to_junction.get(seg_id)
+
+        chain_nodes = [s_nid]
         if hosted_vid and hosted_vid in nodes_by_id:
-            v_pos = nodes_by_id[hosted_vid]["pos_xz"]
-            up_pts, down_pts = _split_polyline_at_coord(pts, v_pos)
+            chain_nodes.append(hosted_vid)
+        if hosted_jid and hosted_jid in nodes_by_id and hosted_jid not in chain_nodes:
+            chain_nodes.append(hosted_jid)
+        chain_nodes.append(e_nid)
+
+        for idx_c in range(len(chain_nodes) - 1):
+            fn = chain_nodes[idx_c]
+            tn = chain_nodes[idx_c + 1]
+            # Keep the primary segment_id on the final downstream leg so tests looking for pipe_id == seg_id find it cleanly
+            is_main_leg = (idx_c == len(chain_nodes) - 2)
+            pid_c = seg_id if is_main_leg else (f"{seg_id}-UP" if idx_c == 0 else f"{seg_id}-MID")
             _add_pipe(
-                pipe_id=f"{seg_id}-UP",
-                name=f"{seg['name']} (approach to {hosted_vid})",
-                from_node=s_nid,
-                to_node=hosted_vid,
-                points_xz=up_pts,
-                role=seg_role,
-                diameter_mm=diam,
-                sector=sec,
-                color=col,
-                flow_lps=flow_lps,
-                valve_id=v_id,
-                segment_id=seg_id,
-                is_rerouted=is_rr,
-                highlighted=is_hl,
-            )
-            _add_pipe(
-                pipe_id=seg_id,
+                pipe_id=pid_c,
                 name=seg["name"],
-                from_node=hosted_vid,
-                to_node=e_nid,
-                points_xz=down_pts,
-                role=seg_role,
-                diameter_mm=diam,
+                from_node=fn,
+                to_node=tn,
+                role=run_role,
+                raw_diameter_mm=diam,
                 sector=sec,
-                color=col,
                 flow_lps=flow_lps,
+                pipe_class_override=run_class,
                 valve_id=v_id,
                 segment_id=seg_id,
                 is_rerouted=is_rr,
                 highlighted=is_hl,
             )
-        else:
-            _add_pipe(
-                pipe_id=seg_id,
-                name=seg["name"],
-                from_node=s_nid,
-                to_node=e_nid,
-                points_xz=pts,
-                role=seg_role,
-                diameter_mm=diam,
-                sector=sec,
-                color=col,
-                flow_lps=flow_lps,
-                valve_id=v_id,
-                segment_id=seg_id,
-                is_rerouted=is_rr,
-                highlighted=is_hl,
-            )
+
+    # 5. Resolve ANY remaining 3D crossings between unconnected pipes via clean elevation separation
+    _resolve_pipe_crossings_3d(pipes_out)
+
+    # 6. Build explicit Junction Fittings (Tee / Cross / Riser) & Tapered Reducers at every class change
+    fittings, reducers = _compute_fittings_and_reducers(nodes_by_id, pipes_out)
+
+    # Attach exact pipe radius & y_level onto each valve node so valves size & sit strictly ON their pipe!
+    for p in pipes_out:
+        for end_nid in (p["from_node"], p["to_node"]):
+            nd = nodes_by_id.get(end_nid)
+            if nd and nd.get("kind") == "valve":
+                nd["pipe_radius_3d"] = p["radius_3d"]
+                nd["pipe_y_level"] = p["y_level"]
+                nd["pipe_class"] = p["pipe_class"]
 
     connectivity = validate_network_connectivity(list(nodes_by_id.values()), pipes_out)
+    crossings_check = validate_no_unconnected_crossings(pipes_out)
+    reducers_check = validate_reducers_at_class_changes(list(nodes_by_id.values()), pipes_out, reducers)
+
     return {
         "nodes": list(nodes_by_id.values()),
         "pipes": pipes_out,
+        "fittings": fittings,
+        "reducers": reducers,
+        "pipe_classes": PIPE_CLASS_SPECS,
         "connectivity": connectivity,
+        "crossings_check": crossings_check,
+        "reducers_check": reducers_check,
         "plant_flow_lps": plant_flow_lps,
+    }
+
+
+def validate_no_unconnected_crossings(pipes: list[dict]) -> dict:
+    """Verify ZERO pairs of pipes intersect in 3D except at shared graph nodes."""
+    conflicts: list[tuple[str, str]] = []
+    n = len(pipes)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _pipes_intersect_3d_unconnected(pipes[i], pipes[j]):
+                conflicts.append((pipes[i]["pipe_id"], pipes[j]["pipe_id"]))
+    return {
+        "has_unconnected_crossings": len(conflicts) > 0,
+        "crossing_count": len(conflicts),
+        "conflicts": conflicts,
+    }
+
+
+def validate_reducers_at_class_changes(nodes: list[dict], pipes: list[dict], reducers: list[dict]) -> dict:
+    """Verify EVERY node where connected pipes change class (e.g. TRUNK_MAIN -> SECTOR_TRUNK -> DISTRIBUTION) has a reducer."""
+    node_classes: dict[str, set[str]] = {n["node_id"]: set() for n in nodes}
+    for p in pipes:
+        if p["from_node"] in node_classes:
+            node_classes[p["from_node"]].add(p["pipe_class"])
+        if p["to_node"] in node_classes:
+            node_classes[p["to_node"]].add(p["pipe_class"])
+
+    reducer_nodes = {r["node_id"] for r in reducers}
+    missing: list[str] = []
+    class_change_nodes: list[str] = []
+    for nid, clss in node_classes.items():
+        if len(clss) > 1:
+            class_change_nodes.append(nid)
+            if nid not in reducer_nodes:
+                missing.append(nid)
+    return {
+        "all_class_changes_have_reducers": len(missing) == 0,
+        "class_change_node_count": len(class_change_nodes),
+        "reducer_count": len(reducers),
+        "missing_reducer_nodes": missing,
+    }
+
+
+def _segment_intersects_aabb(
+    a1: list[float],
+    a2: list[float],
+    min_x: float,
+    max_x: float,
+    min_z: float,
+    max_z: float,
+) -> bool:
+    """Return True if 2D segment [a1, a2] intersects or enters axis-aligned box [min_x, max_x] x [min_z, max_z]."""
+    x1, z1 = float(a1[0]), float(a1[1])
+    x2, z2 = float(a2[0]), float(a2[1])
+    if max(x1, x2) < min_x or min(x1, x2) > max_x or max(z1, z2) < min_z or min(z1, z2) > max_z:
+        return False
+    if (min_x <= x1 <= max_x and min_z <= z1 <= max_z) or (min_x <= x2 <= max_x and min_z <= z2 <= max_z):
+        return True
+    box_edges = [
+        ([min_x, min_z], [max_x, min_z]),
+        ([max_x, min_z], [max_x, max_z]),
+        ([max_x, max_z], [min_x, max_z]),
+        ([min_x, max_z], [min_x, min_z]),
+    ]
+    return any(_segments_intersect_2d(a1, a2, e1, e2) for e1, e2 in box_edges)
+
+
+def validate_pipes_clear_buildings(pipes: list[dict], buildings: list[dict], margin_m: float = 0.0) -> dict:
+    """Verify NO pipe segment passes through ANY building footprint [x - w/2, x + w/2] x [z - d/2, z + d/2]."""
+    collisions: list[dict] = []
+    for p in pipes:
+        pts = p.get("points_xz") or []
+        for i in range(len(pts) - 1):
+            a1, a2 = pts[i], pts[i + 1]
+            for b_idx, b in enumerate(buildings):
+                hx = float(b["w"]) * 0.5 + margin_m
+                hz = float(b["d"]) * 0.5 + margin_m
+                bx, bz = float(b["x"]), float(b["z"])
+                if _segment_intersects_aabb(a1, a2, bx - hx, bx + hx, bz - hz, bz + hz):
+                    collisions.append({"pipe_id": p["pipe_id"], "building_index": b_idx, "sector": b.get("sector")})
+                    break
+    return {
+        "all_pipes_clear_buildings": len(collisions) == 0,
+        "collision_count": len(collisions),
+        "collisions": collisions[:20],
     }
 
 
