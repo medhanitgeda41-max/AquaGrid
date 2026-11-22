@@ -13,6 +13,7 @@ from agent.chat_assistant import EXAMPLE_QUESTIONS, run_chat_turn, run_scenario_
 from agent.llm_factory import provider_supports_streaming
 from config.constants import DEFAULT_SCADA_HOUR
 from config.settings import settings
+from database.scenarios import get_scenarios_by_round
 from simulator import get_simulator, simulator_step_lock
 from components.badges import status_badge
 from components.chat_widgets import render_chat_widget
@@ -415,15 +416,54 @@ def _execute_pending_request(pending: dict, snapshot: dict, show_tech: bool) -> 
     return True
 
 
+def _render_scenario_row_in_panel(entry: dict, display_hour: int) -> None:
+    """Render one compact scenario item (ID, title, one-line brief, Run button) inside the right scrollable panel."""
+    sc_id = entry["id"]
+    btn_key = (
+        f"btn_scenario_{entry['scenario_num']}"
+        if entry.get("scenario_num") is not None
+        else f"btn_scenario_{sc_id}"
+    )
+    is_active = st.session_state.get("active_scenario_id") == sc_id
+    brief_short = entry["brief"]
+
+    c_txt, c_btn = st.columns([3.6, 0.9])
+    with c_txt:
+        st.markdown(
+            f'<div style="line-height:1.25; margin-bottom:0.25rem;">'
+            f'<span class="scada-id-badge">{html.escape(sc_id)}</span>'
+            f'<strong style="font-size:0.81rem; color:#F8FAFC;">{html.escape(entry["title"])}</strong>'
+            f'<div style="font-size:0.72rem; color:#94A3B8; margin-top:0.1rem;">{html.escape(brief_short)}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with c_btn:
+        if st.button("Run", key=btn_key, type="primary" if is_active else "secondary", width="stretch"):
+            if not queue_scenario_request(st.session_state, sc_id, entry["title"], display_hour=display_hour):
+                st.warning("Please wait for the current answer")
+
+
+def render_scenarios_panel(display_hour: int = DEFAULT_SCADA_HOUR) -> None:
+    """Render Round 1 & Round 2 scenario lists at the top of the right scrollable panel."""
+    with st.expander("Scenarios — Round 1 & Round 2", expanded=True):
+        tab_r1, tab_r2 = st.tabs(["Round 1 — Core (R1-S1..S4)", "Round 2 — Challenge (U-5.1..U-5.5)"])
+        with tab_r1:
+            for entry in get_scenarios_by_round(1):
+                _render_scenario_row_in_panel(entry, display_hour=display_hour)
+        with tab_r2:
+            for entry in get_scenarios_by_round(2):
+                _render_scenario_row_in_panel(entry, display_hour=display_hour)
+
+
 def render_ask_aquagrid_chat(
     display_hour: int = DEFAULT_SCADA_HOUR,
     snapshot: dict | None = None,
-    chat_height: int = 360,
+    chat_height: int = 560,
+    show_scenarios: bool = True,
 ) -> bool:
     """
-    Render scrollable Ask AquaGrid chat below the persistent top 3D digital twin,
-    with immediate user messages, live Thinking status, word-by-word streaming,
-    inline charts/tables/approvals, and pinned chat input at the bottom.
+    Render the right-column scrollable panel (Scenarios at top + Ask AquaGrid chat history below),
+    with a 3D click suggestion chip and chat input pinned at the bottom of the right column.
     Returns True if a new chat/scenario turn was executed during this render pass.
     """
     snapshot = snapshot or {}
@@ -438,23 +478,27 @@ def render_ask_aquagrid_chat(
     elif is_chat_generating(st.session_state) and not st.session_state.get("_pending_chat_request"):
         st.warning("Please wait for the current answer")
 
-    # Compact example question buttons
-    ex_cols = st.columns(len(EXAMPLE_QUESTIONS))
-    for idx, q_text in enumerate(EXAMPLE_QUESTIONS):
-        with ex_cols[idx]:
-            if st.button(q_text, key=f"btn_example_q_{idx}", width="stretch"):
-                if not queue_chat_request(st.session_state, q_text, display_hour):
-                    st.warning("Please wait for the current answer")
-
-    # Scrollable chat history container so the persistent top 3D digital twin stays visible while chat scrolls
+    # Scrollable right panel: Scenarios at top + Chat history below (scrolling never moves the fixed left twin!)
     with st.container(height=chat_height):
+        if show_scenarios:
+            render_scenarios_panel(display_hour=display_hour)
+
+        # Compact example question buttons
+        ex_cols = st.columns(3)
+        quick_qs = list(EXAMPLE_QUESTIONS[:2]) + ["Show reservoir trend"]
+        for idx, q_text in enumerate(quick_qs):
+            with ex_cols[idx]:
+                if st.button(q_text, key=f"btn_example_q_{idx}", width="stretch"):
+                    if not queue_chat_request(st.session_state, q_text, display_hour):
+                        st.warning("Please wait for the current answer")
+
         if not messages:
             st.markdown(
                 """
-                <div class="scada-card" style="text-align:center; padding:0.9rem;">
-                    <div style="font-size:1.05rem; font-weight:700; color:#F8FAFC;">Ask AquaGrid</div>
-                    <div style="font-size:0.84rem; color:#94A3B8; margin-top:0.2rem;">
-                        Ask about any sector, leak, valve, reservoir, desalination plant, tariff, or schedule — the 3D twin above responds automatically.
+                <div class="scada-card" style="text-align:center; padding:0.75rem; margin-top:0.3rem;">
+                    <div style="font-size:1.0rem; font-weight:700; color:#F8FAFC;">Ask AquaGrid</div>
+                    <div style="font-size:0.81rem; color:#94A3B8; margin-top:0.15rem;">
+                        Ask about any sector, leak, valve, reservoir trend, plant, or schedule — or click any asset in the 3D twin on the left.
                     </div>
                 </div>
                 """,
@@ -486,12 +530,33 @@ def render_ask_aquagrid_chat(
             with live_turn_container:
                 executed_turn = _execute_pending_request(pending_top, snapshot, show_tech)
 
-    # Chat input bar pinned at bottom
+    # Interactive 3D click suggestion chip right above the right-column chat input
+    suggestion = st.session_state.get("_chat_input_suggestion")
+    if suggestion:
+        sc1, sc2, sc3 = st.columns([3.4, 1.0, 0.5])
+        with sc1:
+            st.markdown(
+                f'<div style="font-size:0.79rem; color:#38BDF8; padding:0.35rem 0.5rem; background:#0F172A; '
+                f'border:1px solid #1E3A5F; border-radius:6px;">Selected in 3D: <strong>{html.escape(str(suggestion))}</strong></div>',
+                unsafe_allow_html=True,
+            )
+        with sc2:
+            if st.button("Send ↵", key="btn_send_3d_suggestion", type="primary", width="stretch"):
+                st.session_state.pop("_chat_input_suggestion", None)
+                if queue_chat_request(st.session_state, str(suggestion), display_hour):
+                    st.rerun()
+        with sc3:
+            if st.button("✕", key="btn_clear_3d_suggestion", width="stretch"):
+                st.session_state.pop("_chat_input_suggestion", None)
+                st.rerun()
+
+    # Chat input bar pinned at the bottom of the RIGHT column (not the page bottom!)
     user_typed = st.chat_input(
-        "Ask AquaGrid anything (e.g. 'show Sector 4', 'look inside the reservoir', 'show the desalination plant', 'close V-12')...",
+        "Ask AquaGrid (e.g. 'show Sector 4', 'show reservoir trend', 'close V-12')...",
         key="ask_aquagrid_chat_input",
     )
     if user_typed and user_typed.strip():
+        st.session_state.pop("_chat_input_suggestion", None)
         cleaned_typed = user_typed.strip()
         if queue_chat_request(st.session_state, cleaned_typed, display_hour):
             with live_turn_container:
@@ -505,8 +570,8 @@ def render_ask_aquagrid_chat(
         else:
             st.warning("Please wait for the current answer")
 
-    # If the completed turn updated the top 3D twin view (or DB state via scenario), rerun once so the
-    # persistent fixed-key twin at the top updates smoothly in place (no reload!).
+    # If the completed turn updated the twin view (or DB state via scenario), rerun once so the
+    # persistent fixed-key twin on the left updates smoothly in place (no reload!).
     if st.session_state.pop("_twin_needs_rerun", False):
         st.rerun()
 

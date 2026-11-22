@@ -8,6 +8,7 @@ from typing import Optional
 from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection, transaction_scope
 from guards.injection_filter import inspect_untrusted_text, sanitize_text, QUARANTINED_ALERT_PLACEHOLDER
+from guards.reservoir_model import evaluate_reservoir_status
 from guards.safety_floors import compute_effective_reservoir_floor, evaluate_quality_and_bloom_derating
 from guards.water_quality import evaluate_sector_chlorine
 
@@ -271,6 +272,30 @@ def read_tariff_and_quality_feeds(
         reservoir_status["has_active_emergency"] = eff_floor["has_active_emergency"]
         reservoir_status["floor_banner"] = eff_floor["banner"]
         reservoir_status["active_emergency_commitments"] = eff_floor["active_commitments"]
+
+        # Unified pure-Python real-time depletion rate & time-to-floor (uses active dynamic floor & bloom cap)
+        curr_hour_demand = float(hourly_demand_24h.get(int(current_hour) % 24, 85.0))
+        res_eval = evaluate_reservoir_status(
+            current_volume_ml=float(res_row["volume_ml"]),
+            production_mld=current_plant_output_mld,
+            demand_mld=curr_hour_demand,
+            floor_percent=float(eff_floor["effective_floor_percent"]),
+            capacity_ml=float(res_row["capacity_ml"]),
+            bloom_severity=highest_bloom_severity,
+            turbidity_ntu=curr_turbidity,
+            chlorine_ppm=curr_chlorine,
+        )
+        reservoir_status["effective_production_mld"] = res_eval["effective_production_mld"]
+        reservoir_status["current_demand_mld"] = res_eval["demand_mld"]
+        reservoir_status["rate_ml_per_hour"] = res_eval["rate_ml_per_hour"]
+        reservoir_status["rate_pct_per_hour"] = res_eval["rate_pct_per_hour"]
+        reservoir_status["trend_arrow"] = res_eval["trend_arrow"]
+        reservoir_status["rate_str"] = res_eval["rate_str"]
+        reservoir_status["hours_to_floor"] = res_eval["hours_to_floor"]
+        reservoir_status["floor_eta_str"] = res_eval["floor_eta_str"]
+        reservoir_status["warning_state"] = res_eval["warning_state"]
+        reservoir_status["within_warning_band"] = res_eval["within_warning_band"]
+        reservoir_status["at_or_below_floor"] = res_eval["at_or_below_floor"]
 
         result = {
             "current_hour": current_hour,

@@ -594,5 +594,181 @@ def test_scene_state_includes_detailed_plant_reservoir_rings_and_city_features()
     assert "Inside Reservoir RES-01" in caption
 
 
+def test_unified_reservoir_model_matches_schedule_validator_and_floor_eta():
+    """Unified reservoir model: prod < dem falls, prod > dem rises, matches schedule validator exactly, and floor ETA is exact."""
+    from guards.reservoir_model import (
+        evaluate_reservoir_status,
+        project_reservoir_series,
+        step_reservoir_volume_ml,
+    )
+    from guards.schedule_validator import validate_production_schedule
+
+    # 1. Production < demand -> falls; production > demand -> rises; clamped [0, 500]
+    v_fall = step_reservoir_volume_ml(240.0, production_mld=60.0, demand_mld=96.0, dt_hours=1.0, capacity_ml=500.0)
+    assert v_fall == pytest.approx(238.5, abs=1e-6)
+    v_rise = step_reservoir_volume_ml(240.0, production_mld=120.0, demand_mld=96.0, dt_hours=1.0, capacity_ml=500.0)
+    assert v_rise == pytest.approx(241.0, abs=1e-6)
+    assert step_reservoir_volume_ml(0.5, production_mld=0.0, demand_mld=120.0, dt_hours=2.0, capacity_ml=500.0) == 0.0
+    assert step_reservoir_volume_ml(499.5, production_mld=120.0, demand_mld=0.0, dt_hours=2.0, capacity_ml=500.0) == 500.0
+
+    # 2. Exact match with schedule validator hour-by-hour over 24 hours
+    demand_24h = {h: (96.0 if 12 <= h <= 20 else 72.0) for h in range(24)}
+    val = validate_production_schedule(
+        proposed_schedule="00:00-24:00 at 80 MLD",
+        current_volume_ml=240.0,
+        demand_by_hour=demand_24h,
+        current_hour=14,
+        total_capacity_ml=500.0,
+        min_floor_percent=0.35,
+    )
+    vol = 240.0
+    for step_idx in range(24):
+        hr = (14 + step_idx) % 24
+        vol = step_reservoir_volume_ml(vol, production_mld=80.0, demand_mld=demand_24h[hr], dt_hours=1.0, capacity_ml=500.0)
+        traj_pt = val["cumulative_trajectory"][step_idx + 1]
+        assert traj_pt["volume_ml"] == round(vol, 2)
+        assert traj_pt["level_percent"] == round((vol / 500.0) * 100.0, 2)
+
+    # 3. Exact "floor in X h Y m" calculation (240 ML -> 175 ML = 65 ML at -1.5 ML/h => 43 h 20 m)
+    st_fall = evaluate_reservoir_status(current_volume_ml=240.0, production_mld=60.0, demand_mld=96.0, floor_percent=35.0, capacity_ml=500.0)
+    assert st_fall["trend_arrow"] == "↓"
+    assert st_fall["rate_pct_per_hour"] == pytest.approx(-0.3, abs=1e-3)
+    assert st_fall["hours_to_floor"] == pytest.approx(65.0 / 1.5, abs=0.01)
+    assert st_fall["floor_eta_str"] == "35% floor in 43 h 20 m"
+    assert st_fall["warning_state"] == "NORMAL"
+
+    # Dynamic floor 35.4% (177 ML -> 63 ML / 1.5 ML/h = exactly 42 h)
+    st_dyn = evaluate_reservoir_status(current_volume_ml=240.0, production_mld=60.0, demand_mld=96.0, floor_percent=35.4, capacity_ml=500.0)
+    assert st_dyn["floor_eta_str"] == "35.4% floor in 42 h"
+
+    # Rising & warning / critical bands
+    st_rise = evaluate_reservoir_status(current_volume_ml=240.0, production_mld=110.0, demand_mld=80.0, floor_percent=35.0, capacity_ml=500.0)
+    assert st_rise["trend_arrow"] == "↑" and st_rise["floor_eta_str"] == "rising"
+
+    st_warn = evaluate_reservoir_status(current_volume_ml=190.0, production_mld=60.0, demand_mld=96.0, floor_percent=35.0, capacity_ml=500.0)
+    assert st_warn["warning_state"] == "WARNING" and st_warn["within_warning_band"] is True
+
+    st_crit = evaluate_reservoir_status(current_volume_ml=175.0, production_mld=60.0, demand_mld=96.0, floor_percent=35.0, capacity_ml=500.0)
+    assert st_crit["warning_state"] == "CRITICAL" and st_crit["at_or_below_floor"] is True
+
+    # 6h history + 12h projection series includes both segments & floor
+    series = project_reservoir_series(240.0, current_hour=14, production_mld=60.0, demand_by_hour=demand_24h, floor_percent=35.0)
+    assert any(p["segment"] == "History (last 6h)" for p in series)
+    assert any(p["segment"] == "Projection (next 12h)" for p in series)
+
+
+def test_approving_plant_output_100_to_60_mld_updates_depletion_rate_immediately():
+    """Approving SET_PLANT_OUTPUT 100 -> 60 MLD changes live reservoir rate immediately and posts trend line."""
+    from unittest.mock import patch
+    import components.chat_widgets as cw
+    from tools.read_feeds import read_tariff_and_quality_feeds
+    from tools.write_gateway import stage_gated_valve_or_setpoint_action
+
+    class _Col:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    reset_database()
+    before_feeds = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=14, log_audit=False)
+    rate_before = float(before_feeds["reservoir"]["rate_pct_per_hour"])
+
+    gw = stage_gated_valve_or_setpoint_action(
+        action_type="SET_PLANT_OUTPUT",
+        target_id="DESAL-01",
+        proposed_value=60.0,
+        rationale="Peak tariff reduction to 60 MLD",
+    )
+    assert gw["status"] == "STAGED_PENDING_APPROVAL"
+
+    fake_state: dict = {"operator_signature": "Control_Op", "ask_aquagrid_messages": []}
+    with (
+        patch.object(cw.st, "session_state", fake_state),
+        patch.object(cw.st, "markdown"),
+        patch.object(cw.st, "columns", return_value=(_Col(), _Col(), _Col())),
+        patch.object(cw.st, "button", side_effect=lambda label, **kw: label.startswith("Approve")),
+        patch.object(cw.st, "rerun"),
+    ):
+        cw.render_inline_approvals("plant_ap")
+
+    after_feeds = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=14, log_audit=False)
+    rate_after = float(after_feeds["reservoir"]["rate_pct_per_hour"])
+    assert after_feeds["current_plant_output_mld"] == 60.0
+    assert rate_after < rate_before, f"Expected rate to drop after 100 -> 60 MLD ({rate_before} -> {rate_after})"
+    assert after_feeds["reservoir"]["trend_arrow"] == "↓"
+    assert "floor in" in after_feeds["reservoir"]["floor_eta_str"]
+
+    assert len(fake_state["ask_aquagrid_messages"]) == 1
+    msg = fake_state["ask_aquagrid_messages"][0]
+    assert "DESAL-01 100 -> 60 MLD" in msg["content"]
+    assert "reservoir now" in msg["content"]
+    assert fake_state["twin_view"]["event_type"] == "plant_change"
+
+
+def test_connected_pipe_network_connectivity_and_valve_cutoff():
+    """Every pipe endpoint is a graph node, RES-01 reaches all 6 sectors, valves sit on nodes, and closing V-12 cuts downstream flow to 0."""
+    from digital_twin.hydraulics import build_connected_network_geometry, validate_network_connectivity
+
+    reset_database()
+    state_open = build_3d_scene_state(current_hour=14, focus="all")
+    cnet = state_open["connected_network"]
+    check = validate_network_connectivity(cnet["nodes"], cnet["pipes"])
+
+    assert check["is_connected"] is True, f"Network connectivity failed: {check}"
+    assert check["missing_endpoints"] == []
+    assert check["misaligned_pipes"] == []
+    assert check["desal_reaches_res"] is True
+    assert check["missing_sectors"] == []
+    assert check["disconnected_valves"] == []
+    assert len(check["reachable_sectors"]) == 6
+
+    # Closing sector trunk valve V-12 makes downstream connected pipes SEG-S4-01 & SEG-S4-05 drop to 0.0 L/s
+    all_open = {f"V-{i:02d}": "OPEN" for i in range(1, 21)}
+    v12_closed = dict(all_open)
+    v12_closed["V-12"] = "CLOSED"
+    cnet_closed = build_connected_network_geometry(valve_statuses=v12_closed, plant_output_mld=100.0)
+    s4_01_pipes = [p for p in cnet_closed["pipes"] if p["segment_id"] in ("SEG-S4-01", "SEG-S4-05")]
+    assert len(s4_01_pipes) >= 2
+    assert all(p["flow_lps"] == 0.0 for p in s4_01_pipes)
+    # Main transmission trunk and Sector 6 remain pressurized
+    s6_pipes = [p for p in cnet_closed["pipes"] if p["pipe_id"] == "SEG-S6-01"]
+    assert s6_pipes and s6_pipes[0]["flow_lps"] > 0.0
+
+
+def test_focusing_sector_4_updates_shared_twin_view_for_both_3d_and_2d():
+    """Focusing 'Sector 4' updates st.session_state['twin_view'] used identically by both 3D twin and 2D OpenStreetMap."""
+    from unittest.mock import patch
+    from agent.chat_assistant import run_chat_turn
+    from components.digital_twin_3d import resolve_2d_map_focus_from_twin_view, set_twin_view
+
+    reset_database()
+    with patch("agent.chat_assistant.llm_client.chat_with_tools", return_value=(None, "Deterministic Offline Engine", [])):
+        reply = run_chat_turn("show Sector 4", history=[], current_hour=14)
+
+    tv = reply["twin_view"]
+    state_dict: dict = {}
+    cmd = set_twin_view(state_dict, focus=tv["focus"], event_type=tv["event_type"], note=tv["note"])
+
+    # 3D scene state reads the exact shared twin_view focus
+    scene_3d = build_3d_scene_state(focus=cmd["focus"], current_hour=14)
+    assert scene_3d["highlight"]["type"] == "sector"
+    assert scene_3d["highlight"]["id"] == "Sector 4"
+
+    # 2D map resolver reads the exact same shared twin_view focus
+    focus_2d = resolve_2d_map_focus_from_twin_view(state_dict["twin_view"])
+    assert focus_2d["highlight_sector"] == "Sector 4"
+
+    # Also verify shared sync for valve, reservoir_inside, and plant
+    cmd_v = set_twin_view(state_dict, focus="V-12")
+    assert resolve_2d_map_focus_from_twin_view(cmd_v)["focus_point_latlon"] is not None
+    cmd_r = set_twin_view(state_dict, focus="reservoir_inside")
+    assert resolve_2d_map_focus_from_twin_view(cmd_r)["focus_point_latlon"] is not None
+    cmd_p = set_twin_view(state_dict, focus="plant")
+    assert resolve_2d_map_focus_from_twin_view(cmd_p)["focus_point_latlon"] is not None
+
+
+
 
 

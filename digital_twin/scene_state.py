@@ -23,7 +23,11 @@ from database.dubai_network import (
     compute_sector_boundaries,
     point_in_polygon,
 )
-from digital_twin.hydraulics import compute_network_flows, get_effective_valve_for_segment
+from digital_twin.hydraulics import (
+    build_connected_network_geometry,
+    compute_network_flows,
+    get_effective_valve_for_segment,
+)
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
 
@@ -357,9 +361,12 @@ def build_twin_caption(scene_state: dict, twin_view: Optional[dict] = None) -> s
 
     if f_type in ("reservoir", "reservoir_inside"):
         res = scene_state.get("reservoir") or {}
+        rate_str = str(res.get("rate_str") or "")
+        eta_str = str(res.get("floor_eta_str") or "")
+        trend_part = f" ({rate_str}, {eta_str})" if rate_str and eta_str else ""
         em_txt = f", dynamic floor {res.get('safety_floor_percent', 35.0):.1f}%" if res.get("has_active_emergency") else f", floor {res.get('safety_floor_percent', 35.0):.1f}%"
         prefix = "Inside Reservoir RES-01" if f_type == "reservoir_inside" else "Reservoir RES-01"
-        return f"Showing: {prefix} — {res.get('level_percent', 48.0):.1f}%{em_txt}{suffix}"
+        return f"Showing: {prefix} — {res.get('level_percent', 48.0):.1f}%{trend_part}{em_txt}{suffix}"
 
     if f_type in ("plant", "intake"):
         pl = scene_state.get("plant") or {}
@@ -387,8 +394,11 @@ def build_twin_caption(scene_state: dict, twin_view: Optional[dict] = None) -> s
     act_leaks = sum(1 for l in scene_state.get("leaks", []) if l.get("active"))
     non_comp = [s["name"] for s in scene_state.get("sectors", []) if s.get("compliance_status") == "NON_COMPLIANT"]
     wq_txt = f"NON_COMPLIANT: {', '.join(non_comp)}" if non_comp else "chlorine OK"
+    rate_str = str(res.get("rate_str") or "")
+    eta_str = str(res.get("floor_eta_str") or "")
+    res_trend = f" {rate_str} ({eta_str})" if rate_str and eta_str else ""
     return (
-        f"Showing: All 6 Sectors — RES-01 {res.get('level_percent', 48.0):.1f}%, "
+        f"Showing: All 6 Sectors — RES-01 {res.get('level_percent', 48.0):.1f}%{res_trend}, "
         f"DESAL-01 {pl.get('output_mld', 100.0):.0f} MLD, {act_leaks} active leak(s), {wq_txt}{suffix}"
     )
 
@@ -719,7 +729,7 @@ def build_3d_scene_state(
         "highlighted": focus_type in ("plant", "intake"),
     }
 
-    # 8. Strategic Reservoir RES-01 (with base floor, dynamic floor & warning floor rings)
+    # 8. Strategic Reservoir RES-01 (with base floor, dynamic floor, warning floor rings & live depletion rate/ETA)
     rx, rz = latlon_to_local_xz(*RESERVOIR_RES01_LATLON)
     base_floor_pct = round(RESERVOIR_FLOOR_PERCENT * 100.0, 2)
     eff_floor_pct = round(float(res_info.get("safety_floor_percent", base_floor_pct)), 2)
@@ -734,9 +744,35 @@ def build_3d_scene_state(
         "warning_floor_percent": round(eff_floor_pct + 5.0, 2),
         "has_active_emergency": has_fire_emergency,
         "floor_banner": str(res_info.get("floor_banner", "")),
+        "effective_production_mld": round(float(res_info.get("effective_production_mld", plant_output_mld)), 1),
+        "current_demand_mld": round(float(res_info.get("current_demand_mld", 85.0)), 1),
+        "rate_ml_per_hour": round(float(res_info.get("rate_ml_per_hour", 0.0)), 3),
+        "rate_pct_per_hour": round(float(res_info.get("rate_pct_per_hour", 0.0)), 3),
+        "trend_arrow": str(res_info.get("trend_arrow", "→")),
+        "rate_str": str(res_info.get("rate_str", "→ 0.0 %/h")),
+        "hours_to_floor": res_info.get("hours_to_floor"),
+        "floor_eta_str": str(res_info.get("floor_eta_str", "stable")),
+        "warning_state": str(res_info.get("warning_state", "NORMAL")),
+        "within_warning_band": bool(res_info.get("within_warning_band", False)),
+        "at_or_below_floor": bool(res_info.get("at_or_below_floor", False)),
         "look_inside": focus_type in ("reservoir", "reservoir_inside"),
         "highlighted": focus_type in ("reservoir", "reservoir_inside"),
     }
+
+    # 8b. 100% Connected Geometric & Hydraulic Pipe Network Graph (Intakes -> DESAL-01 -> RES-01 -> Trunk Spine -> Valves -> Sectors)
+    connected_net = build_connected_network_geometry(
+        segments=segments,
+        valve_statuses=valve_status_map,
+        plant_output_mld=float(res_info.get("effective_production_mld", plant_output_mld)),
+        intake2_isolated=intake2_isolated,
+        leaks=[dict(lk) for lk in leak_rows],
+        latlon_to_xz=latlon_to_local_xz,
+        pipe_flows_lps={p["segment_id"]: p["flow_lps"] for p in pipes_out},
+        rerouted_segments=rerouted_segments,
+        highlight_pipe_ids=hl_pipes_set,
+        focus_type=focus_type,
+        focus_id=focus_id,
+    )
 
     # 9. Deterministic procedural city (buildings, roads, parks, trees) & western coastline
     buildings_out = generate_sector_buildings(boundaries, low_quality=low_quality)
@@ -771,6 +807,7 @@ def build_3d_scene_state(
         "low_quality": bool(low_quality),
         "sectors": sectors_out,
         "pipes": pipes_out,
+        "connected_network": connected_net,
         "valves": valves_out,
         "junctions": junctions_out,
         "sensors": sensors_out,

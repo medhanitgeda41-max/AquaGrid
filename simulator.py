@@ -38,6 +38,7 @@ from config.constants import (
 from config.region_config import REGION_CONFIG, now_local
 from database.connection import get_db_connection, transaction_scope
 from database.dubai_network import point_on_polyline
+from guards.reservoir_model import compute_effective_production_mld, step_reservoir_volume_ml
 from guards.water_quality import evaluate_sector_chlorine
 from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.read_telemetry import read_network_telemetry
@@ -270,13 +271,35 @@ class LiveScadaSimulator:
             ).fetchone()
             plant_output_mld = float(plant_row["production_mld"]) if plant_row else 100.0
 
-            if self.real_time_clock:
-                demand_mld = realistic_daily_demand_mld(dt_local)
+            demand_row = conn.execute(
+                "SELECT demand_mld FROM demand_forecast WHERE hour = ?;", (sim_hour,)
+            ).fetchone()
+            if demand_row is not None:
+                demand_mld = float(demand_row["demand_mld"])
             else:
-                demand_row = conn.execute(
-                    "SELECT demand_mld FROM demand_forecast WHERE hour = ?;", (sim_hour,)
-                ).fetchone()
-                demand_mld = float(demand_row["demand_mld"]) if demand_row else 85.0
+                demand_mld = realistic_daily_demand_mld(dt_local)
+
+            # Check active algal bloom & intake water quality so effective production honors bloom derating cap
+            alert_rows = conn.execute(
+                "SELECT severity, raw_text, is_injection FROM quality_alerts ORDER BY id DESC LIMIT 10;"
+            ).fetchall()
+            bloom_sev = "NONE"
+            for ar in alert_rows:
+                if bool(ar["is_injection"]):
+                    continue
+                if "bloom" in str(ar["raw_text"] or "").lower():
+                    sev = str(ar["severity"] or "").upper()
+                    if sev in ("CRITICAL", "MODERATE", "LOW"):
+                        bloom_sev = sev
+                        break
+            t_row = conn.execute(
+                "SELECT value FROM telemetry WHERE sensor_id = 'T-INTAKE-1' ORDER BY id DESC LIMIT 1;"
+            ).fetchone()
+            cl_row = conn.execute(
+                "SELECT value FROM telemetry WHERE sensor_id = 'CL-INTAKE-1' ORDER BY id DESC LIMIT 1;"
+            ).fetchone()
+            curr_turb = float(t_row["value"]) if t_row else 1.2
+            curr_cl = float(cl_row["value"]) if cl_row else 1.8
 
             res_row = conn.execute(
                 "SELECT capacity_ml, volume_ml FROM reservoirs WHERE id = 'RES-01';"
@@ -292,9 +315,20 @@ class LiveScadaSimulator:
         finally:
             conn.close()
 
-        # 1. Realistic reservoir update (never jumps; proportional to actual elapsed dt_hours)
-        net_delta_ml = (plant_output_mld - demand_mld) * (dt_hours / 24.0)
-        new_vol_ml = max(0.0, min(capacity_ml, current_vol_ml + net_delta_ml))
+        # 1. Unified pure-Python reservoir update (matches schedule_validator & status bar identically)
+        effective_prod_mld = compute_effective_production_mld(
+            setpoint_mld=plant_output_mld,
+            bloom_severity=bloom_sev,
+            turbidity_ntu=curr_turb,
+            chlorine_ppm=curr_cl,
+        )
+        new_vol_ml = step_reservoir_volume_ml(
+            current_volume_ml=current_vol_ml,
+            production_mld=effective_prod_mld,
+            demand_mld=demand_mld,
+            dt_hours=dt_hours,
+            capacity_ml=capacity_ml,
+        )
         new_level_pct = round((new_vol_ml / capacity_ml) * 100.0, 2)
 
         # 2. Tariff tier based on active hour

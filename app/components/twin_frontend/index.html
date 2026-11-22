@@ -648,10 +648,75 @@ function initEngine(state, quality) {
     <div class="ag-leg-row"><span class="ag-swatch" style="background:#FFFFFF;"></span><span>Tank Rings: Cur · <span style="color:#FACC15;">+5%</span> · <span style="color:#F97316;">Dyn</span> · <span style="color:#EF4444;">35%</span></span></div>
   </div>`;
 
-  // Hover Raycaster Tooltips
+  // Hover Raycaster Tooltips + Interactive Click Selection (updates caption & fills chat input!)
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2(-99, -99);
   const tooltipEl = document.getElementById('ag-tooltip');
+  let downX = 0, downY = 0;
+  let clickSeq = 0;
+
+  function fillParentChatInput(suggestionText) {
+    if (!suggestionText) return;
+    try {
+      const parentDoc = window.parent && window.parent.document;
+      if (!parentDoc) return;
+      const ta = parentDoc.querySelector('[data-testid="stChatInputTextArea"], textarea[aria-label*="Ask AquaGrid"]');
+      if (!ta) return;
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.parent.HTMLTextAreaElement.prototype, 'value')?.set
+        || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      if (nativeSetter) {
+        nativeSetter.call(ta, suggestionText);
+      } else {
+        ta.value = suggestionText;
+      }
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+      ta.focus();
+    } catch (e) {
+      // Cross-origin fallback handled cleanly in Python via component return value
+    }
+  }
+
+  renderer.domElement.addEventListener('pointerdown', (ev) => {
+    downX = ev.clientX;
+    downY = ev.clientY;
+  });
+
+  renderer.domElement.addEventListener('pointerup', (ev) => {
+    if (ev.button !== 0) return;
+    if (Math.hypot(ev.clientX - downX, ev.clientY - downY) > 6) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, camera);
+    const hits = raycaster.intersectObjects(engine.hoverables, false);
+    if (!hits.length) return;
+    // Prioritize leaks -> valves -> plant/reservoir -> sectors
+    const prio = { leak: 0, valve: 1, plant: 2, reservoir: 2, sector: 3 };
+    let chosen = null;
+    for (const h of hits) {
+      const info = h.object.userData && h.object.userData.selectInfo;
+      if (!info) continue;
+      if (!chosen || (prio[info.target_type] ?? 9) < (prio[chosen.target_type] ?? 9)) {
+        chosen = info;
+      }
+    }
+    if (chosen) {
+      clickSeq += 1;
+      showEventToast(`Selected ${chosen.target_id} — press Enter in chat`);
+      fillParentChatInput(chosen.suggestion);
+      sendToStreamlit("streamlit:setComponentValue", {
+        value: {
+          kind: "select",
+          target_type: chosen.target_type,
+          target_id: chosen.target_id,
+          focus: chosen.focus,
+          suggestion: chosen.suggestion,
+          click_seq: clickSeq
+        }
+      });
+    }
+  });
+
   renderer.domElement.addEventListener('pointermove', (ev) => {
     const rect = renderer.domElement.getBoundingClientRect();
     pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
@@ -663,8 +728,10 @@ function initEngine(state, quality) {
       tooltipEl.style.display = 'block';
       tooltipEl.style.left = Math.min(rect.width - 275, Math.max(8, ev.clientX - rect.left + 12)) + 'px';
       tooltipEl.style.top = Math.min(rect.height - 96, Math.max(8, ev.clientY - rect.top + 12)) + 'px';
+      renderer.domElement.style.cursor = hits.some(h => h.object.userData.selectInfo) ? 'pointer' : 'grab';
     } else {
       tooltipEl.style.display = 'none';
+      renderer.domElement.style.cursor = 'grab';
     }
   });
   renderer.domElement.addEventListener('pointerleave', () => { tooltipEl.style.display = 'none'; });
@@ -707,6 +774,12 @@ function buildStaticEnvironment(state, lowQ) {
     const zoneMesh = new THREE.Mesh(new THREE.ShapeGeometry(shape), zoneMat);
     zoneMesh.rotation.x = -Math.PI / 2;
     zoneMesh.position.y = 0.05;
+    zoneMesh.userData.selectInfo = {
+      target_type: 'sector',
+      target_id: sec.name,
+      focus: sec.name,
+      suggestion: `Tell me about ${sec.name}`
+    };
     scene.add(zoneMesh);
     engine.hoverables.push(zoneMesh);
 
@@ -864,7 +937,15 @@ function buildDesalinationPlant(state) {
   );
   pad.position.set(0.6, 0.18, 0);
   pad.receiveShadow = true;
+  pad.userData.tooltip = '<strong>DESAL-01 Coastal Desalination Plant</strong><br/>Click to inspect plant status &amp; output.';
+  pad.userData.selectInfo = {
+    target_type: 'plant',
+    target_id: 'DESAL-01',
+    focus: 'plant',
+    suggestion: 'Tell me about desalination plant DESAL-01'
+  };
   g.add(pad);
+  engine.hoverables.push(pad);
 
   // 1. Twin Seawater Intake Pipes from West Sea (Intake 1 & Intake 2)
   const intake1Mat = new THREE.MeshStandardMaterial({ color: '#0284C7', roughness: 0.3, metalness: 0.55 });
@@ -1140,34 +1221,19 @@ function buildReservoirLookInside(state) {
   engine.scene.add(g);
 
   // Labels for tank + inner marker rings
-  const resLbl = registerLabel(`RES-01 · ${Number(res.level_percent || 48).toFixed(1)}%`, new THREE.Vector3(rx, H + 2.0, rz), 'ag-label', '#0EA5E9');
+  const initRateStr = res.rate_str ? ` ${res.rate_str}` : '';
+  const initEtaStr = res.floor_eta_str ? ` · ${res.floor_eta_str}` : '';
+  const resLbl = registerLabel(`RES-01 · ${Number(res.level_percent || 48).toFixed(1)}%${initRateStr}${initEtaStr}`, new THREE.Vector3(rx, H + 2.0, rz), 'ag-label', '#0EA5E9');
   const floorLbl = registerLabel('35% Floor (Red) · +5% Warn (Yellow)', new THREE.Vector3(rx + R + 1.2, 0.4 + H * 0.38, rz), 'ag-label ag-label-part', '#EF4444');
   const dynLbl = registerLabel('Dynamic Floor', new THREE.Vector3(rx - R - 0.8, 0.4 + H * 0.36, rz), 'ag-label ag-label-warn');
   dynLbl.visible = false;
   dynLbl.el.style.display = 'none';
 
-  // Product-water transmission pipe connecting DESAL-01 -> RES-01
-  const plPos = state.plant ? state.plant.pos_xz : [-13000, 11000];
-  const supplyCurve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(plPos[0] * S + 5.6, 1.1, plPos[1] * S),
-    new THREE.Vector3(rx - R, H * 0.78 + 0.4, rz)
-  ]);
-  const supplyTube = new THREE.Mesh(
-    new THREE.TubeGeometry(supplyCurve, 18, 0.48, 10, false),
-    new THREE.MeshStandardMaterial({ color: '#38BDF8', metalness: 0.65, roughness: 0.25, emissive: '#0369A1', emissiveIntensity: 0.25 })
-  );
-  supplyTube.userData.tooltip = '<strong>Product Water Main</strong><br/>DESAL-01 &rarr; RES-01';
-  engine.scene.add(supplyTube);
-  engine.hoverables.push(supplyTube);
-
-  engine.supplyTrack = {
-    curve: supplyCurve,
-    prevFlow: Number((state.plant && state.plant.output_mld) || 100),
-    targetFlow: Number((state.plant && state.plant.output_mld) || 100),
-    currentFlow: Number((state.plant && state.plant.output_mld) || 100),
-    animStart: 0,
-    mat: null,
-    particles: Array.from({ length: 7 }, (_, i) => ({ phase: i / 7 }))
+  glassWall.userData.selectInfo = {
+    target_type: 'reservoir',
+    target_id: 'RES-01',
+    focus: 'reservoir_inside',
+    suggestion: 'Show reservoir trend and status for RES-01'
   };
 
   engine.resRig = {
@@ -1181,6 +1247,8 @@ function buildReservoirLookInside(state) {
     baseFloorPct: Number(res.base_floor_percent || 35),
     dynFloorPct: Number(res.safety_floor_percent || 35),
     warnFloorPct: Number(res.warning_floor_percent || 40),
+    rateStr: res.rate_str || '',
+    floorEtaStr: res.floor_eta_str || '',
     hasEmergency: !!res.has_active_emergency,
     animStart: 0
   };
@@ -1189,58 +1257,128 @@ function buildReservoirLookInside(state) {
 function buildPipesAndParticles(state, lowQ) {
   const S = engine.scale;
   const scene = engine.scene;
-  const flangeMat = new THREE.MeshStandardMaterial({ color: '#CBD5E1', metalness: 0.8, roughness: 0.25 });
+  const flangeMat = new THREE.MeshStandardMaterial({ color: '#CBD5E1', metalness: 0.82, roughness: 0.24 });
+  const jointMat = new THREE.MeshStandardMaterial({ color: '#E2E8F0', metalness: 0.78, roughness: 0.28 });
+  const elbowMat = new THREE.MeshStandardMaterial({ color: '#94A3B8', metalness: 0.76, roughness: 0.26 });
 
-  engine.flowTracks = [engine.supplyTrack];
+  engine.flowTracks = [];
+  engine.pipeMap = {};
 
-  (state.pipes || []).forEach(pipe => {
-    const pts = (pipe.points_xz || []).map(p => new THREE.Vector3(p[0] * S, 0.9, p[1] * S));
+  const connNet = state.connected_network || {};
+  const pipeList = (connNet.pipes && connNet.pipes.length) ? connNet.pipes : (state.pipes || []);
+  const nodeList = connNet.nodes || [];
+
+  const elbowCoords = [];
+
+  pipeList.forEach(pipe => {
+    const role = pipe.role || (pipe.is_trunk ? 'sector_trunk' : 'distribution');
+    const isMainTrunk = (role === 'intake' || role === 'product_water' || role === 'trunk_main');
+    const isSecTrunk = (role === 'sector_trunk');
+    const pipeY = isMainTrunk ? 1.05 : (isSecTrunk ? 0.92 : 0.82);
+    const radius = isMainTrunk ? 0.56 : (isSecTrunk ? 0.38 : 0.24);
+
+    const pts = (pipe.points_xz || []).map(p => new THREE.Vector3(p[0] * S, pipeY, p[1] * S));
     if (pts.length < 2) return;
-    const curve = new THREE.CatmullRomCurve3(pts);
-    const radius = pipe.is_trunk ? 0.50 : 0.28;
-    const activeColor = new THREE.Color(pipe.color || '#2563EB');
+
+    // Straight-segment CurvePath preserves exact node-to-node alignment and sharp elbow joints
+    const curve = new THREE.CurvePath();
+    for (let i = 0; i < pts.length - 1; i++) {
+      if (pts[i].distanceTo(pts[i + 1]) > 0.01) {
+        curve.add(new THREE.LineCurve3(pts[i], pts[i + 1]));
+      }
+    }
+    if (curve.curves.length === 0) return;
+
+    // Collect intermediate bend vertices for 3D elbow fittings
+    for (let i = 1; i < pts.length - 1; i++) {
+      elbowCoords.push({ pos: pts[i], r: radius * 1.32 });
+    }
+
+    const activeColor = new THREE.Color(pipe.color || (isMainTrunk ? '#38BDF8' : '#2563EB'));
     const dryColor = new THREE.Color('#475569');
+    const flowVal = Number(pipe.flow_lps || 0);
 
     const mat = new THREE.MeshStandardMaterial({
-      color: pipe.flow_lps <= 0.05 ? dryColor.clone() : activeColor.clone(),
-      metalness: 0.58,
-      roughness: 0.30,
+      color: flowVal <= 0.05 ? dryColor.clone() : activeColor.clone(),
+      metalness: 0.62,
+      roughness: 0.28,
       transparent: true,
       opacity: 0.96
     });
-    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, Math.max(12, pts.length * 6), radius, 10, false), mat);
-    tube.castShadow = !lowQ;
+    const tubularSegs = Math.max(8, Math.min(36, (pts.length - 1) * 6));
+    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, tubularSegs, radius, 9, false), mat);
+    tube.castShadow = !lowQ && (isMainTrunk || isSecTrunk);
     scene.add(tube);
     engine.hoverables.push(tube);
 
-    // Metallic joints / flanges along pipe
-    for (const u of [0.25, 0.5, 0.75]) {
-      const pPos = curve.getPointAt(u);
-      const tan = curve.getTangentAt(u);
-      const flange = new THREE.Mesh(new THREE.TorusGeometry(radius + 0.09, 0.07, 6, 12), flangeMat);
-      flange.position.copy(pPos);
-      flange.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tan.normalize());
-      scene.add(flange);
+    // Metallic flange rings near pipe start/end joints
+    const totalLen = curve.getLength();
+    if (totalLen > 3.5) {
+      for (const u of [0.15, 0.5, 0.85]) {
+        const pPos = curve.getPointAt(u);
+        const tan = curve.getTangentAt(u);
+        const flange = new THREE.Mesh(new THREE.TorusGeometry(radius + 0.08, 0.06, 6, 10), flangeMat);
+        flange.position.copy(pPos);
+        flange.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), tan.normalize());
+        scene.add(flange);
+      }
     }
 
-    const maxParticles = lowQ ? 4 : 8;
+    const keyId = pipe.pipe_id || pipe.segment_id;
+    const maxParticles = lowQ ? (isMainTrunk ? 5 : 3) : (isMainTrunk ? 9 : (isSecTrunk ? 6 : 4));
     const tr = {
-      segment_id: pipe.segment_id,
+      pipe_id: keyId,
+      segment_id: pipe.segment_id || keyId,
+      role,
+      pipeY,
       curve,
       mat,
       tube,
       activeColor,
       dryColor,
-      prevFlow: Number(pipe.flow_lps || 0),
-      targetFlow: Number(pipe.flow_lps || 0),
-      currentFlow: Number(pipe.flow_lps || 0),
+      prevFlow: flowVal,
+      targetFlow: flowVal,
+      currentFlow: flowVal,
       animStart: 0,
       delay: 0,
       particles: Array.from({ length: maxParticles }, (_, i) => ({ phase: i / maxParticles }))
     };
-    engine.pipeMap[pipe.segment_id] = tr;
+    engine.pipeMap[keyId] = tr;
     engine.flowTracks.push(tr);
   });
+
+  // Instanced spherical joints/manifolds at EVERY network node (zero gaps between connected pipes!)
+  if (nodeList.length > 0) {
+    const jointGeo = new THREE.SphereGeometry(1.0, 10, 8);
+    const jointInst = new THREE.InstancedMesh(jointGeo, jointMat, nodeList.length);
+    const dummy = new THREE.Object3D();
+    nodeList.forEach((nd, idx) => {
+      const k = nd.kind || 'pipe_node';
+      const y = (k === 'trunk_hub' || k === 'plant' || k === 'reservoir' || k === 'intake') ? 1.05 : 0.90;
+      const r = (k === 'trunk_hub') ? 0.85 : (k === 'valve' ? 0.62 : (k === 'junction' ? 0.50 : 0.42));
+      dummy.position.set(nd.pos_xz[0] * S, y, nd.pos_xz[1] * S);
+      dummy.scale.setScalar(r);
+      dummy.updateMatrix();
+      jointInst.setMatrixAt(idx, dummy.matrix);
+    });
+    jointInst.instanceMatrix.needsUpdate = true;
+    scene.add(jointInst);
+  }
+
+  // Instanced pipe elbows wherever pipes change direction
+  if (elbowCoords.length > 0) {
+    const elbowGeo = new THREE.SphereGeometry(1.0, 8, 8);
+    const elbowInst = new THREE.InstancedMesh(elbowGeo, elbowMat, elbowCoords.length);
+    const dummy = new THREE.Object3D();
+    elbowCoords.forEach((eb, idx) => {
+      dummy.position.copy(eb.pos);
+      dummy.scale.setScalar(eb.r);
+      dummy.updateMatrix();
+      elbowInst.setMatrixAt(idx, dummy.matrix);
+    });
+    elbowInst.instanceMatrix.needsUpdate = true;
+    scene.add(elbowInst);
+  }
 
   const total = engine.flowTracks.reduce((a, t) => a + t.particles.length, 0);
   if (total > 0) {
@@ -1295,6 +1433,12 @@ function buildValves(state) {
       new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.0, depthWrite: false })
     );
     hit.position.y = 0.8;
+    hit.userData.selectInfo = {
+      target_type: 'valve',
+      target_id: v.valve_id,
+      focus: v.valve_id,
+      suggestion: `Tell me about valve ${v.valve_id}`
+    };
     group.add(hit);
     engine.hoverables.push(hit);
 
@@ -1386,6 +1530,12 @@ function syncLeaks(state, lowQ) {
       rec.isolatedAt = null;
     }
     rec.isActive = isActive;
+    rec.core.userData.selectInfo = {
+      target_type: 'leak',
+      target_id: lid,
+      focus: lid,
+      suggestion: `Tell me about leak ${lid}`
+    };
     rec.core.userData.tooltip = `<strong>${lid}</strong> (${lk.severity} · ${isActive ? lk.status : 'ISOLATED'})<br/>${lk.location_name}<br/>Loss: <strong>${lk.estimated_loss_m3_per_hour} m³/hr</strong>`;
     rec.lblRec.el.textContent = isActive ? `🚨 ${lid}` : `✓ ${lid} ISOLATED`;
     rec.lblRec.el.style.background = isActive ? 'rgba(220,38,38,0.94)' : 'rgba(22,163,74,0.90)';
@@ -1527,24 +1677,34 @@ function applySceneUpdate(args) {
     rec.hit.userData.tooltip = `<strong>Valve ${v.valve_id}</strong> (${v.sector})<br/>Status: <span style="color:${colHex}; font-weight:700;">${nextStat}</span>${v.pipe_segment_id ? '<br/>Pipe: ' + v.pipe_segment_id : ''}`;
   });
 
-  // 6. Pipes flow diffs (downstream particles slow down & stop after valve turns!)
-  (state.pipes || []).forEach(p => {
-    const tr = engine.pipeMap[p.segment_id];
+  // 6. Connected pipes flow diffs (downstream particles slow down & stop after valve turns!)
+  const updatePipes = (state.connected_network && state.connected_network.pipes && state.connected_network.pipes.length)
+    ? state.connected_network.pipes
+    : (state.pipes || []);
+  const segPressMap = {};
+  (state.pipes || []).forEach(sp => { segPressMap[sp.segment_id] = sp.pressure_psi; });
+
+  updatePipes.forEach(p => {
+    const keyId = p.pipe_id || p.segment_id;
+    const tr = engine.pipeMap[keyId];
     if (!tr) return;
     const nextFlow = Number(p.flow_lps || 0);
     if (Math.abs(nextFlow - tr.targetFlow) > 0.3) {
       tr.prevFlow = tr.currentFlow;
       tr.targetFlow = nextFlow;
       tr.animStart = now;
-      tr.delay = 0.65;
+      tr.delay = (tr.role === 'intake' || tr.role === 'product_water' || tr.role === 'trunk_main') ? 0.15 : 0.65;
     }
-    const pHl = !!p.highlighted || dlSet.has(p.segment_id);
-    const pDim = isFocused && !pHl && (hl.type === 'sector' || hl.type === 'valve');
+    const pHl = !!p.highlighted || dlSet.has(p.segment_id) || dlSet.has(keyId);
+    const pDim = isFocused && !pHl && (hl.type === 'sector' || hl.type === 'valve') && (tr.role !== 'trunk_main' && tr.role !== 'product_water' && tr.role !== 'intake');
     tr.mat.opacity = pDim ? 0.26 : 0.96;
     tr.mat.emissive.copy(pHl ? tr.activeColor : new THREE.Color('#000000'));
     tr.mat.emissiveIntensity = pHl ? 0.55 : 0.0;
     const rerouteTag = p.rerouted ? ' · REROUTED' : '';
-    tr.tube.userData.tooltip = `<strong>${p.segment_id}</strong> (${p.sector})<br/>${p.name}<br/>${p.diameter_mm}mm ${p.is_trunk ? 'Trunk' : 'Distribution'} · Valve: ${p.isolation_valve_id}<br/>Flow: <strong>${p.flow_lps} L/s</strong>${rerouteTag} · Pressure: ${p.pressure_psi} psi`;
+    const pressVal = p.pressure_psi !== undefined ? p.pressure_psi : segPressMap[p.segment_id];
+    const pressStr = pressVal !== undefined ? ` · Pressure: ${pressVal} psi` : '';
+    const valveStr = p.isolation_valve_id ? ` · Valve: ${p.isolation_valve_id}` : '';
+    tr.tube.userData.tooltip = `<strong>${keyId}</strong> (${p.sector})<br/>${p.name}<br/>${p.diameter_mm}mm ${tr.role.replace('_', ' ')}${valveStr}<br/>Flow: <strong>${p.flow_lps} L/s</strong>${rerouteTag}${pressStr}`;
   });
 
   // 7. Sensors
@@ -1572,9 +1732,6 @@ function applySceneUpdate(args) {
       pr.prevOut = pr.currentOut;
       pr.targetOut = nextOut;
       pr.animStart = now;
-      engine.supplyTrack.prevFlow = engine.supplyTrack.currentFlow;
-      engine.supplyTrack.targetFlow = nextOut;
-      engine.supplyTrack.animStart = now;
     }
     pr.mainLbl.el.textContent = pl.label || `DESAL-01 — ${nextOut.toFixed(0)} MLD`;
 
@@ -1604,6 +1761,8 @@ function applySceneUpdate(args) {
     rr.baseFloorPct = Number(res.base_floor_percent || 35);
     rr.dynFloorPct = Number(res.safety_floor_percent || 35);
     rr.warnFloorPct = Number(res.warning_floor_percent || (rr.dynFloorPct + 5));
+    rr.rateStr = res.rate_str || '';
+    rr.floorEtaStr = res.floor_eta_str || '';
     rr.hasEmergency = !!res.has_active_emergency;
 
     // Position floor marker rings on the inner wall
@@ -1620,7 +1779,8 @@ function applySceneUpdate(args) {
       rr.dynLbl.el.style.display = 'none';
     }
     rr.glassMat.opacity = res.look_inside ? 0.14 : 0.24;
-    rr.glassWall.userData.tooltip = `<strong>RES-01 Strategic Reservoir</strong><br/>Level: <strong>${nextPct.toFixed(1)}%</strong> (${res.volume_ml} / ${res.capacity_ml} ML)<br/>Safety Floor: ${rr.baseFloorPct}%${showDyn ? ' · Dynamic Floor: <strong>' + rr.dynFloorPct.toFixed(1) + '%</strong>' : ''} · Warning: ${rr.warnFloorPct.toFixed(1)}%`;
+    const rateLine = rr.rateStr ? `<br/>Trend: <strong>${rr.rateStr}</strong> (${rr.floorEtaStr})` : '';
+    rr.glassWall.userData.tooltip = `<strong>RES-01 Strategic Reservoir</strong><br/>Level: <strong>${nextPct.toFixed(1)}%</strong> (${res.volume_ml} / ${res.capacity_ml} ML)${rateLine}<br/>Safety Floor: ${rr.baseFloorPct}%${showDyn ? ' · Dynamic Floor: <strong>' + rr.dynFloorPct.toFixed(1) + '%</strong>' : ''} · Warning: ${rr.warnFloorPct.toFixed(1)}%`;
   }
 
   // 11. Camera fly-to ONLY when view_command.seq increments AND (followChat ON or explicit user button!)
@@ -1707,7 +1867,9 @@ function startAnimationLoop() {
       const ripple = 0.05 * Math.sin(t * 3.2);
       rr.waterSurface.position.y = 0.4 + waterH + ripple;
       rr.currentRing.position.y = 0.4 + waterH;
-      rr.resLbl.el.textContent = `RES-01 · ${rr.currentPct.toFixed(1)}%`;
+      const rPart = rr.rateStr ? ` ${rr.rateStr}` : '';
+      const ePart = rr.floorEtaStr ? ` · ${rr.floorEtaStr}` : '';
+      rr.resLbl.el.textContent = `RES-01 · ${rr.currentPct.toFixed(1)}%${rPart}${ePart}`;
 
       // Color: blue normal, orange near floor (<= floor + 5%), red at/below floor
       if (rr.currentPct <= rr.dynFloorPct + 0.05) {

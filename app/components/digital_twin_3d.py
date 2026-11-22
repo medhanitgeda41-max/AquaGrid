@@ -1225,14 +1225,58 @@ def render_3d_digital_twin(
     return scene_state
 
 
+def resolve_2d_map_focus_from_twin_view(
+    twin_view: Optional[dict],
+    leaks: Optional[list[dict]] = None,
+) -> dict:
+    """
+    Resolve shared `st.session_state['twin_view']` into 2D Folium map zoom parameters so
+    3D Twin and 2D OpenStreetMap always focus/zoom to the exact same target.
+    """
+    from database.dubai_network import JUNCTION_COORDINATES, VALVE_COORDINATES
+    from digital_twin.hydraulics import PLANT_DESAL01_LATLON, RESERVOIR_RES01_LATLON
+
+    tv = twin_view if isinstance(twin_view, dict) else {}
+    f_type = str(tv.get("focus_type") or "all").lower()
+    f_id = tv.get("focus_id")
+    out = {
+        "highlight_sector": None,
+        "selected_leak": None,
+        "focus_point_latlon": None,
+        "focus_label": str(tv.get("focus") or "all"),
+    }
+
+    if f_type == "sector" and f_id:
+        out["highlight_sector"] = str(f_id)
+    elif f_type == "leak" and f_id:
+        lk = next((l for l in (leaks or []) if str(l.get("leak_id", "")).upper() == str(f_id).upper()), None)
+        if lk:
+            out["selected_leak"] = lk
+            out["focus_point_latlon"] = (float(lk["latitude"]), float(lk["longitude"]))
+    elif f_type == "valve" and f_id:
+        coord = VALVE_COORDINATES.get(str(f_id).upper())
+        if coord:
+            out["focus_point_latlon"] = (float(coord[0]), float(coord[1]))
+    elif f_type == "junction" and f_id:
+        coord = JUNCTION_COORDINATES.get(str(f_id).upper())
+        if coord:
+            out["focus_point_latlon"] = (float(coord[0]), float(coord[1]))
+    elif f_type in ("reservoir", "reservoir_inside"):
+        out["focus_point_latlon"] = (float(RESERVOIR_RES01_LATLON[0]), float(RESERVOIR_RES01_LATLON[1]))
+    elif f_type in ("plant", "intake"):
+        out["focus_point_latlon"] = (float(PLANT_DESAL01_LATLON[0]), float(PLANT_DESAL01_LATLON[1]))
+    return out
+
+
 def render_persistent_top_twin(
     display_hour: int = DEFAULT_SCADA_HOUR,
     snapshot: Optional[dict] = None,
-    height: int = 450,
+    height: int = 530,
 ) -> dict:
     """
-    Render the single persistent top-of-screen 3D Digital Twin (or 2D OpenStreetMap when sidebar '2D map' is ON)
-    with a fixed component key so it never reloads across reruns, plus the one-line caption and camera/quality controls.
+    Render the single persistent fixed 3D Digital Twin (or 2D OpenStreetMap when switched via '2D map / 3D view')
+    with a fixed component key so it never reloads across reruns, plus the caption and all twin controls underneath.
+    Both 3D and 2D read from the SAME shared `st.session_state['twin_view']`.
     """
     snapshot = snapshot or {}
     twin_view = st.session_state.get("twin_view")
@@ -1244,6 +1288,9 @@ def render_persistent_top_twin(
     low_q = (quality == "Low")
     follow_chat = bool(st.session_state.get("twin_follow_chat", True))
     show_2d_map = bool(st.session_state.get("twin_show_2d_map", False))
+
+    # Sticky CSS anchor for the left 50% column
+    st.markdown('<div id="aquagrid-twin-sticky-anchor"></div>', unsafe_allow_html=True)
 
     scene_state = build_3d_scene_state(
         focus=str(twin_view.get("focus") or "all"),
@@ -1269,29 +1316,50 @@ def render_persistent_top_twin(
             conn.close()
         latest_p = {r["pipe_segment_id"]: float(r["pressure_psi"]) for r in p_rows if r["pressure_psi"] is not None}
         q_ids = {s["sensor_id"] for s in (snapshot.get("telemetry_data") or {}).get("quarantined_sensors", [])}
-        hl_sec = twin_view.get("focus_id") if twin_view.get("focus_type") == "sector" else None
-        sel_leak = None
-        if twin_view.get("focus_type") == "leak" and twin_view.get("focus_id"):
-            sel_leak = next((l for l in leaks if l["leak_id"].upper() == str(twin_view["focus_id"]).upper()), None)
+        map_focus = resolve_2d_map_focus_from_twin_view(twin_view, leaks=leaks)
+
+        # Preserve operator's manual 2D pan/zoom during Live Simulation batches when twin_view.seq hasn't changed
+        cmd_seq = int(twin_view.get("seq", 0))
+        last_2d_seq = st.session_state.get("_last_2d_view_seq")
+        saved_cam = st.session_state.get("_2d_map_camera")
+        preserve_center = None
+        preserve_zoom = None
+        if (last_2d_seq == cmd_seq or not follow_chat) and isinstance(saved_cam, dict):
+            if saved_cam.get("center") and saved_cam.get("zoom") is not None:
+                preserve_center = (float(saved_cam["center"]["lat"]), float(saved_cam["center"]["lng"]))
+                preserve_zoom = int(saved_cam["zoom"])
+        st.session_state["_last_2d_view_seq"] = cmd_seq
 
         fmap = build_leak_folium_map(
             segments=segs,
             leaks=leaks,
             quarantined_ids=q_ids,
             latest_pressures=latest_p,
-            selected_leak=sel_leak,
+            selected_leak=map_focus["selected_leak"],
             show_boundaries=True,
             show_pipes=True,
             show_sensors=True,
             show_valves=True,
             show_leaks=True,
-            highlight_sector=hl_sec,
+            highlight_sector=map_focus["highlight_sector"],
             valve_statuses=valves,
             fit_bounds=True,
+            focus_point_latlon=map_focus["focus_point_latlon"],
+            focus_label=map_focus["focus_label"],
+            preserve_center=preserve_center,
+            preserve_zoom=preserve_zoom,
         )
-        st_folium(fmap, height=height, width=None, returned_objects=[], key="aquagrid_top_2d_map")
+        map_ret = st_folium(
+            fmap,
+            height=height,
+            width=None,
+            returned_objects=["center", "zoom"],
+            key="aquagrid_top_2d_map",
+        )
+        if isinstance(map_ret, dict) and map_ret.get("center") and map_ret.get("zoom") is not None:
+            st.session_state["_2d_map_camera"] = {"center": map_ret["center"], "zoom": map_ret["zoom"]}
     else:
-        _aquagrid_3d_component(
+        click_evt = _aquagrid_3d_component(
             scene_state=scene_state,
             view_command=twin_view,
             quality=quality,
@@ -1300,30 +1368,55 @@ def render_persistent_top_twin(
             force_no_webgl=False,
             key=TWIN_COMPONENT_KEY,
         )
+        if isinstance(click_evt, dict) and click_evt.get("kind") == "select":
+            c_seq = int(click_evt.get("click_seq", 0))
+            if c_seq and c_seq != st.session_state.get("_last_3d_click_seq"):
+                st.session_state["_last_3d_click_seq"] = c_seq
+                clicked_focus = str(click_evt.get("focus") or "all")
+                clicked_id = str(click_evt.get("target_id") or clicked_focus)
+                suggestion = str(click_evt.get("suggestion") or f"Tell me about {clicked_id}")
+                set_twin_view(
+                    st.session_state,
+                    focus=clicked_focus,
+                    event_type="click_select",
+                    note=f"Selected {clicked_id}",
+                )
+                st.session_state["_chat_input_suggestion"] = suggestion
+                st.rerun()
 
-    # One-line caption + twin controls bar directly underneath
+    # One-line caption directly underneath the twin
     caption_text = build_twin_caption(scene_state, twin_view)
     st.markdown(
-        f'<div style="font-size:0.84rem; color:#CBD5E1; margin:0.15rem 0 0.35rem 0;"><strong>{html_lib.escape(caption_text)}</strong></div>',
+        f'<div style="font-size:0.82rem; color:#CBD5E1; margin:0.15rem 0 0.35rem 0; line-height:1.3;"><strong>{html_lib.escape(caption_text)}</strong></div>',
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3, c4, c5 = st.columns([1.05, 1.3, 1.05, 1.4, 1.3])
-    with c1:
+    # Row 1 of buttons under the twin: Reset view · Inside reservoir · Plant view · 2D map / 3D view
+    b1, b2, b3, b4 = st.columns([1.0, 1.25, 1.0, 1.25])
+    with b1:
         if st.button("Reset view", key="btn_twin_reset_view", width="stretch"):
+            st.session_state.pop("_2d_map_camera", None)
             set_twin_view(st.session_state, focus="all", event_type="reset", note="View reset to All 6 Sectors")
             st.rerun()
-    with c2:
+    with b2:
         if st.button("Inside reservoir", key="btn_twin_inside_res", width="stretch"):
             set_twin_view(st.session_state, focus="reservoir_inside", event_type="button_focus", note="Looking inside RES-01")
             st.rerun()
-    with c3:
+    with b3:
         if st.button("Plant view", key="btn_twin_plant_view", width="stretch"):
             set_twin_view(st.session_state, focus="plant", event_type="button_focus", note="Focused on DESAL-01")
             st.rerun()
-    with c4:
+    with b4:
+        mode_btn_label = "3D view" if show_2d_map else "2D map"
+        if st.button(f"2D map / 3D view ({mode_btn_label})", key="btn_twin_toggle_2d_3d", width="stretch"):
+            st.session_state["twin_show_2d_map"] = not show_2d_map
+            st.rerun()
+
+    # Row 2: Follow chat: ON/OFF · Quality: High/Low
+    t1, t2 = st.columns([1.2, 1.0])
+    with t1:
         st.toggle("Follow chat: ON/OFF", value=True, key="twin_follow_chat")
-    with c5:
+    with t2:
         st.radio(
             "Quality",
             options=["High", "Low"],

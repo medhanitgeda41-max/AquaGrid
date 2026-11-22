@@ -83,9 +83,30 @@ SCADA_CSS = """
         opacity: 1 !important;
     }
     .block-container {
-        padding-top: 2.5rem !important;
-        padding-bottom: 2.5rem;
-        max-width: 1320px;
+        padding-top: 2.3rem !important;
+        padding-bottom: 1.0rem !important;
+        max-width: 1620px;
+    }
+    /* 50/50 split layout: keep left 3D twin column fixed/sticky while right panel scrolls; stack on mobile */
+    @media (min-width: 900px) {
+        [data-testid="stHorizontalBlock"]:has(#aquagrid-twin-sticky-anchor) {
+            align-items: flex-start !important;
+        }
+        [data-testid="stHorizontalBlock"]:has(#aquagrid-twin-sticky-anchor) > [data-testid="stColumn"]:first-child {
+            position: sticky !important;
+            top: 2.8rem !important;
+            align-self: flex-start !important;
+            z-index: 5;
+        }
+    }
+    @media (max-width: 899px) {
+        [data-testid="stHorizontalBlock"]:has(#aquagrid-twin-sticky-anchor) {
+            flex-direction: column !important;
+        }
+        [data-testid="stHorizontalBlock"]:has(#aquagrid-twin-sticky-anchor) > [data-testid="stColumn"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+        }
     }
     .scada-banner {
         background: #111827;

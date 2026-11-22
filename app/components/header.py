@@ -24,6 +24,7 @@ def _compute_grid_health(telemetry_data: dict, feeds_data: dict, pending_count: 
     res = feeds_data.get("reservoir", {})
     res_pct = float(res.get("current_level_percent", 48.0))
     eff_floor = float(res.get("safety_floor_percent", RESERVOIR_FLOOR_PERCENT * 100.0))
+    warning_state = str(res.get("warning_state", "NORMAL")).upper()
     non_compliant = len(feeds_data.get("excluded_sectors", []))
 
     score -= leak_count * 25
@@ -34,14 +35,18 @@ def _compute_grid_health(telemetry_data: dict, feeds_data: dict, pending_count: 
         score -= 15
     elif bloom_sev == "MODERATE":
         score -= 10
-    if res_pct < eff_floor:
+    if res_pct <= eff_floor or warning_state == "CRITICAL":
         score -= 35
+    elif warning_state == "WARNING" or res_pct <= eff_floor + 5.0:
+        score -= 18
     if pending_count > 0:
         score -= 4
 
     score = max(0, min(100, score))
-    if leak_count > 0 or non_compliant > 0 or injection_count > 0 or res_pct < eff_floor or score < 65:
+    if leak_count > 0 or non_compliant > 0 or injection_count > 0 or res_pct <= eff_floor or warning_state == "CRITICAL" or score < 65:
         label = "ALERT ACTIVE"
+    elif warning_state == "WARNING" or res_pct <= eff_floor + 5.0:
+        label = "RESERVOIR WARNING"
     elif score >= 85 and not res.get("has_active_emergency"):
         label = "NOMINAL"
     else:
@@ -69,6 +74,9 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     res = feeds_data.get("reservoir", {})
     res_pct = float(res.get("current_level_percent", 48.0))
     eff_floor_pct = float(res.get("safety_floor_percent", 35.0))
+    rate_str = str(res.get("rate_str") or "→ 0.0 %/h")
+    floor_eta_str = str(res.get("floor_eta_str") or "stable")
+    res_warn_state = str(res.get("warning_state") or "NORMAL").upper()
     plant_mld = float(plant["production_mld"]) if plant else 100.0
     tariffs = feeds_data.get("tariffs", [])
     curr_tariff = float(tariffs[0]["rate_per_kwh"]) if tariffs else 0.48
@@ -82,31 +90,47 @@ def render_header(display_hour: int = DEFAULT_SCADA_HOUR) -> dict:
     else:
         clock_str = now_local().strftime("%H:%M:%S")
 
-    res_color = "#EF4444" if res_pct < eff_floor_pct else "#E2E8F0"
+    if res_warn_state == "CRITICAL" or res_pct <= eff_floor_pct:
+        res_color = "#EF4444"
+        rate_color = "#FCA5A5"
+    elif res_warn_state == "WARNING" or res_pct <= eff_floor_pct + 5.0:
+        res_color = "#F59E0B"
+        rate_color = "#FCD34D"
+    else:
+        res_color = "#38BDF8"
+        rate_color = "#CBD5E1"
+
     leak_color = "#EF4444" if leak_count > 0 else "#10B981"
     pend_color = "#F59E0B" if pending_count > 0 else "#10B981"
     peak_tag = "PEAK" if is_peak else "OFF-PEAK"
 
-    badge_status = "TELEMETRY_LOSS" if health_label == "TELEMETRY LOSS" else health_label
-    badge_html = status_badge(badge_status).replace("TELEMETRY_LOSS", "TELEMETRY LOSS")
+    if health_label == "TELEMETRY LOSS":
+        badge_html = status_badge("TELEMETRY_LOSS").replace("TELEMETRY_LOSS", "TELEMETRY LOSS")
+    elif health_label == "RESERVOIR WARNING":
+        badge_html = '<span class="ag-badge ag-badge-warn">ALERT · RESERVOIR LOW</span>'
+    else:
+        badge_html = status_badge(health_label)
+
     live_paused_html = (
-        '<span style="font-size:0.76rem; color:#64748B; margin-right:0.45rem;">Live simulation paused</span>'
+        '<span style="font-size:0.75rem; color:#64748B; margin-right:0.45rem;">Live simulation paused</span>'
         if (not st.session_state.get("live_sim_toggle", False) and not telemetry_data.get("telemetry_loss"))
         else ""
     )
 
     st.markdown(
         f"""
-        <div class="scada-banner" style="padding:0.55rem 1rem; margin-bottom:0.75rem;">
-            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.75rem; font-size:0.86rem;">
-                <div style="display:flex; align-items:center; flex-wrap:wrap; gap:0.9rem;">
-                    <strong style="font-size:0.95rem; letter-spacing:0.03em; color:#F8FAFC;">AQUAGRID</strong>
+        <div class="scada-banner" style="padding:0.5rem 0.9rem; margin-bottom:0.55rem;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.65rem; font-size:0.84rem;">
+                <div style="display:flex; align-items:center; flex-wrap:wrap; gap:0.85rem;">
+                    <strong style="font-size:0.94rem; letter-spacing:0.03em; color:#F8FAFC;">AQUAGRID</strong>
                     <span class="ag-mono" style="color:#94A3B8;">{html.escape(clock_str)}</span>
-                    <span>Reservoir RES-01 <strong class="ag-mono" style="color:{res_color};">{res_pct:.1f}%</strong></span>
+                    <span>RES-01 <strong class="ag-mono" style="color:{res_color};">{res_pct:.1f}%</strong>
+                        <span class="ag-mono" style="color:{rate_color}; font-size:0.78rem; margin-left:0.2rem;">{html.escape(rate_str)} · {html.escape(floor_eta_str)}</span>
+                    </span>
                     <span>DESAL-01 <strong class="ag-mono">{plant_mld:.0f} MLD</strong></span>
-                    <span>Tariff <strong class="ag-mono">${curr_tariff:.2f}/kWh</strong> <span style="color:#94A3B8; font-size:0.78rem;">({peak_tag})</span></span>
-                    <span>Active Leaks <strong class="ag-mono" style="color:{leak_color};">{leak_count}</strong></span>
-                    <span>Pending HITL <strong class="ag-mono" style="color:{pend_color};">{pending_count}</strong></span>
+                    <span>Tariff <strong class="ag-mono">${curr_tariff:.2f}/kWh</strong> <span style="color:#94A3B8; font-size:0.76rem;">({peak_tag})</span></span>
+                    <span>Leaks <strong class="ag-mono" style="color:{leak_color};">{leak_count}</strong></span>
+                    <span>HITL <strong class="ag-mono" style="color:{pend_color};">{pending_count}</strong></span>
                 </div>
                 <div style="display:flex; align-items:center;">{live_paused_html}{badge_html}</div>
             </div>

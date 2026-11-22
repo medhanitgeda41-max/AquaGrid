@@ -134,19 +134,23 @@ def simulate_reservoir_trajectory(
             'hourly_levels': list[dict],
             'reason': str
     """
+    from guards.reservoir_model import step_reservoir_volume_ml
+
     min_floor_volume_ml = total_capacity_ml * min_floor_percent
-    volume = current_volume_ml
+    volume = float(current_volume_ml)
     hourly_levels = []
     min_vol_reached = volume
     breach_hour = None
 
     for hour_idx, demand_mld in enumerate(demand_forecast_mld):
-        # Convert daily rates (MLD) into 1-hour volume delta (ML)
-        hourly_inflow_ml = plant_inflow_mld / 24.0
-        hourly_demand_ml = demand_mld / 24.0
-        net_delta_ml = hourly_inflow_ml - hourly_demand_ml
-
-        volume = max(0.0, volume + net_delta_ml)
+        # Shared reservoir balance equation: level_ML(t+dt) = clamp(0, cap, level_ML(t) + (prod - dem) * dt / 24)
+        volume = step_reservoir_volume_ml(
+            current_volume_ml=volume,
+            production_mld=plant_inflow_mld,
+            demand_mld=demand_mld,
+            dt_hours=1.0,
+            capacity_ml=total_capacity_ml,
+        )
         level_percent = (volume / total_capacity_ml) * 100.0
 
         if volume < min_vol_reached:

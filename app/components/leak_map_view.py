@@ -194,9 +194,19 @@ def build_leak_folium_map(
     valve_statuses: dict[str, str] | None = None,
     basemap: str = "OpenStreetMap",
     fit_bounds: bool = True,
+    focus_point_latlon: tuple[float, float] | None = None,
+    focus_label: str | None = None,
+    preserve_center: tuple[float, float] | None = None,
+    preserve_zoom: int | None = None,
 ) -> folium.Map:
-    """Construct interactive OpenStreetMap Leaflet map with buffered (~500m) sector boundaries, pipes, valves, sensors, leaks & collapsible legend."""
-    if selected_leak:
+    """Construct interactive OpenStreetMap Leaflet map with buffered (~500m) sector boundaries, pipes, valves, sensors, leaks, DESAL-01/RES-01 & collapsible legend."""
+    if preserve_center is not None and preserve_zoom is not None:
+        center = [float(preserve_center[0]), float(preserve_center[1])]
+        zoom = int(preserve_zoom)
+    elif focus_point_latlon is not None:
+        center = [float(focus_point_latlon[0]), float(focus_point_latlon[1])]
+        zoom = 14
+    elif selected_leak:
         center = [float(selected_leak["latitude"]), float(selected_leak["longitude"])]
         zoom = max(int(REGION_CONFIG["map_zoom"]) + 2, 14)
     else:
@@ -391,19 +401,63 @@ def build_leak_folium_map(
             ).add_to(leak_group)
         leak_group.add_to(fmap)
 
+    # 5b. Core Facilities (DESAL-01 Coastal Plant & RES-01 Strategic Reservoir) + Main Transmission Spine
+    from digital_twin.hydraulics import PLANT_DESAL01_LATLON, RESERVOIR_RES01_LATLON, TRUNK_HUB_LATLON
+
+    fac_group = folium.FeatureGroup(name="Plant & Reservoir")
+    spine_coords = [
+        list(PLANT_DESAL01_LATLON),
+        list(RESERVOIR_RES01_LATLON),
+        list(TRUNK_HUB_LATLON["TRUNK-HUB-S5"]),
+        list(TRUNK_HUB_LATLON["TRUNK-HUB-S4"]),
+        list(TRUNK_HUB_LATLON["TRUNK-HUB-S3"]),
+        list(TRUNK_HUB_LATLON["TRUNK-HUB-S2"]),
+        list(TRUNK_HUB_LATLON["TRUNK-HUB-S1"]),
+    ]
+    folium.PolyLine(
+        locations=spine_coords,
+        color="#0284C7",
+        weight=5,
+        opacity=0.80,
+        dash_array="8 4",
+        tooltip="Main Transmission Trunk (DESAL-01 -> RES-01 -> Sectors 1-5)",
+    ).add_to(fac_group)
+    folium.PolyLine(
+        locations=[list(RESERVOIR_RES01_LATLON), list(TRUNK_HUB_LATLON["TRUNK-HUB-S6"])],
+        color="#0284C7",
+        weight=5,
+        opacity=0.80,
+        dash_array="8 4",
+        tooltip="RES-01 South Outlet Trunk -> Sector 6",
+    ).add_to(fac_group)
+    folium.Marker(
+        location=list(PLANT_DESAL01_LATLON),
+        tooltip="DESAL-01 Coastal Desalination Plant",
+        icon=folium.Icon(color="darkblue", icon="industry", prefix="fa"),
+    ).add_to(fac_group)
+    folium.Marker(
+        location=list(RESERVOIR_RES01_LATLON),
+        tooltip="RES-01 Strategic Reservoir (500 ML)",
+        icon=folium.Icon(color="blue", icon="tint", prefix="fa"),
+    ).add_to(fac_group)
+    fac_group.add_to(fmap)
+
     # 6. Floating Legend Box & Native Leaflet Layer Control
     legend = MacroElement()
     legend._template = Template(_build_map_legend_html())
     fmap.get_root().add_child(legend)
     folium.LayerControl(collapsed=True).add_to(fmap)
 
-    # 7. Always fit map bounds with padding to what is shown (selected sector, leak, or all 6 sectors)
-    if fit_bounds:
+    # 7. Always fit map bounds with padding to what is shown (unless preserving manual camera during Live Sim)
+    if fit_bounds and not (preserve_center is not None and preserve_zoom is not None):
         if hl_norm is not None and boundaries:
             for sec, binfo in boundaries.items():
                 if sec.lower() == hl_norm:
                     fmap.fit_bounds(binfo["bounds"], padding=(25, 25))
                     break
+        elif focus_point_latlon is not None:
+            lat, lon = float(focus_point_latlon[0]), float(focus_point_latlon[1])
+            fmap.fit_bounds([[lat - 0.010, lon - 0.012], [lat + 0.010, lon + 0.012]], padding=(25, 25))
         elif selected_leak is not None:
             lat = float(selected_leak["latitude"])
             lon = float(selected_leak["longitude"])

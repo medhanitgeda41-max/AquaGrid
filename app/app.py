@@ -142,11 +142,19 @@ def main() -> None:
                     note=str(tv.get("note") or ""),
                 )
 
-    # 4. ONE always-visible realistic 3D Digital Twin at the top (fixed key -> updates in place with ZERO reload!)
-    render_persistent_top_twin(display_hour=display_hour, snapshot=snapshot, height=450)
-
-    # 5. Scrollable "Ask AquaGrid" chat below the twin (chat & events control the top twin automatically)
-    turn_ran = render_ask_aquagrid_chat(display_hour=display_hour, snapshot=snapshot, chat_height=360)
+    # 4. 50/50 Split Control Room Layout:
+    #    LEFT  = Persistent fixed 3D/2D digital twin (~80% viewport height, sticky, fixed key -> zero reload)
+    #    RIGHT = Scrollable panel with Scenarios (Round 1 & 2) at top + Chat history + right-column chat input
+    col_twin, col_chat = st.columns([1, 1], gap="medium")
+    with col_twin:
+        render_persistent_top_twin(display_hour=display_hour, snapshot=snapshot, height=540)
+    with col_chat:
+        turn_ran = render_ask_aquagrid_chat(
+            display_hour=display_hour,
+            snapshot=snapshot,
+            chat_height=560,
+            show_scenarios=True,
+        )
     if turn_ran:
         with header_placeholder.container():
             render_header(display_hour=display_hour)

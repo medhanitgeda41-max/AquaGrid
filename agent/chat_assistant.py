@@ -721,6 +721,12 @@ def build_live_scada_snapshot(
             "safety_floor_percent": float(res.get("safety_floor_percent", 35.0)),
             "has_active_emergency": bool(res.get("has_active_emergency", False)),
             "floor_banner": res.get("floor_banner", ""),
+            "rate_pct_per_hour": float(res.get("rate_pct_per_hour", 0.0)),
+            "rate_str": str(res.get("rate_str", "→ 0.0 %/h")),
+            "floor_eta_str": str(res.get("floor_eta_str", "stable")),
+            "warning_state": str(res.get("warning_state", "NORMAL")),
+            "effective_production_mld": float(res.get("effective_production_mld", feeds.get("current_plant_output_mld", 100.0))),
+            "current_demand_mld": float(res.get("current_demand_mld", 85.0)),
         },
         "desal_01": {
             "current_output_mld": float(feeds.get("current_plant_output_mld", plant.get("production_mld", 100.0))),
@@ -1678,14 +1684,20 @@ def _offline_chat_fallback(
         mp = tool_executor("show_map", {"sector": sec_arg, "leak_id": lid_arg, "show_boundaries": show_b})
         return f"{mp.get('summary_text', 'Displayed live map.')}{loss_suffix}"
 
-    # 3b. Direct reservoir level question ("what is the reservoir level")
+    # 3b. Direct reservoir level / trend question ("what is the reservoir level", "show reservoir trend")
     if ("reservoir" in lower or "res-01" in lower) and not any(k in lower for k in ("plan", "schedule", "optim", "tariff", "pressure", "flow")):
         res_vol = float(res.get("current_volume_ml", 240.0))
-        tool_executor("show_chart", {"metric": "reservoir", "asset": "RES-01", "hours": 24})
+        rate_str = str(res.get("rate_str") or "→ 0.0 %/h")
+        eta_str = str(res.get("floor_eta_str") or "stable")
+        if any(k in lower for k in ("trend", "deplet", "project", "forecast", "chart", "graph", "when")):
+            tool_executor("show_chart", {"metric": "reservoir_trend", "asset": "RES-01", "hours": 18})
+        else:
+            tool_executor("show_chart", {"metric": "reservoir", "asset": "RES-01", "hours": 24})
+        tool_executor("show_3d", {"focus": "reservoir_inside"})
         em_note = " (fire emergency reserve active)" if res.get("has_active_emergency") else ""
         return (
             f"Strategic Reservoir **RES-01** is currently at **{res_pct:.1f}% ({res_vol:.1f} ML)** "
-            f"against the mandatory **{eff_floor:.1f}%** safety floor{em_note}. "
+            f"(**{rate_str}**, **{eta_str}**) against the mandatory **{eff_floor:.1f}%** safety floor{em_note}. "
             f"DESAL-01 output is **{plant_mld:.0f} MLD** (cap {max_cap:.0f} MLD).{loss_suffix}"
         )
 
@@ -2090,7 +2102,7 @@ def run_chat_turn(
 
         elif tool_name == "show_chart":
             metric = str(args.get("metric") or "reservoir").lower()
-            if metric not in ("pressure", "flow", "reservoir", "tariff"):
+            if metric not in ("pressure", "flow", "reservoir", "reservoir_trend", "tariff"):
                 metric = "reservoir"
             asset = str(args.get("asset") or ("J-14" if metric in ("pressure", "flow") else "RES-01")).strip()
             default_hrs = 2 if metric in ("pressure", "flow") else 24
@@ -2293,6 +2305,19 @@ def run_chat_turn(
         requested_3d_focus = _parse_3d_focus_request(cleaned)
         if requested_3d_focus is not None and not twin_3d_results_holder and not map_results_holder:
             _execute_tool("show_3d", {"focus": requested_3d_focus})
+
+        # If the operator asks for the reservoir trend ("show reservoir trend" / "reservoir depletion"), attach the 6h+12h trend chart
+        if ("reservoir" in lower_q or "res-01" in lower_q) and any(k in lower_q for k in ("trend", "deplet", "project", "floor in")):
+            upgraded = False
+            for w in widgets:
+                if w.get("type") == "chart" and w.get("metric") in ("reservoir", "reservoir_trend"):
+                    w["metric"] = "reservoir_trend"
+                    w["hours"] = 18
+                    upgraded = True
+            if not upgraded:
+                _execute_tool("show_chart", {"metric": "reservoir_trend", "asset": "RES-01", "hours": 18})
+            if not twin_3d_results_holder:
+                _execute_tool("show_3d", {"focus": "reservoir_inside"})
 
         # If the user asked for a 2D map or "show the sectors" and the LLM skipped calling show_map, invoke show_map directly
         asked_for_map = _is_map_request(cleaned)
@@ -2502,15 +2527,18 @@ def collect_system_alerts(
                 }
             )
 
-    # 4. Reservoir Floor Breach or Fire Emergency Floor Raised
+    # 4. Reservoir Floor Breach, Warning Band (within 5% of floor), or Fire Emergency Floor Raised
     res = feeds_data.get("reservoir") or {}
     res_pct = float(res.get("current_level_percent", 48.0))
     eff_floor = float(res.get("safety_floor_percent", RESERVOIR_FLOOR_PERCENT * 100.0))
-    if res_pct < eff_floor:
+    rate_str = str(res.get("rate_str") or "")
+    eta_str = str(res.get("floor_eta_str") or "")
+    trend_note = f" ({rate_str}, {eta_str})" if rate_str and eta_str else ""
+    if res_pct <= eff_floor:
         key = f"FLOOR_BREACH:{round(res_pct, 1)}:{round(eff_floor, 1)}"
         if key not in updated_seen:
             updated_seen.add(key)
-            body = f"RES-01 dropped to {res_pct:.1f}% (below mandatory {eff_floor:.1f}% floor)."
+            body = f"RES-01 at {res_pct:.1f}%{trend_note} — at/below mandatory {eff_floor:.1f}% safety floor."
             new_msgs.append(
                 {
                     "role": "assistant",
@@ -2521,10 +2549,31 @@ def collect_system_alerts(
                     "content": f"ALERT (RESERVOIR FLOOR BREACH): {body}",
                     "provider": "CODE_GUARD (Auto Alert)",
                     "tools_called": [],
-                    "code_checks": [{"check": "Reservoir Safety Floor", "status": "BLOCKED", "code": "REJECTED_BY_SAFETY_GUARD", "detail": f"{res_pct:.1f}% < {eff_floor:.1f}%"}],
-                    "widgets": [{"type": "chart", "metric": "reservoir", "asset": "RES-01", "hours": 24}],
+                    "code_checks": [{"check": "Reservoir Safety Floor", "status": "BLOCKED", "code": "REJECTED_BY_SAFETY_GUARD", "detail": f"{res_pct:.1f}% <= {eff_floor:.1f}%"}],
+                    "widgets": [{"type": "chart", "metric": "reservoir_trend", "asset": "RES-01", "hours": 18}],
                     "staged_action": None,
-                    "twin_view": build_twin_view_command(focus="reservoir_inside", event_type="reservoir_alert", note=f"RES-01 below floor ({res_pct:.1f}%)"),
+                    "twin_view": build_twin_view_command(focus="reservoir_inside", event_type="reservoir_alert", note=f"RES-01 at/below floor ({res_pct:.1f}%)"),
+                }
+            )
+    elif res_pct <= eff_floor + 5.0:
+        key = f"FLOOR_WARN:{round(res_pct, 1)}:{round(eff_floor, 1)}"
+        if key not in updated_seen:
+            updated_seen.add(key)
+            body = f"RES-01 is at {res_pct:.1f}%{trend_note} — within 5% of the {eff_floor:.1f}% safety floor."
+            new_msgs.append(
+                {
+                    "role": "assistant",
+                    "kind": "alert",
+                    "alert_code": "RESERVOIR_WARNING",
+                    "alert_title": "RESERVOIR LOW WARNING",
+                    "alert_body": body,
+                    "content": f"ALERT (RESERVOIR LOW WARNING): {body}",
+                    "provider": "CODE_GUARD (Auto Alert)",
+                    "tools_called": [],
+                    "code_checks": [{"check": "Reservoir Warning Margin", "status": "BLOCKED", "code": "RESERVOIR_WARNING", "detail": f"{res_pct:.1f}% within 5% of {eff_floor:.1f}% floor"}],
+                    "widgets": [{"type": "chart", "metric": "reservoir_trend", "asset": "RES-01", "hours": 18}],
+                    "staged_action": None,
+                    "twin_view": build_twin_view_command(focus="reservoir_inside", event_type="reservoir_alert", note=f"RES-01 near floor ({res_pct:.1f}%)"),
                 }
             )
     elif res.get("has_active_emergency"):

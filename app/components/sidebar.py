@@ -158,8 +158,8 @@ def render_sidebar() -> None:
 
         st.divider()
 
-        # ── Scenarios (Round 1 & Round 2) ─────────────────────────────────────
-        st.markdown("### Scenarios")
+        # ── Database Reset ────────────────────────────────────────────────────
+        st.markdown("### Database")
         st.button(
             "Reset and Re-seed Database",
             key="btn_reset_db",
@@ -167,19 +167,9 @@ def render_sidebar() -> None:
             on_click=_on_sidebar_reset,
         )
 
-        st.markdown('<div class="scada-round-hdr">ROUND 1 — Core scenarios</div>', unsafe_allow_html=True)
-        for entry in get_scenarios_by_round(1):
-            _render_sidebar_scenario_row(entry)
-
-        st.markdown('<div class="scada-round-hdr">ROUND 2 — New challenge scenarios</div>', unsafe_allow_html=True)
-        for entry in get_scenarios_by_round(2):
-            _render_sidebar_scenario_row(entry)
-
         st.divider()
 
-        # ── 2D Map toggle, Audit Log, Technical Details, Clear Chat ───────────
-        st.toggle("2D map", value=False, key="twin_show_2d_map")
-
+        # ── Audit Log, Technical Details, Clear Chat ──────────────────────────
         if st.button("Open Audit Log", key="btn_open_audit_log", width="stretch"):
             st.session_state.setdefault("ask_aquagrid_messages", []).append(
                 {

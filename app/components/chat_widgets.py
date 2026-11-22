@@ -10,6 +10,8 @@ from config.constants import DEFAULT_SCADA_HOUR
 from database.connection import get_db_connection
 from digital_twin.hydraulics import simulate_valve_change_impact
 from guards.injection_filter import detect_injection
+from guards.reservoir_model import project_reservoir_series
+from tools.read_feeds import read_tariff_and_quality_feeds
 from tools.write_gateway import execute_human_approval, execute_human_rejection
 from components.badges import format_dubai_time, status_badge
 from components.digital_twin_3d import render_3d_digital_twin, set_twin_view
@@ -175,9 +177,100 @@ def render_inline_map(
         st.dataframe(sec_df, width="stretch", hide_index=True)
 
 
+def _build_reservoir_trend_chart(snapshot: dict) -> alt.LayerChart:
+    """Build compact reservoir trend chart (last 6h history + next 12h projection + active safety floor line)."""
+    feeds_data = snapshot.get("feeds_data") or read_tariff_and_quality_feeds(horizon_hours=6, current_hour=DEFAULT_SCADA_HOUR, log_audit=False)
+    res = feeds_data.get("reservoir") or {}
+    wq = feeds_data.get("water_quality") or {}
+    curr_hour = int(feeds_data.get("current_hour", DEFAULT_SCADA_HOUR))
+    plant_mld = float(feeds_data.get("current_plant_output_mld", snapshot.get("plant_mld", 100.0)))
+    floor_pct = float(res.get("safety_floor_percent", 35.0))
+    cap_ml = float(res.get("capacity_ml", 500.0))
+
+    # Pull any recent live reservoir snapshots from scada_history for the last 6h segment
+    history_pts: list[dict] = []
+    conn = get_db_connection()
+    try:
+        h_rows = conn.execute(
+            """
+            SELECT recorded_at, reservoir_level_percent, reservoir_volume_ml
+            FROM scada_history
+            WHERE reservoir_level_percent IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 6;
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    if len(h_rows) >= 2:
+        for r in reversed(h_rows):
+            history_pts.append(
+                {
+                    "hour_label": format_dubai_time(r["recorded_at"])[11:16],
+                    "level_percent": float(r["reservoir_level_percent"]),
+                    "volume_ml": float(r["reservoir_volume_ml"] or (float(r["reservoir_level_percent"]) * cap_ml / 100.0)),
+                }
+            )
+
+    series = project_reservoir_series(
+        current_volume_ml=float(res.get("current_volume_ml", 240.0)),
+        current_hour=curr_hour,
+        production_mld=plant_mld,
+        demand_by_hour=feeds_data.get("hourly_demand_24h") or {},
+        floor_percent=floor_pct,
+        capacity_ml=cap_ml,
+        history_hours=6,
+        forecast_hours=12,
+        history_points=history_pts if len(history_pts) >= 2 else None,
+        bloom_severity=str(wq.get("bloom_severity", "NONE")),
+        turbidity_ntu=float(wq.get("intake_turbidity_ntu", 1.2)),
+        chlorine_ppm=float(wq.get("intake_chlorine_ppm", 1.8)),
+    )
+    df = pd.DataFrame(series)
+    x_order = list(dict.fromkeys(df["hour_label"].tolist()))
+    y_min = max(0.0, min(floor_pct - 5.0, float(df["level_percent"].min()) - 3.0))
+    y_max = min(100.0, max(55.0, float(df["level_percent"].max()) + 4.0))
+
+    line = (
+        alt.Chart(df)
+        .mark_line(strokeWidth=2.6, point=alt.OverlayMarkDef(size=42))
+        .encode(
+            x=alt.X("hour_label:N", sort=x_order, title="Last 6h & Next 12h Projection", axis=alt.Axis(labelAngle=-45, labelFontSize=9)),
+            y=alt.Y("level_percent:Q", title="RES-01 Level (%)", scale=alt.Scale(domain=[y_min, y_max])),
+            color=alt.Color(
+                "segment:N",
+                scale=alt.Scale(domain=["History (last 6h)", "Projection (next 12h)"], range=["#94A3B8", "#38BDF8"]),
+                legend=alt.Legend(orient="top", title=None),
+            ),
+            strokeDash=alt.StrokeDash(
+                "segment:N",
+                scale=alt.Scale(domain=["History (last 6h)", "Projection (next 12h)"], range=[[1, 0], [5, 3]]),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("hour_label:N", title="Time"),
+                alt.Tooltip("segment:N", title="Series"),
+                alt.Tooltip("level_percent:Q", title="Level (%)", format=".2f"),
+                alt.Tooltip("volume_ml:Q", title="Volume (ML)", format=".1f"),
+            ],
+        )
+    )
+    floor_df = pd.DataFrame({"y": [floor_pct], "label": [f"Safety Floor ({floor_pct:.1f}%)"]})
+    rule = alt.Chart(floor_df).mark_rule(color="#EF4444", strokeDash=[6, 4], strokeWidth=2.2).encode(y="y:Q")
+    lbl = alt.Chart(floor_df).mark_text(align="left", dx=5, dy=-6, color="#FCA5A5", fontWeight="bold", fontSize=10).encode(
+        x=alt.value(4), y="y:Q", text="label:N"
+    )
+    return (line + rule + lbl).properties(height=225)
+
+
 def render_inline_chart(metric: str, asset: str | None, hours: int, snapshot: dict) -> None:
-    """Render live pressure, flow, reservoir, or tariff chart inside chat."""
+    """Render live pressure, flow, reservoir, reservoir_trend (6h+12h), or tariff chart inside chat."""
     metric = (metric or "reservoir").lower()
+
+    if metric == "reservoir_trend":
+        chart = _build_reservoir_trend_chart(snapshot)
+        st.altair_chart(chart, width="stretch")
+        return
 
     if metric == "reservoir":
         feeds_data = snapshot.get("feeds_data") or {}
@@ -563,14 +656,14 @@ def render_inline_approvals(widget_key: str) -> None:
                     Safety check: PASS at staging · Clicking Approve re-checks safety floor, water quality &amp; freshness and consumes a single-use token.
                 </div>
                 <div style="margin-top:0.25rem; font-size:0.79rem; color:#38BDF8;">
-                    &rarr; {html.escape(preview['focus'])} &amp; affected downstream pipes shown in the 3D view above
+                    &rarr; {html.escape(preview['focus'])} &amp; affected downstream pipes shown in the twin view
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        c1, c2, _ = st.columns([1.0, 1.0, 2.5])
+        c1, c2, _ = st.columns([1.5, 1.5, 0.3])
         with c1:
             if st.button(f"Approve #{action_id}", key=f"chat_approve_{widget_key}_{action_id}", type="primary", width="stretch"):
                 res = execute_human_approval(action_id=action_id, approver=operator_name)
@@ -585,19 +678,26 @@ def render_inline_approvals(widget_key: str) -> None:
                         short_ev = f"{target_id} opened — {flow_lines[0]}" if flow_lines else f"{target_id} opened"
                     elif action_type == "SET_PLANT_OUTPUT":
                         evt_type = "plant_change"
-                        short_ev = f"DESAL-01 output set to {prop_fmt}"
+                        old_mld = float(row["current_value"])
+                        new_mld = float(row["proposed_value"])
+                        fresh_feeds = read_tariff_and_quality_feeds(horizon_hours=6, current_hour=DEFAULT_SCADA_HOUR, log_audit=False)
+                        f_res = fresh_feeds.get("reservoir") or {}
+                        r_str = str(f_res.get("rate_str") or "→ 0.0 %/h")
+                        eta_str = str(f_res.get("floor_eta_str") or "stable")
+                        short_ev = f"DESAL-01 {old_mld:.0f} -> {new_mld:.0f} MLD — reservoir now {r_str}, {eta_str}"
+                        decision_widgets.append({"type": "chart", "metric": "reservoir_trend", "asset": "RES-01", "hours": 18})
                     else:
                         evt_type = "isolate_flush"
                         short_ev = f"{target_id} isolated and flushed"
 
                     set_twin_view(
                         st.session_state,
-                        focus=preview["focus"],
+                        focus="plant" if action_type == "SET_PLANT_OUTPUT" else preview["focus"],
                         event_type=evt_type,
                         note=short_ev,
                         highlight_pipe_ids=preview["highlight_pipe_ids"],
                     )
-                    impact_note = f" — {'; '.join(flow_lines[:2])}" if flow_lines else ""
+                    impact_note = f" — {'; '.join(flow_lines[:2])}" if (flow_lines and action_type != "SET_PLANT_OUTPUT") else ""
                     msg_txt = f"**{short_ev}** (Action #{action_id} `{st_code}` by `{res.get('approver')}`{impact_note})"
                     decision_widgets.append({"type": "twin_3d", "focus": preview["focus"]})
                 else:

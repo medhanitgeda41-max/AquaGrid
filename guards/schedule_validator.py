@@ -21,6 +21,7 @@ from config.constants import (
     RESERVOIR_FLOOR_PERCENT,
     RESERVOIR_TOTAL_CAPACITY_ML,
 )
+from guards.reservoir_model import step_reservoir_volume_ml
 from guards.safety_floors import evaluate_quality_and_bloom_derating
 
 # Matches blocks like:
@@ -297,9 +298,14 @@ def validate_production_schedule(
                     active_gap["min_pct"] = entry_pct
 
         demand_mld = _resolve_hourly_demand(clock_h, demand_by_hour, fallback_demand_mld)
-        net_delta_ml = (sim_inflow_mld - demand_mld) / 24.0
         prev_volume_ml = volume_ml
-        volume_ml = max(0.0, min(total_capacity_ml, volume_ml + net_delta_ml))
+        volume_ml = step_reservoir_volume_ml(
+            current_volume_ml=volume_ml,
+            production_mld=sim_inflow_mld,
+            demand_mld=demand_mld,
+            dt_hours=1.0,
+            capacity_ml=total_capacity_ml,
+        )
         level_pct = round((volume_ml / total_capacity_ml) * 100.0, 2)
 
         if level_pct < min_overall_pct:
